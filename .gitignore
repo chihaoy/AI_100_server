@@ -1,0 +1,16 @@
+# Whitelist: only scripts and documents are tracked (per professor, 2026-09-21).
+# Experiment outputs (logs, configs, csv/json/npz results, traces, QPC, ONNX, npy, bin) stay local.
+*
+!*/
+!.gitignore
+!*.md
+!*.py
+!*.sh
+!*.cpp
+!*.html
+!9.17.2026/结论总结/*.txt
+!9.17.2026/结论总结/*.png
+# never these, even if a directory above is re-included
+**/qpc/
+**/qpc_*/
+**/__pycache__/
