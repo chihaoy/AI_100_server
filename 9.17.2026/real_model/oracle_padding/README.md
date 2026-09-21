@@ -22,6 +22,13 @@ The follow-up [per-layer profiling and power-of-two capacity experiment](layer_p
 uses matched instrumented builds to measure individual MoE intervals and test
 a third capacity policy. Its timings are kept separate from this uninstrumented comparison.
 
+The [controlled cold-group sweep](cold_capacity_control/README.md) replays trained
+FP16 layer 2 with identical activations, routing and expert order, hot C128, and
+seven cold capacities. Cold C128 → C2 reduces isolated MoE host latency by
+13.93%; C32 is the fastest tested variant. The traces show substantial HMX
+dependency waits at small capacities. These isolated-layer timings are kept
+separate from full-model results.
+
 ## Scope and method
 
 The benchmark uses the trained Qwen3-30B-A3B model, all 48 decoder layers,
