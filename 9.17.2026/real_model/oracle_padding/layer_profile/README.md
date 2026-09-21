@@ -25,6 +25,15 @@ interval. The gather itself has about 24 µs of busiest-core execution. These
 direct costs do not explain the remaining milliseconds per layer; removing the
 permutation has not been measured as a causal graph ablation.
 
+The [additive elapsed-time breakdown](breakdown/README.md) partitions all 864
+layer/sample intervals into six ordered phases and reproduces the original
+MoE medians exactly. In FP16, minimum padding reduces the second expert-group
+span from 3.1905 to 1.7133 ms, but the first-group span grows from 3.0459 to
+3.4418 ms and initial routing/packing/waits grow from 0.6333 to 1.1615 ms.
+Final dense combination still takes 2.4612 ms. The report also records the
+unchanged logical dense output buffer and expert weight dimensions, and keeps
+engine busy times separate from the additive elapsed phases.
+
 Keep both policies as candidates for per-layer tuning. For example, FP16
 layer 0 favors minimum (9.0895 vs 10.0676 ms), while layer 2 favors power of
 two (10.9753 vs 9.8683 ms). These are descriptive comparisons of three traces,
@@ -113,6 +122,9 @@ Scripts:
   both precisions' 48-layer tables and standalone PNG/PDF/SVG plots.
 - [`moe_qwen3_routing_profile.py`](../../../../tools/moe_qwen3_routing_profile.py):
   isolated routing permutation analysis with independent raw-trace checks.
+- [`moe_qwen3_breakdown.py`](../../../../tools/moe_qwen3_breakdown.py):
+  six additive MoE phases, separate engine work, logical capacity/weight sizes
+  and stacked timing plots from the saved traces.
 
 [capacity_policies.csv](capacity_policies.csv) contains both capacity policies
 for every layer and precision. Precision-specific `*_progress.json` and
