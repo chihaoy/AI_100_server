@@ -37,6 +37,9 @@
 | `moe_e2e_verify_layers.py` | 每层 QPC 喂参考输入,热+冷相加 vs 参考 |
 | `moe_e2e_host.cpp` | 48 层链式驱动(常驻 / lazy / swap 三种模式,naive 模式) |
 | `moe_e2e_logits.py` | 最终 norm + lm_head,和 CPU 参考、naive 比 argmax / 相关 |
+| `moe_qwen3_baseline.py`、`moe_qwen3_baseline_host.cpp` | 真实 48 层模型的四卡保守 prefill 基线；逐次 logits 检查、FP32 参考误差、60 次计时及设备内存/释放检查；见 `9.17.2026/real_model/README.md` |
+| `moe_qwen3_oracle.py` | 原生 48 层图的静态逐层 padding 与 expert 重排、设备路由校准、容量溢出审计及 full-model oracle 对照；见 `9.17.2026/real_model/oracle_padding/README.md` |
+| `moe_qwen3_profile.py`、`moe_qwen3_profile_sweep.py`、`moe_qwen3_profile_report.py` | 相同 profiling 配置下的 C128、最小容量、2 的幂容量对照；逐层 MoE 时间、SDK trace 校验和图表；见 `9.17.2026/real_model/oracle_padding/layer_profile/README.md` |
 | `moe_multilayer_export.py` | 将不同 padding 的完整 decoder 层连接成一个 ONNX；同权重 uniform/tuned 对照及路由计数输出 |
 | `moe_multilayer_bench.py`、`moe_single_qpc_host.cpp` | 单 QPC 编译、卡上溢出/数值检查、预热后的 C++ 主机计时；见 `9.17.2026/multilayer/README.md` |
 | `moe_grant_access.sh` | 管理员授予指定用户设备及实验数据访问权限，备份原 ACL |

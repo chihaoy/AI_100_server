@@ -65,6 +65,12 @@ AI 100 上 MoE expert 放置与 padding 研究的脚本和结论文档,从 mllm 
 
 [四卡独立 profile 实验](9.17.2026/runtime_constraints/MULTICARD_JOINT.md) 已完成 8,640 次四卡计时事务及 4,560 次匹配的单卡对照。每卡固定驻留 32 expert，可在同一 chunk 独立选择 padding；T=128 warm 输入使用 card 0/3 的 C32 与 card 1/2 的 C16。T=128 balanced 的 FP16 并发主机延迟为 7.928 ms，四卡保守对照为 18.304 ms。跨卡 ownership 变化、复制与两对卡 QPC 仍待测；本轮结束时四卡资源均已释放。
 
+**真实模型保守基线**：[Qwen3-30B-A3B 全 48 层 prefill](9.17.2026/real_model/README.md) 使用真实权重、四卡单 QPC、统一 C128，暂未接入自适应 padding。同一 GSM8K prompt 41 的前 128 token，FP16/MXFP6 各完成 60 次计时，主机中位延迟分别为 572.223/525.103 ms。两者均预测与 FP32 参考相同的下一 token，但 logits 相对 L2 误差为 5.029%/18.842%，均未通过 5% 诊断门槛；不是模型准确率或多 chunk/KV 连续性的验证。
+
+**真实模型静态 oracle**：[逐层最小安全 padding 与热/冷 expert 重分组](9.17.2026/real_model/oracle_padding/README.md) 已在全 48 层、四卡单 QPC、同一 128-token 输入上完成。与重新编译的同配置 C128 对照相比，FP16 为 572.298 → 501.623 ms（降 12.35%），MXFP6 为 496.480 → 425.481 ms（降 14.30%）。每个候选均完成 60 次计时、零溢出，counts/logits 与重分组后的 C128 对照逐位相同；最小容量在两种精度下均优于向上取整到 16。该结果仅覆盖原生两组各 64 expert 的离线 oracle，未计入运行时选择、重排、权重搬运或加载成本。重分组后的 FP16/MXFP6 参考误差为 3.096%/17.201%，仅前者通过此输入上的 5% 诊断门槛。
+
+**逐层 profiling 与 2 的幂 padding**：[48 层完整对照](9.17.2026/real_model/oracle_padding/layer_profile/results/README.md) 已完成 6 个相同 `stats-level=70` 配置、360 次计时和 18 份 trace。FP16 的平均 MoE 时间为 C128 11.5466 → 最小容量 10.0475 → 2 的幂 9.7871 ms；MXFP6 为 10.1564 → 8.5871 → 8.0593 ms。2 的幂容量对 C128 的 MoE 加速为 1.180×/1.260×，但仅在 24/48 与 40/48 层优于最小容量，应保留两类候选逐层调优。这些是完整模型中的插桩时间，不应与上面的无插桩绝对时间混用；混合容量策略尚未编译测量。
+
 ## 复现入口
 
 - 单层微基准:`tools/moe_tier_bench.sh <name> <groups> [num_devices]`,导出器 `tools/moe_tier_bench_export.py`
