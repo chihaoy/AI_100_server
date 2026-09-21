@@ -17,6 +17,14 @@ layers and 40/48 MXFP6 layers. Compared with minimum, summed MoE medians fall
 The profiling-enabled host medians are 605.044 → 526.944 → 514.675 ms for FP16
 and 537.920 → 453.995 → 429.529 ms for MXFP6 (C128 → minimum → power of two).
 
+The 2026-09-22 [routing-column permutation profile](routing_permutation/README.md)
+isolates the graph's added `Gather` using these same saved traces. Its broad
+elapsed envelope, including associated copies and intervening gaps, averages
+about 60–66 µs per layer across the four regrouped cases, below 1% of the MoE
+interval. The gather itself has about 24 µs of busiest-core execution. These
+direct costs do not explain the remaining milliseconds per layer; removing the
+permutation has not been measured as a causal graph ablation.
+
 Keep both policies as candidates for per-layer tuning. For example, FP16
 layer 0 favors minimum (9.0895 vs 10.0676 ms), while layer 2 favors power of
 two (10.9753 vs 9.8683 ms). These are descriptive comparisons of three traces,
@@ -103,6 +111,8 @@ Scripts:
   and successful trace analysis; original QPCs and checkpoints are preserved.
 - [`moe_qwen3_profile_report.py`](../../../../tools/moe_qwen3_profile_report.py):
   both precisions' 48-layer tables and standalone PNG/PDF/SVG plots.
+- [`moe_qwen3_routing_profile.py`](../../../../tools/moe_qwen3_routing_profile.py):
+  isolated routing permutation analysis with independent raw-trace checks.
 
 [capacity_policies.csv](capacity_policies.csv) contains both capacity policies
 for every layer and precision. Precision-specific `*_progress.json` and
