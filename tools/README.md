@@ -37,10 +37,22 @@
 | `moe_e2e_verify_layers.py` | 每层 QPC 喂参考输入,热+冷相加 vs 参考 |
 | `moe_e2e_host.cpp` | 48 层链式驱动(常驻 / lazy / swap 三种模式,naive 模式) |
 | `moe_e2e_logits.py` | 最终 norm + lm_head,和 CPU 参考、naive 比 argmax / 相关 |
+| `moe_multilayer_export.py` | 将不同 padding 的完整 decoder 层连接成一个 ONNX；同权重 uniform/tuned 对照及路由计数输出 |
+| `moe_multilayer_bench.py`、`moe_single_qpc_host.cpp` | 单 QPC 编译、卡上溢出/数值检查、预热后的 C++ 主机计时；见 `9.17.2026/multilayer/README.md` |
+| `moe_grant_access.sh` | 管理员授予指定用户设备及实验数据访问权限，备份原 ACL |
 
 ## 放置与机制探针
 | 脚本 | 用途 |
 |---|---|
+| `moe_capacity_probe.py`、`moe_capacity_probe_host.cpp`、`moe_capacity_audit.py` | 固定 128 token，单 QPC 运行时切换两轮容量；两卡/四卡、逐次输出验证、溢出检测、形状/权重包审计及设备 trace；见 `9.17.2026/runtime_constraints/README.md` |
+| `moe_resident_selection.py`、`moe_resident_selection_host.cpp`、`moe_resident_audit.py` | 单卡常驻 32 expert，用运行时 ID 在两个固定容量组之间重分组；FP16/MXFP6、Qwen 矩阵尺寸、静态分组对照及压缩/设备 trace 审计；见 `9.17.2026/runtime_constraints/RESIDENT_SELECTION.md` |
+| `moe_group_width_probe.py` | 复用同一常驻 expert bank、输入与参考，等 padding 工作量扫描每组 1–32 expert；逐次验证、FP16/MXFP6 延迟、实际打包形状及 HMX 核参与度；见 `9.17.2026/runtime_constraints/GROUP_WIDTH.md` |
+| `moe_adaptive_probe.py`、`moe_adaptive_host.cpp` | 单常驻 QPC 同时切换 expert ID 与八组容量；四种切换模式、无状态 overflow/replay、profile 子集常量存储和设备 trace 审计；见 `9.17.2026/runtime_constraints/COMBINED_ADAPTATION.md` |
+| `moe_current_count_probe.py`、`moe_current_count_host.cpp` | 单卡先获取当前路由计数，再选择 expert ID 和容量；1+15 核双常驻、两种 ProgramGroup 协议、15/16 核 fused 对照、逐次正确性和内存审计；见 `9.17.2026/runtime_constraints/CURRENT_COUNT_DISPATCH.md` |
+| `moe_topology_probe.py`、`moe_topology_host.cpp` | 单常驻 QPC 以 shape-resolved If 切换 1–32 expert 组宽，并改变运行时 ID；固定拓扑对照、编译限制、布局子集存储及逐分支设备 trace；见 `9.17.2026/runtime_constraints/TOPOLOGY_SWITCHING.md` |
+| `moe_joint_scale.py`、`moe_joint_host.cpp`、`moe_joint_runtime.h` | 联合切换当前计数驱动的 expert ID、均匀/混合组宽及容量；64/128/256 token、32/128 expert、保守对照、编译常量和分阶段设备内存审计 |
+| `moe_layer_scale.py` | 1/2/4 层依赖的合成 MoE 链；128 expert、两种容量 profile、独立层权重；保留路由特征以控制负载，未包含 attention/KV |
+| `moe_multicard_joint.py`、`moe_multicard_joint_host.cpp` | 四卡各驻留 32 expert，使用当前全局 router 输出，比较各卡独立/共同 profile 与保守 profile；四卡并发及串行执行对照、主机 FP32 求和和单卡参考 |
 | `moe_probe_placement.sh`、`moe_probe_lane2core.py`、`moe_probe_lane2device.py`、`moe_probe_tap2core.py` | lane → 卡 / 核 的放置探针 |
 | `moe_proof_percard_ops.py`、`moe_sync_straggler.py`、`moe_ep_stage_timeline.py`、`moe_onnx_structure.py`、`moe_find_expert_bytes.py`、`moe_verify_expert_tensor.py` | 真模型 trace 解读、算子归属、权重定位 |
 | `moe_ep_predict.py`、`moe_ep_batch_sweep.py`、`moe_blocksize_sweep.py`、`moe_decode_bmm_export.py`、`moe_tiny_ep_decode_proof.py` | EP 负载预测、decode 形态实验 |

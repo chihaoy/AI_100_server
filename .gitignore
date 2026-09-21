@@ -7,6 +7,7 @@
 !*.py
 !*.sh
 !*.cpp
+!tools/moe_joint_runtime.h
 !*.html
 !9.17.2026/结论总结/*.txt
 !9.17.2026/结论总结/*.png

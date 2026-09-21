@@ -45,7 +45,25 @@ AI 100 上 MoE expert 放置与 padding 研究的脚本和结论文档,从 mllm 
 16. [`端到端prefill_naive_vs_两QPC.md`](9.17.2026/结论总结/端到端prefill_naive_vs_两QPC.md) — **48 层端到端**:正确性与 naive 一样;但每层换 program 不可行,若能常驻 388 vs 520 ms;fp16 RMSNorm 溢出与画布余量两个坑
 17. [`一个program能否换图_探索.md`](9.17.2026/结论总结/一个program能否换图_探索.md) — specialization / `If` / ProgramGroup / 多 program QPC 逐一验证;换 program 的真实成本是重搬权重(6.9 ms / 171 MB)
 
-**当前结论(9 月 21 日)**:整模型只能是一个 QPC、一个分区、四卡;可用的自由度是每层的 expert 顺序和两轮各自的画布(128 / 32),估一层 8.2 ms;lane 分档估 6.5 ms(未测)。下一步是把 48 层按此编成一个 QPC 跑端到端。
+**静态路径的阶段结论(9 月 21 日，运行时探针之前)**:当时采用的整模型路径是一个 QPC、一个分区、四卡;可用的自由度是每层的 expert 顺序和两轮各自的画布(128 / 32),估一层 8.2 ms;lane 分档估 6.5 ms(未测)。48 层单 QPC 端到端仍待验证；后续运行时实验见下文。
+
+**新增两层验证(9 月 21 日)**:[不同层 padding 编进同一 QPC](9.17.2026/multilayer/README.md) 已在四卡实测:layer 0 用 64/32、layer 1 用 128/32,两层输出与 uniform 128/128 逐位相同、零溢出。FP16 主机延迟 25.54 → 21.31 ms(降 16.55%),MXFP6 22.53 → 20.05 ms(降 11.01%);MXFP6 两个变体均有 5.57% 的 fp32 参考误差,详见报告。仅一条已用过的 prompt,48 层和独立测试集尚未验证。
+
+**运行时自适应的研究范围**:上述静态路径结论不排除其他运行时设计。[跨 prefill chunk 的设计空间](9.17.2026/multilayer/RUNTIME_ADAPTATION.md) 保留单四卡 QPC 与两对卡 QPC、动态容量、expert 重分组、activation 路由、权重复制和迁移，按实测支持程度与成本决定算法约束。[首个约束探针](9.17.2026/runtime_constraints/README.md) 已验证固定 128 token、单个常驻 QPC 的四种容量切换，支持四卡和任一两卡对。[第二个探针](9.17.2026/runtime_constraints/RESIDENT_SELECTION.md) 已验证单卡常驻 expert 的运行时 ID 重分组及 MXFP6 路径，含 Qwen 矩阵尺寸；目前仍为合成权重，完整模型及 KV 状态尚待验证。
+
+[第三个约束探针](9.17.2026/runtime_constraints/GROUP_WIDTH.md) 固定总 padding 工作量扫描每组 1–32 expert，均可执行；本配置下每组 4 expert 相比 16 expert 降低 FP16/MXFP6 延迟约 20%/26%。设备 trace 显示单 expert 也可使用全部 16 个 HMX 核，分组宽度不能直接当作核数。该探针中不同组数为分别编译的 QPC；后续单程序切换见第六个探针。
+
+[第四个探针](9.17.2026/runtime_constraints/COMBINED_ADAPTATION.md) 已在单常驻 QPC 中组合运行时 expert ID 与五种八组容量，验证逐次切换、无状态 overflow/replay 及 MXFP6 路径。profile 库的常量共享依赖容量组合与精度：16/32 的三个 profile 几乎无额外权重存储，加入 128 或 64 可明显增加空间。该探针尚未覆盖当前层路由计数的提前获取、多卡及 KV 状态；当前计数与多卡的后续结果见下文。
+
+[第五个探针](9.17.2026/runtime_constraints/CURRENT_COUNT_DISPATCH.md) 已验证先读取当前层 router 输出，再选择 expert ID 和容量：单卡 1 核 router + 15 核 expert 可同时保持激活，FP16/MXFP6 输出与 fused 对照逐位相同。相对 15 核 fused 对照，净边界成本约 0.30–0.61 ms；两种 ProgramGroup 切换协议均更慢。仍是合成权重、部分 expert 的无状态探针，MXFP6 参考误差约 6% 尚未解决。
+
+**探索顺序（2026-09-21 更新）**：已按[单卡探索清单](9.17.2026/runtime_constraints/SINGLE_CARD_ROADMAP.md)完成 card 0 上的联合控制（expert ID、组宽、容量、当前计数）及规模测量，并完成首轮多卡实验。真实权重、KV/chunk 连续性及应用路由 trace 后续继续探索；保留此前所有多卡设计候选。
+
+[第六个探针](9.17.2026/runtime_constraints/TOPOLOGY_SWITCHING.md) 已在单常驻程序内切换每组 1、2、4、8、16、32 expert，并同时改变 ID。输入 shape 决定编译时可解析的 If 分支；设备只执行选中拓扑，FP16/MXFP6 均与对应固定组宽对照逐位相同。六种布局的 packed constants 约为单独 width 4 的 4.8 倍，并有持续执行开销；输入数值决定的 If 与双输出分支在本 SDK 路径被拒绝。
+
+[联合控制及规模探针](9.17.2026/runtime_constraints/JOINT_SCALING.md) 已完成本轮单卡步骤 1、2：当前计数驱动 expert ID、均匀/混合组宽与容量，覆盖 32/128 expert、64/128/256 token 和 1/2/4 层依赖的合成 MoE，共 44,400 次计时事务通过机制检查。四层双 profile 占用设备内存 FP16 9.516 GiB、MXFP6 3.959 GiB；MXFP6 约 6% 参考误差仍未解决。
+
+[四卡独立 profile 实验](9.17.2026/runtime_constraints/MULTICARD_JOINT.md) 已完成 8,640 次四卡计时事务及 4,560 次匹配的单卡对照。每卡固定驻留 32 expert，可在同一 chunk 独立选择 padding；T=128 warm 输入使用 card 0/3 的 C32 与 card 1/2 的 C16。T=128 balanced 的 FP16 并发主机延迟为 7.928 ms，四卡保守对照为 18.304 ms。跨卡 ownership 变化、复制与两对卡 QPC 仍待测；本轮结束时四卡资源均已释放。
 
 ## 复现入口
 
