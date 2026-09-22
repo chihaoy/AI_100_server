@@ -35,6 +35,12 @@ remote activations releasing groups of cores, persistent weight-sized DDR
 copies at small capacity, and core-0 vector reductions. It includes the actual
 full-model layer budget, cross-card timelines and all 16 cores within card 0.
 
+The [measured overhead ablations](overhead_ablation/README.md) remove the first
+group's redundant zero-accumulator read/add and tile the local reduction. At
+fixed hot128/cold2, the combined rewrite reduces uninstrumented layer-2 replay
+latency from 10.305 to 7.776 ms (24.54%), with bit-exact saved outputs. The
+profile shows smaller TCM merge kernels on core 0 and unchanged P2P payload.
+
 ## Scope and method
 
 The benchmark uses the trained Qwen3-30B-A3B model, all 48 decoder layers,

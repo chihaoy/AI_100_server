@@ -55,7 +55,7 @@ def tensor(name, dtype, shape):
     return h.make_tensor_value_info(name, dtype, shape)
 
 
-def compile_model(graph, out, prefix=False):
+def compile_model(graph, out, prefix=False, stats_level=70):
     out.mkdir(parents=True, exist_ok=False)
     cmd = [SDK / 'exec/qaic-compile', '-aic-hw', '-aic-hw-version=ai100', f'-m={graph}',
            '-convert-to-fp16', '-aic-num-cores=16', '-mos=1', '-aic-enable-depth-first',
@@ -65,14 +65,14 @@ def compile_model(graph, out, prefix=False):
         cmd += ['-retained-state', f'-network-specialization-config={CONFIG / "specializations_flat.json"}',
                 f'-custom-IO-list-file={graph.parent / "custom_io.yaml"}']
     else:
-        cmd += ['-stats-level=70']
+        cmd += [f'-stats-level={stats_level}']
     started = time.monotonic()
     command(cmd, out / 'compile.log')
     if not (out / 'qpc/programqpc.bin').is_file():
         raise RuntimeError('Compiler produced no QPC')
     dump(out / 'result.json', dict(seconds=time.monotonic()-started, graph=str(graph),
                                   qpc_bytes=(out / 'qpc/programqpc.bin').stat().st_size,
-                                  stats_level=0 if prefix else 70))
+                                  stats_level=0 if prefix else stats_level))
     print('COMPILE_OK', out, flush=True)
 
 
