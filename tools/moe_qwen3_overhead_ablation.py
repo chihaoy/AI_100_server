@@ -174,7 +174,7 @@ def validate(args, out):
     return result
 
 
-def timing(args):
+def timing(args, qpc_fn=qpc):
     host = args.base_scratch/'moe_single_host'
     if not host.is_file():
         raise ValueError('Build the existing single-QPC benchmark host first')
@@ -184,7 +184,7 @@ def timing(args):
             case = args.out/name
             out = case/f'{args.timing_prefix}_r{index}'
             resources(case/f'{args.timing_prefix}_before_r{index}.txt')
-            command([host, qpc(args, name), args.cold/'input_f16.bin', out, args.iterations, 10],
+            command([host, qpc_fn(args, name), args.cold/'input_f16.bin', out, args.iterations, 10],
                     case/f'{args.timing_prefix}_r{index}.log')
             resources(case/f'{args.timing_prefix}_after_r{index}.txt')
             result = validate(args, out)
@@ -195,7 +195,7 @@ def timing(args):
                   'bit_exact', result['bit_exact'], flush=True)
 
 
-def profile(args, name):
+def profile(args, name, qpc_fn=qpc):
     case = args.out/name
     out = case/'profile'
     out.mkdir(exist_ok=False)
@@ -213,7 +213,7 @@ def profile(args, name):
     for directory in ['stats', 'outputs', 'trace']:
         (out/directory).mkdir()
     resources(out/'resources_before.txt')
-    command([SDK/'exec/qaic-runner', '-t', qpc(args, name), '-D', '0:1:2:3',
+    command([SDK/'exec/qaic-runner', '-t', qpc_fn(args, name), '-D', '0:1:2:3',
              '--aic-batch-json-input', out/'io.json', '-n', 5, '-S', 1, '-T', 1, '-c',
              '--aic-profiling-type', 'raw_device_stats', '--aic-profiling-start-iter', 2,
              '--aic-profiling-num-samples', 3, '--aic-profiling-out-dir', out/'stats',
@@ -231,7 +231,7 @@ def profile(args, name):
             checked[key].append(str(path))
     if any(len(checked[k]) != 3 for k in ['y', 'counts']):
         raise ValueError('Missing profile output')
-    command([SDK/'exec/qaic-opstats', '--qpc', qpc(args, name)/'programqpc.bin',
+    command([SDK/'exec/qaic-opstats', '--qpc', qpc_fn(args, name)/'programqpc.bin',
              '--input-dir', out/'stats', '--output-dir', out/'trace', '--summary', '--trace',
              '--merge-mq-traces', 'true', '--flow-events', 'full'], out/'opstats.log')
     dump(out/'validation.json', dict(bit_exact_to_own_timing=True, samples=3, files=dict(checked)))

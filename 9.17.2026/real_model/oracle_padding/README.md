@@ -41,6 +41,13 @@ fixed hot128/cold2, the combined rewrite reduces uninstrumented layer-2 replay
 latency from 10.305 to 7.776 ms (24.54%), with bit-exact saved outputs. The
 profile shows smaller TCM merge kernels on core 0 and unchanged P2P payload.
 
+The [routing scan and padding retune](routing_retune/README.md) builds on those
+rewrites. Seven integer shift/add stages replace each routing prefix sum and
+execute on all 16 cores per card. It compares independent expert-row slices,
+repeats the cold-capacity sweep before and after the scan change, and confirms
+the selected variants with profiling disabled. The report separates kernel
+work from scheduling gaps and compares P2P payload at C2 and C32.
+
 ## Scope and method
 
 The benchmark uses the trained Qwen3-30B-A3B model, all 48 decoder layers,
