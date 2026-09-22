@@ -48,6 +48,15 @@ repeats the cold-capacity sweep before and after the scan change, and confirms
 the selected variants with profiling disabled. The report separates kernel
 work from scheduling gaps and compares P2P payload at C2 and C32.
 
+The [active-expert oracle](active_oracle/README.md) physically omits the 42 empty
+cold experts in this captured layer. Preserving the existing routing and
+accumulation layout while shrinking the FFNs reduces host latency from
+7.251 to 5.997 ms (17.29%), with bit-exact saved outputs. Cold projection DDR
+copies fall from 576 to about 197 MiB. Compacting the whole cold path instead
+regresses to 8.979 ms: the compiler moves local reduction onto four cores of
+card 0 and increases P2P payload. This is an offline feasibility result, with
+runtime active-set selection and weight changes excluded.
+
 ## Scope and method
 
 The benchmark uses the trained Qwen3-30B-A3B model, all 48 decoder layers,

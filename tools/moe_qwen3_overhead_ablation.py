@@ -238,7 +238,7 @@ def profile(args, name, qpc_fn=qpc):
     print('PROFILE_OK', name, flush=True)
 
 
-def trace_metrics(path):
+def trace_metrics(path, require_full_expert_coverage=True, allow_card0_reduction=False):
     nodes, device_ms = summarize_trace(path)
     threads = {(e['pid'], e['tid']): e['args']['name'] for e in events(path, metadata_only=True)
                if e['name']=='thread_name'}
@@ -267,7 +267,7 @@ def trace_metrics(path):
         result[stage+'_end_ms'] = max(r['end_us'] for r in selected)/1000
         result[stage+'_span_ms'] = result[stage+'_end_ms']-result[stage+'_start_ms']
         result[stage+'_cores'] = len({(r['card'], r['core']) for r in selected})
-        if result[stage+'_cores'] != 64:
+        if require_full_expert_coverage and result[stage+'_cores'] != 64:
             raise ValueError('Expert core coverage changed')
     local = [r for r in work if (r['node']==STEM+'Einsum_3' or r['node'].startswith(STEM+'reduce_tile_'))
              and r['engine']=='HVX' and r['kind']=='aicbatchedreduceadd']
@@ -293,6 +293,17 @@ def trace_metrics(path):
     # merge's memory path; do not call the gain a 16-way parallel merge.
     merge_busy = defaultdict(float)
     merge_memory = set()
+    compact = all({(r['card'],r['core']) for r in local if r['node']==node} == {(0,c) for c in range(4)}
+                  and sum(r['node']==node for r in local)==4 for node in {r['node'] for r in local})
+    if compact:
+        if not allow_card0_reduction:
+            raise ValueError('Reduction moved to four cores of card 0; inspect lowering')
+        # Observed with cold-path compaction: one kernel per tile on card-0
+        # cores 0..3, with no second local merge kernel. Do not mislabel it.
+        result['local_reduction_layout'] = 'card0_cores0_3'
+        result['core0_merge_max_ms'] = None
+        result['core0_merge_memory'] = None
+        return result, nodes, work, p2p
     for card in range(4):
         for node in {r['node'] for r in local}:
             selected = [r for r in local if r['card']==card and r['node']==node]
@@ -305,6 +316,7 @@ def trace_metrics(path):
             merge_memory.add(merge['memory'])
     result['core0_merge_max_ms'] = max(merge_busy.values())
     result['core0_merge_memory'] = ','.join(sorted(merge_memory))
+    result['local_reduction_layout'] = 'all_cards_16cores_then_core0_merge'
     return result, nodes, work, p2p
 
 
