@@ -45,12 +45,47 @@ def core_work(work, node, kind):
     return len(by_core), statistics.median(by_core.values()), max(by_core.values())
 
 
+def idle_gaps(root, case):
+    """Audit the C2 idle-looking intervals using the same clock origin as the figure."""
+    src = directory(root, case)
+    origin = case['device_start_ms']
+    work, waits = rows(src/'work.csv'), rows(src/'waits.csv')
+
+    def interval(r):
+        return dict(node=r['node'], kind=r['kind'], core=int(r['core']),
+                    start_ms=float(r['start_us'])/1000-origin,
+                    end_ms=float(r['end_us'])/1000-origin,
+                    duration_ms=float(r['duration_us'])/1000)
+
+    result = dict(capacity=case['capacity'], sample=case['sample'], origin_sdk_ms=origin,
+                  time_origin='device execution start')
+    for name, node, memory in [('zero_accumulator', 'ConstantOfShape_1', 'DDR'),
+                               ('cold_prefix_sum', 'CumSum_1', 'TCM'),
+                               ('dense_reduction', 'Einsum_3', 'DDR')]:
+        selected = [r for r in work if r['card']=='0' and r['core']=='0' and
+                    r['engine']=='HVX' and r['node']==STEM+node and r['memory']==memory]
+        if len(selected) != 1:
+            raise ValueError(f'Ambiguous core-0 interval: {name}')
+        result[name] = interval(selected[0])
+    result['last_gemm_end_by_card0_core_ms'] = [
+        max(float(r['end_us'])/1000-origin for r in work if r['card']=='0' and
+            int(r['core'])==core and r['engine']=='HMX' and r['kind']=='aicconvolutiond32')
+        for core in range(16)]
+    result['core8_terminal_waits'] = [interval(r) for r in waits if r['card']=='0' and
+        r['core']=='8' and r['engine']=='HMX' and r['kind'] in ['aicendcyclestats', 'aicoutputsemaphoreinc']]
+    result['final_receive_events'] = [dict(port=r['port'], **interval(r)) for r in work
+        if r['node']==STEM+'Einsum_3' and r['port'].startswith('0<-')]
+    (root/'idle_gap_check.json').write_text(json.dumps(result, indent=2)+'\n')
+    return result
+
+
 def report(root, data):
     cases = data['cases']
     base, small = cases
     work = {c['capacity']: rows(directory(root, c)/'work.csv') for c in cases}
     producers = {c['capacity']: rows(directory(root, c)/'producers.csv') for c in cases}
     p2p = {c['capacity']: {r['node'].removeprefix(STEM): r for r in rows(directory(root, c)/'p2p_summary.csv')} for c in cases}
+    gaps = idle_gaps(root, small)
     lines = [
         '# Qwen3 layer 2: card and core profiling', '',
         'Analyzed 2026-09-22; trained Qwen3-30B-A3B FP16, batch 1, prefill 128, '
@@ -174,8 +209,45 @@ def report(root, data):
         '![All 16 cores within card 0](within_card.png)', '',
         'Each core row has four sublanes: HMX wait/compute, HVX work, DDR DMA, '
         'and local-memory multicast. The cold HMX span is lightly shaded. '
+        'GEMM dependency waits and other HMX thread synchronization use separate colors. '
+        'The additional bottom row shows recorded P2P endpoint intervals involving card 0; '
+        'these include waiting and are not continuous link utilization. '
         'Rows execute concurrently; the figure must not be read as a sum of costs. '
         'All cards and individual lowered operations are available in the CSV artifacts.', '',
+        '### What the idle-looking gaps mean', '',
+        'White space in the original chart was not a complete core-idle measurement: '
+        'it omitted P2P, HVX/DMA-issue waits, some local copies and cacheable-DDR gathers. '
+        'The original gray HMX lane also included end-of-program synchronization, '
+        'not just waits preceding GEMMs. The updated chart separates that synchronization '
+        'and adds P2P intervals.', '',
+        'For the C2 representative capture, the main card-0 intervals are below. '
+        'Times are milliseconds since device execution starts, matching the chart.', '',
+        '| Interval | What is happening | Why many compute engines have no work |',
+        '|---|---|---|',
+        '| Approximately 2.0–4.5 ms | Hot-group activation/index exchange, unpacking and accumulator update | '
+        'Many cores wait on P2P and packing dependencies before cold-stage inputs are ready; '
+        'brief down-GEMM and vector work still occurs within this window. |',
+        f'| {gaps["zero_accumulator"]["start_ms"]:.3f}–{gaps["zero_accumulator"]["end_ms"]:.3f} ms | '
+        f'Core 0 zeroes the dense accumulator ({gaps["zero_accumulator"]["duration_ms"]:.3f} ms) | '
+        'This vector stage has limited core participation. |',
+        f'| {gaps["cold_prefix_sum"]["start_ms"]:.3f}–{gaps["cold_prefix_sum"]["end_ms"]:.3f} ms | '
+        f'Core 0 computes the cold routing prefix sum ({gaps["cold_prefix_sum"]["duration_ms"]:.3f} ms) | '
+        'Other cores cannot use the resulting packing indices until ready. |',
+        f'| {gaps["dense_reduction"]["start_ms"]:.3f}–{gaps["dense_reduction"]["end_ms"]:.3f} ms | '
+        f'Core 0 performs the dense local reduction ({gaps["dense_reduction"]["duration_ms"]:.3f} ms) | '
+        'Expert GEMMs have finished; other cores wait for final combination and output synchronization. |', '',
+        f'All 16 card-0 cores finish their last GEMM by '
+        f'{max(gaps["last_gemm_end_by_card0_core_ms"]):.3f} ms, although the complete replay '
+        f'lasts {small["device_ms"]:.3f} ms. Core 8, for example, waits in '
+        '`aicendcyclestats` around 7.128–7.731 ms and then in an output semaphore '
+        'around 7.739–9.392 ms. This is waiting for graph completion, not additional '
+        'expert arithmetic or evidence of continuous weight DMA. The short stats operation '
+        'itself must not be charged the full preceding wait as profiling overhead.', '',
+        'Remote final-result receive events on card 0 remain open until 9.246–9.391 ms. '
+        'Their long intervals include waiting for remote producers; they do not show '
+        'that the links transfer continuously. The profile exposes limited parallelism '
+        'and dependency sequencing in the compiled route/unpack/combine path. It does '
+        'not establish that every such gap can be removed or overlapped safely.', '',
         '### Actual compute work, separate from elapsed spans', '',
         'Values below sum compute durations within each participating core and then take '
         'the maximum core. They are **not operator latency** and cannot be added to '
@@ -257,7 +329,8 @@ def report(root, data):
         '`summary.json` and `full_model_layer2.csv` hold the main results. Each '
         '`c*/sample*/` contains `work.csv`, `waits.csv`, `cores.csv`, `nodes.csv`, '
         '`p2p.csv`, `p2p_summary.csv`, `flows.csv`, `cross_core.csv`, `producers.csv`, '
-        'and `cold_copies.csv`. Full-flow traces are in `c*/trace/`; metadata is in '
+        'and `cold_copies.csv`. `idle_gap_check.json` records the figure-relative gap audit. '
+        'Full-flow traces are in `c*/trace/`; metadata is in '
         '`c*/metadata/`. Charts are available as PNG, PDF and SVG. Large local artifacts '
         'follow the repository ignore policy; scripts and this report are committed.', '',
         '## Reproduce from the saved captures', '',
@@ -344,14 +417,16 @@ def plots(root, data):
     save(fig, 'cross_card')
 
     fig, axes = plt.subplots(1, 2, figsize=(15, 11), sharey=True, layout='constrained')
-    colors = {'wait': '#d8d8d8', 'HMX': '#13876a', 'HVX': '#8c62a6', 'DDR': '#4783b3', 'local': '#d98735'}
+    colors = {'wait': '#d8d8d8', 'sync': '#e4d6aa', 'HMX': '#13876a', 'HVX': '#8c62a6',
+              'DDR': '#4783b3', 'local': '#d98735', 'P2P': '#b66c75'}
     for ax, case in zip(axes, data['cases']):
         src = directory(root, case)
         origin = case['device_start_ms']
         bars = defaultdict(list)
         for r in rows(src/'waits.csv'):
             if r['card'] == '0' and r['engine'] == 'HMX':
-                bars[int(r['core']), 'wait'].append((float(r['start_us'])/1000-origin, float(r['duration_us'])/1000))
+                label = 'wait' if r['kind']=='aicconvolutiond32' else 'sync'
+                bars[int(r['core']), label].append((float(r['start_us'])/1000-origin, float(r['duration_us'])/1000))
         for r in rows(src/'work.csv'):
             if r['card'] != '0':
                 continue
@@ -366,21 +441,25 @@ def plots(root, data):
                 kind = 'local'
             if kind:
                 bars[int(r['core']), kind].append((float(r['start_us'])/1000-origin, float(r['duration_us'])/1000))
-        offsets = {'wait': -.38, 'HMX': -.38, 'HVX': -.18, 'DDR': .02, 'local': .22}
-        for kind in ['wait', 'HMX', 'HVX', 'DDR', 'local']:
+        offsets = {'wait': -.38, 'sync': -.38, 'HMX': -.38, 'HVX': -.18, 'DDR': .02, 'local': .22}
+        for kind in ['wait', 'sync', 'HMX', 'HVX', 'DDR', 'local']:
             for core in range(16):
                 ax.broken_barh(bars[core, kind], (core+offsets[kind], .16), facecolors=colors[kind], linewidth=0)
+        p2p_intervals = [(float(r['start_us'])/1000-origin, float(r['duration_us'])/1000)
+                         for r in rows(src/'p2p.csv') if r['port'].startswith(('0->', '0<-'))]
+        ax.broken_barh(p2p_intervals, (16-.2, .4), facecolors=colors['P2P'], linewidth=0)
         bounds = case['phase_boundaries_ms']
         ax.axvspan(bounds[3]-origin, bounds[4]-origin, alpha=.08, color='#d95f02')
         for y in np.arange(.5, 16, 1):
             ax.axhline(y, color='#dddddd', lw=.5)
-        ax.set(yticks=range(16), yticklabels=[f'Core {c}' for c in range(16)],
-               xlabel='Time since device start (ms)', xlim=(0, 11.6), ylim=(15.6, -.6),
+        ax.set(yticks=range(17), yticklabels=[f'Core {c}' for c in range(16)]+['Card 0 P2P'],
+               xlabel='Time since device start (ms)', xlim=(0, 11.6), ylim=(16.6, -.6),
                title=f'Card 0 · cold C{case["capacity"]} · {case["device_ms"]:.3f} ms device interval')
         ax.grid(axis='x', alpha=.15)
     fig.legend(handles=[Patch(color=colors[k], label=l) for k, l in [
-        ('wait', 'HMX dependency wait'), ('HMX', 'HMX compute'), ('HVX', 'HVX compute'),
-        ('DDR', 'Recorded DDR DMA interval'), ('local', 'Local-memory multicast')]],
+        ('wait', 'GEMM dependency wait'), ('sync', 'Other HMX thread sync'),
+        ('HMX', 'HMX compute'), ('HVX', 'HVX compute'), ('DDR', 'Recorded DDR DMA interval'),
+        ('local', 'Local-memory multicast'), ('P2P', 'Recorded P2P wait / transfer interval')]],
         loc='outside lower center', ncol=3, fontsize=9)
     fig.suptitle('Within one card: all 16 cores and four concurrent activity lanes per core')
     save(fig, 'within_card')

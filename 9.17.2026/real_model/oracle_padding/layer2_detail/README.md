@@ -88,7 +88,24 @@ Each card has 16 active HMX cores. The trace also separates vector work (HVX), D
 
 ![All 16 cores within card 0](within_card.png)
 
-Each core row has four sublanes: HMX wait/compute, HVX work, DDR DMA, and local-memory multicast. The cold HMX span is lightly shaded. Rows execute concurrently; the figure must not be read as a sum of costs. All cards and individual lowered operations are available in the CSV artifacts.
+Each core row has four sublanes: HMX wait/compute, HVX work, DDR DMA, and local-memory multicast. The cold HMX span is lightly shaded. GEMM dependency waits and other HMX thread synchronization use separate colors. The additional bottom row shows recorded P2P endpoint intervals involving card 0; these include waiting and are not continuous link utilization. Rows execute concurrently; the figure must not be read as a sum of costs. All cards and individual lowered operations are available in the CSV artifacts.
+
+### What the idle-looking gaps mean
+
+White space in the original chart was not a complete core-idle measurement: it omitted P2P, HVX/DMA-issue waits, some local copies and cacheable-DDR gathers. The original gray HMX lane also included end-of-program synchronization, not just waits preceding GEMMs. The updated chart separates that synchronization and adds P2P intervals.
+
+For the C2 representative capture, the main card-0 intervals are below. Times are milliseconds since device execution starts, matching the chart.
+
+| Interval | What is happening | Why many compute engines have no work |
+|---|---|---|
+| Approximately 2.0–4.5 ms | Hot-group activation/index exchange, unpacking and accumulator update | Many cores wait on P2P and packing dependencies before cold-stage inputs are ready; brief down-GEMM and vector work still occurs within this window. |
+| 4.496–4.867 ms | Core 0 zeroes the dense accumulator (0.371 ms) | This vector stage has limited core participation. |
+| 4.871–5.270 ms | Core 0 computes the cold routing prefix sum (0.399 ms) | Other cores cannot use the resulting packing indices until ready. |
+| 7.742–9.354 ms | Core 0 performs the dense local reduction (1.612 ms) | Expert GEMMs have finished; other cores wait for final combination and output synchronization. |
+
+All 16 card-0 cores finish their last GEMM by 7.132 ms, although the complete replay lasts 9.703 ms. Core 8, for example, waits in `aicendcyclestats` around 7.128–7.731 ms and then in an output semaphore around 7.739–9.392 ms. This is waiting for graph completion, not additional expert arithmetic or evidence of continuous weight DMA. The short stats operation itself must not be charged the full preceding wait as profiling overhead.
+
+Remote final-result receive events on card 0 remain open until 9.246–9.391 ms. Their long intervals include waiting for remote producers; they do not show that the links transfer continuously. The profile exposes limited parallelism and dependency sequencing in the compiled route/unpack/combine path. It does not establish that every such gap can be removed or overlapped safely.
 
 ### Actual compute work, separate from elapsed spans
 
@@ -143,7 +160,7 @@ Earlier copies in the same batch can have sub-microsecond visible durations whil
 - HMX waits use `opSyncDurUs`, not the zero visible sync duration; waits are clipped to the cold interval and checked for per-thread overlap. All wait/compute pairs agree within 1 µs. Overlapping DMA, waits and parallel core work are not added.
 - Compiler descriptors are copied locally and decoded with the installed SDK binary’s embedded `AICOpstatsDesc.proto` schema. Schema, descriptor and trace hashes are saved.
 
-`summary.json` and `full_model_layer2.csv` hold the main results. Each `c*/sample*/` contains `work.csv`, `waits.csv`, `cores.csv`, `nodes.csv`, `p2p.csv`, `p2p_summary.csv`, `flows.csv`, `cross_core.csv`, `producers.csv`, and `cold_copies.csv`. Full-flow traces are in `c*/trace/`; metadata is in `c*/metadata/`. Charts are available as PNG, PDF and SVG. Large local artifacts follow the repository ignore policy; scripts and this report are committed.
+`summary.json` and `full_model_layer2.csv` hold the main results. Each `c*/sample*/` contains `work.csv`, `waits.csv`, `cores.csv`, `nodes.csv`, `p2p.csv`, `p2p_summary.csv`, `flows.csv`, `cross_core.csv`, `producers.csv`, and `cold_copies.csv`. `idle_gap_check.json` records the figure-relative gap audit. Full-flow traces are in `c*/trace/`; metadata is in `c*/metadata/`. Charts are available as PNG, PDF and SVG. Large local artifacts follow the repository ignore policy; scripts and this report are committed.
 
 ## Reproduce from the saved captures
 
