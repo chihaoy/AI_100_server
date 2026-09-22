@@ -57,6 +57,16 @@ regresses to 8.979 ms: the compiler moves local reduction onto four cores of
 card 0 and increases P2P payload. This is an offline feasibility result, with
 runtime active-set selection and weight changes excluded.
 
+The [all-experts-active experiment](all_active/README.md) keeps all 128 trained
+experts and varies synthetic routing across five 128-token workloads. Frozen
+joint placement/capacity choices confirm at 5.457 ms versus 5.476 ms for the
+best tested static plan (0.35% lower), but provide no additional gain over a
+fixed layout with per-input capacity choices (5.443 ms). At small capacities,
+32/2 cuts P2P payload by 45.99% relative to 32/32 while device latency stays
+near 4.9 ms. Source-group reversal does not force reversed FFN execution order.
+This result covers the tested two-group topology and routing peaks up to 29;
+selection and reconfiguration costs are excluded.
+
 ## Scope and method
 
 The benchmark uses the trained Qwen3-30B-A3B model, all 48 decoder layers,

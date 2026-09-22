@@ -242,7 +242,7 @@ def compile_case(args,name):
                 shutil.copy2(target/filename,out/f'stats{args.stats_level}_{filename}')
 
 
-def metadata(args,name):
+def metadata(args,name,constants_root=None):
     case=args.out/name
     target=case/'metadata'
     if not target.exists():
@@ -268,9 +268,19 @@ def metadata(args,name):
                         key=(card,core,int(op.oc))
                         if key in lookup:
                             raise ValueError('Duplicate descriptor key')
+                        kind=kinds[op.kind_id]
+                        if op.memory_id in memories:
+                            memory=memories[op.memory_id]
+                        elif op.memory_id==0 and kind=='aicinputsemaphoreinc' and op.output_size==0:
+                            # Semaphore increments can omit the optional memory
+                            # field. They are not DDR/TCM transfer descriptors.
+                            memory='unspecified_semaphore'
+                        else:
+                            raise ValueError(f'Unknown descriptor memory: {op}')
                         lookup[key]=dict(name=op.name,bytes=int(op.output_size),
-                                         kind=kinds[op.kind_id],memory=memories[op.memory_id])
-    constants=args.scratch/f'{name}_constant_segments'
+                                         kind=kind,memory=memory)
+    constants=(constants_root or args.scratch)/f'{name}_constant_segments'
+    constants.parent.mkdir(parents=True,exist_ok=True)
     if not constants.exists():
         command([SDK/'tools/qaic-qpc','extract','--qpc',qpc(args,name)/'programqpc.bin',
                  '--output-dir',constants,'-s','*StaticConstants.constants.bin'],case/'constants_extract.log')
