@@ -29,6 +29,12 @@ seven cold capacities. Cold C128 → C2 reduces isolated MoE host latency by
 dependency waits at small capacities. These isolated-layer timings are kept
 separate from full-model results.
 
+The [detailed layer-2 card/core profile](layer2_detail/README.md) decodes the
+saved C128/C2 captures with dependency flows and compiler byte counts. It shows
+remote activations releasing groups of cores, persistent weight-sized DDR
+copies at small capacity, and core-0 vector reductions. It includes the actual
+full-model layer budget, cross-card timelines and all 16 cores within card 0.
+
 ## Scope and method
 
 The benchmark uses the trained Qwen3-30B-A3B model, all 48 decoder layers,
