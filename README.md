@@ -71,6 +71,8 @@ AI 100 上 MoE expert 放置与 padding 研究的脚本和结论文档,从 mllm 
 
 **逐层 profiling 与 2 的幂 padding**：[48 层完整对照](9.17.2026/real_model/oracle_padding/layer_profile/results/README.md) 已完成 6 个相同 `stats-level=70` 配置、360 次计时和 18 份 trace。FP16 的平均 MoE 时间为 C128 11.5466 → 最小容量 10.0475 → 2 的幂 9.7871 ms；MXFP6 为 10.1564 → 8.5871 → 8.0593 ms。2 的幂容量对 C128 的 MoE 加速为 1.180×/1.260×，但仅在 24/48 与 40/48 层优于最小容量，应保留两类候选逐层调优。这些是完整模型中的插桩时间，不应与上面的无插桩绝对时间混用；混合容量策略尚未编译测量。
 
+**编译器修复、MXFP6、全模型与 combine 重设计**：[`-mdts-mos=1` 系列实验（E1–E14）](9.17.2026/real_model/oracle_padding/mdts_flag/README.md) 发现默认编译把 MoE down projection 按输出列切到四卡（每层 121.6 MiB 跨卡交换），`-mdts-mos=1` 使其真正 expert-parallel（layer 2 重放 7.27 → 5.00 ms，输出逐位相同），此后 T=128 下 padding 与重分组不再影响时延，跨卡均衡成为主要杠杆；随后完成更大 prefill chunk 与分阶段容量（T=256/512）、整套重放的 MXFP6 版本、从 checkpoint 重建的全 48 层 prefill（MXFP6：497 → 352 ms 仅加 flag，→ 243 ms 移植层级重写，→ 232 ms 加 token-centric combine，logits 与历史逐位相同；flag 会破坏 KV retained state 配对，全模型 flag 版本为 prefill-only），以及去掉稠密累加器的 token-centric combine（MXFP6 重放 T=128/256/512 层时延 −10%/−27%/−31%，逐位相同）和 profiling 轮。QPC 与 trace 留在本地，脚本在 `mdts_flag/scripts/`。
+
 ## 复现入口
 
 - 单层微基准:`tools/moe_tier_bench.sh <name> <groups> [num_devices]`,导出器 `tools/moe_tier_bench_export.py`
