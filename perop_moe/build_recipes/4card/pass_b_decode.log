@@ -1,0 +1,14 @@
+=== 4-card TP compile: decode  (09:00:13) ===
+Warning: The -aic-hw-version argument '2.0' will be removed in the future. Please use 'ai100' instead.
+[Deprecated] -compile-only will be removed in a future release, default mode is compile-only
+Reading ONNX Model from /home/chihao/models/qwen3_30b_a3b/export-126f04c76d4a0568/Qwen3MoeForCausalLM.onnx
+Compile started ............... 
+Compiling model with FP16 precision.
+Generated binary is present at /home/chihao/models/qwen3_30b_a3b/4card/qpc_decode
+
+real	3m50.877s
+user	4m44.728s
+sys	1m50.443s
+qaic-compile rc=0
+QPC_OK
+25G	/home/chihao/models/qwen3_30b_a3b/4card/qpc_decode/programqpc.bin

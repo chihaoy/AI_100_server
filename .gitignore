@@ -7,6 +7,7 @@
 !*.py
 !*.sh
 !*.cpp
+!*.h
 !*.html
 !9.17.2026/结论总结/*.txt
 !9.17.2026/结论总结/*.png
@@ -14,3 +15,7 @@
 **/qpc/
 **/qpc_*/
 **/__pycache__/
+
+# build_recipes/ holds the full rebuild recipe (json/yaml/log configs) for the deleted
+# full-model QPCs; it is 720 KB and every file type in it is tracked on purpose.
+!perop_moe/build_recipes/**

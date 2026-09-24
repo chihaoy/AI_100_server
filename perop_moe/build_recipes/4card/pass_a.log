@@ -1,0 +1,7 @@
+Warning: The -aic-hw-version argument '2.0' will be removed in the future. Please use 'ai100' instead.
+Reading ONNX Model from /home/chihao/models/qwen3_30b_a3b/export-126f04c76d4a0568/Qwen3MoeForCausalLM.onnx
+Compile started ............... 
+Compiling model with FP16 precision.
+MDP partition file generated: /home/chihao/models/qwen3_30b_a3b/4card/moe_mdp_dump.json
+qaic-compile rc=0
+-rw-rw-r-- 1 chihao chihao 158547  八  28 08:59 /home/chihao/models/qwen3_30b_a3b/4card/moe_mdp_dump.json

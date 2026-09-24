@@ -1,0 +1,14 @@
+=== 4-card TP compile: FORCED ROUTING (router weights = 0) ===
+Warning: The -aic-hw-version argument '2.0' will be removed in the future. Please use 'ai100' instead.
+[Deprecated] -compile-only will be removed in a future release, default mode is compile-only
+Reading ONNX Model from /home/chihao/models/qwen3_30b_a3b/export_forced/Qwen3MoeForCausalLM.onnx
+Compile started ............... 
+Compiling model with FP16 precision.
+Generated binary is present at /home/chihao/models/qwen3_30b_a3b/4card/qpc_forced
+
+real	3m47.340s
+user	4m44.247s
+sys	1m45.685s
+rc=0
+QPC_OK
+25G	/home/chihao/models/qwen3_30b_a3b/4card/qpc_forced/programqpc.bin

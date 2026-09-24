@@ -1,4 +1,5 @@
 # Phase 1 结果 — Qwen3-30B-A3B (MoE) 在 4× AI 100 上的 expert 放置
+> **2026-09-22:** `/home/chihao/models/qwen3_30b_a3b/{ep,4card}` 与三个 `qeff*_cache` 已删除以腾磁盘(共 518 GB)。原始权重 `hf/` 保留;重建脚本、spec、custom_io 和日志见 [`build_recipes/`](build_recipes/README.md)。
 
 **日期**:2026-08-28  **结论**:默认配置下 **不存在 expert→卡/核 的静态映射**,四卡负载差异 **0.35%**。
 

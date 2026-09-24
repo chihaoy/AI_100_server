@@ -1,4 +1,5 @@
 # Expert 到卡、到核的放置规则:推导过程与证据
+> **2026-09-22:** `/home/chihao/models/qwen3_30b_a3b/{ep,4card}` 与三个 `qeff*_cache` 已删除以腾磁盘(共 518 GB)。原始权重 `hf/` 保留;重建脚本、spec、custom_io 和日志见 [`build_recipes/`](../build_recipes/README.md)。
 
 日期 2026-09-09。硬件 Qualcomm Cloud AI 100 × 4 卡(`/dev/accel0..3`),每卡 16 核。
 **所有结论均来自卡上实测**(编译产物、qaic-runner 输出张量、qaic profiler trace),

@@ -1,0 +1,17 @@
+=== EP 4 卡编译 (spec 已拍平以兼容 SDK 1.21.6) ===
+Reading ONNX Model from /home/chihao/models/qwen3_30b_a3b/ep/qeff_cache/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-ed085dabb01c623b/Qwen3MoeForCausalLM.onnx
+Compile started ............... 
+Compiling model with FP16 precision.
+Generated binary is present at /home/chihao/models/qwen3_30b_a3b/ep/qeff_cache/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-ed085dabb01c623b/qpc-6ff7c7675b1fcae0/qpc
+
+real	10m28.397s
+user	10m40.475s
+sys	3m55.043s
+rc=0
+QPC_OK
+25G	/home/chihao/models/qwen3_30b_a3b/ep/qeff_cache/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-ed085dabb01c623b/qpc-6ff7c7675b1fcae0/qpc/programqpc.bin
+programqpc.bin
+QAicGraph_slice00
+QAicGraph_slice01
+QAicGraph_slice02
+QAicGraph_slice03

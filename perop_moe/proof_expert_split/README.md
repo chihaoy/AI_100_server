@@ -1,4 +1,5 @@
 # 证据包:一个 expert 精确平分在四张卡上
+> **2026-09-22:** `/home/chihao/models/qwen3_30b_a3b/{ep,4card}` 与三个 `qeff*_cache` 已删除以腾磁盘(共 518 GB)。原始权重 `hf/` 保留;重建脚本、spec、custom_io 和日志见 [`build_recipes/`](../build_recipes/README.md)。
 
 **待证命题**:Qwen3-30B-A3B 在 4 张 AI 100 上按 QEfficient 默认配置(`mdp_ts_4.json`,单 partition
 4 卡 x 16 核)编译后,**每一个 expert 都被切成四等份、四张卡各持 1/4**;不存在任何 expert 到卡的分配。

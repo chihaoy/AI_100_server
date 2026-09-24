@@ -1,0 +1,4 @@
+=== [1] export (00:59:00) ===
+export step exit=1 (01:29:45)
+RuntimeError: Compilation failed!
+ABORT: no new qpc-* dir created after pipeline start (export did not complete)

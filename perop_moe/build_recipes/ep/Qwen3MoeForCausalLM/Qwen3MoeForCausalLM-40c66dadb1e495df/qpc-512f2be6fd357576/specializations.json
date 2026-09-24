@@ -1,0 +1,12 @@
+{
+    "specializations":[
+        {
+            "name":"Decode",
+            "symbols":{
+                "batch_size":"8",
+                "ctx_len":"256",
+                "seq_len":"1"
+            }
+        }
+    ]
+}

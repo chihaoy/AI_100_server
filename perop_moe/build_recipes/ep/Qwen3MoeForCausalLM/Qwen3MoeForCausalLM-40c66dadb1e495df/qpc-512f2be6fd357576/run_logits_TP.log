@@ -1,0 +1,38 @@
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/outdir_TP/logits-activation-0-inf-0.bin
+ ---- Stats ----
+InferenceCnt 1 TotalDuration 19567us BatchSize 1 Inf/Sec 51.106
+Device Performance: 
+--- Cumulative Device Metrics Report ---
+Metric,                 Value,         Unit           
+ProfilingSamples_Func_0,1,             Samples        
+--- Aggregated Device Metrics Report ---
+Metric,                            Avg,           Min,           Max,           Std            
+ExecTimeUs_Dev_2_Func_0,           14472.031,     14472.031,     14472.031,     0.000          
+BatchInfPerSec_Dev_2_Func_0,       69.099,        69.099,        69.099,        0.000          
+InfPerSec_Dev_2_Func_0,            69.099,        69.099,        69.099,        0.000          
+InfPCycles_Dev_2_Func_0,           15914022.000,  15914022.000,  15914022.000,  0.000          
+EffectiveFrequencyMHz_Dev_2_Func_0,1099.640,      1099.640,      1099.640,      0.000          
+InputWaitTimeUs_Dev_2_Func_0,      926551.875,    926551.875,    926551.875,    0.000          
+OutputWaitTimeUs_Dev_2_Func_0,     29.948,        29.948,        29.948,        0.000          
+ExecTimeUs_Dev_1_Func_0,           14464.948,     14464.948,     14464.948,     0.000          
+BatchInfPerSec_Dev_1_Func_0,       69.133,        69.133,        69.133,        0.000          
+InfPerSec_Dev_1_Func_0,            69.133,        69.133,        69.133,        0.000          
+InfPCycles_Dev_1_Func_0,           15910853.000,  15910853.000,  15910853.000,  0.000          
+EffectiveFrequencyMHz_Dev_1_Func_0,1099.959,      1099.959,      1099.959,      0.000          
+InputWaitTimeUs_Dev_1_Func_0,      926743.333,    926743.333,    926743.333,    0.000          
+OutputWaitTimeUs_Dev_1_Func_0,     30.573,        30.573,        30.573,        0.000          
+ExecTimeUs_Dev_3_Func_0,           14462.760,     14462.760,     14462.760,     0.000          
+BatchInfPerSec_Dev_3_Func_0,       69.143,        69.143,        69.143,        0.000          
+InfPerSec_Dev_3_Func_0,            69.143,        69.143,        69.143,        0.000          
+InfPCycles_Dev_3_Func_0,           15908389.000,  15908389.000,  15908389.000,  0.000          
+EffectiveFrequencyMHz_Dev_3_Func_0,1099.955,      1099.955,      1099.955,      0.000          
+InputWaitTimeUs_Dev_3_Func_0,      925842.500,    925842.500,    925842.500,    0.000          
+OutputWaitTimeUs_Dev_3_Func_0,     22.760,        22.760,        22.760,        0.000          
+ExecTimeUs_Dev_0_Func_0,           14495.885,     14495.885,     14495.885,     0.000          
+BatchInfPerSec_Dev_0_Func_0,       68.985,        68.985,        68.985,        0.000          
+InfPerSec_Dev_0_Func_0,            68.985,        68.985,        68.985,        0.000          
+InfPCycles_Dev_0_Func_0,           15939169.000,  15939169.000,  15939169.000,  0.000          
+EffectiveFrequencyMHz_Dev_0_Func_0,1099.565,      1099.565,      1099.565,      0.000          
+InputWaitTimeUs_Dev_0_Func_0,      929396.667,    929396.667,    929396.667,    0.000          
+OutputWaitTimeUs_Dev_0_Func_0,     29.688,        29.688,        29.688,        0.000          
+

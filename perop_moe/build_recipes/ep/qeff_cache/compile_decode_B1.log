@@ -1,0 +1,4 @@
+[Deprecated] -compile-only will be removed in a future release, default mode is compile-only
+Reading ONNX Model from /home/chihao/models/qwen3_30b_a3b/ep/qeff_cache/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-ed085dabb01c623b/Qwen3MoeForCausalLM.onnx
+Compile started ............... 
+Compiling model with FP16 precision.

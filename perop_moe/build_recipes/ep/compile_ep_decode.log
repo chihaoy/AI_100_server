@@ -1,0 +1,9 @@
+=== manual decode-only compile B=8 (01:30:17) ===
+compile B=8 rc=0 QPC_OK (01:41:21)
+Generated binary is present at /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/qpc_decode_B8
+compile_wall_s=663.49 maxrss_kb=2371000
+=== manual decode-only compile B=1 (01:41:21) ===
+compile B=1 rc=0 QPC_OK (01:52:24)
+Generated binary is present at /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/qpc_decode_B1
+compile_wall_s=662.62 maxrss_kb=2323584
+PIPELINE_DONE

@@ -1,0 +1,1 @@
+{"userBuffers": [{"num": 0, "buffSize": 8, "name": "input_ids", "inputFile": "bind/in_0.bin"}, {"num": 1, "buffSize": 8, "name": "position_ids", "inputFile": "bind/in_1.bin"}]}

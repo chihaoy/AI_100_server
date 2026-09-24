@@ -1,0 +1,11 @@
+Reading ONNX Model from /home/chihao/models/qwen3_30b_a3b/ep_forced/Qwen3MoeForCausalLM.onnx
+Compile started ............... 
+Compiling model with FP16 precision.
+Generated binary is present at /home/chihao/models/qwen3_30b_a3b/ep_forced/qpc
+
+real	10m22.627s
+user	10m39.554s
+sys	3m58.324s
+rc=0
+QPC_OK
+25G	/home/chihao/models/qwen3_30b_a3b/ep_forced/qpc/programqpc.bin

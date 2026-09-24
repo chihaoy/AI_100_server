@@ -1,0 +1,10 @@
+Generated summary outputs:
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-1-QAicGraph_slice00-aiccyclecounts_QAicGraph_slice00_.qaic-opstats.summary.txt
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-1-QAicGraph_slice01-aiccyclecounts_QAicGraph_slice01_.qaic-opstats.summary.txt
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-1-QAicGraph_slice02-aiccyclecounts_QAicGraph_slice02_.qaic-opstats.summary.txt
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-1-QAicGraph_slice03-aiccyclecounts_QAicGraph_slice03_.qaic-opstats.summary.txt
+Generated summary outputs:
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-2-QAicGraph_slice00-aiccyclecounts_QAicGraph_slice00_.qaic-opstats.summary.txt
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-2-QAicGraph_slice01-aiccyclecounts_QAicGraph_slice01_.qaic-opstats.summary.txt
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-2-QAicGraph_slice02-aiccyclecounts_QAicGraph_slice02_.qaic-opstats.summary.txt
+ /home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/out_B8/aic-profiling-program-19-inf-2-QAicGraph_slice03-aiccyclecounts_QAicGraph_slice03_.qaic-opstats.summary.txt

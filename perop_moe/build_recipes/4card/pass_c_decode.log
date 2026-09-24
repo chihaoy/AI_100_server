@@ -1,0 +1,21 @@
+=== [1/3] bindings (48 layers, 4 kv-heads) ===
+seq_len=1  ctx_len=256  layers=48 kv_heads=4 head_dim=128
+input_ids[:8]=[1]
+wrote /home/chihao/models/qwen3_30b_a3b/4card/qpc_decode/bindings.json + 98 files in bind/
+qaic-runner -t <this qpc> will now use YOUR input (delete bindings.json to revert to random).
+=== [2/3] qaic-runner -D 0:1:2:3 raw_device_stats ===
+Error: buffer name: "past_key.0" does not have entry in buffer identifier vector
+Error: Unable to populate File-path: /home/chihao/models/qwen3_30b_a3b/4card/qpc_decode/bind/in_2.bin for input buffer-name: past_key.0
+Error: Failed to parse and process bindings.json
+Skip test due to init failure
+runner rc=255
+0
+=== [3/3] qaic-opstats --summary --trace --merge-mq-traces ===
+[DecodeLog] [error] Failed to identify any stats buffers in the input directory that correspond to the Function: QAicGraph_slice00
+[DecodeLog] [error] Failed to identify any stats buffers in the input directory that correspond to the Function: QAicGraph_slice01
+[DecodeLog] [error] Failed to identify any stats buffers in the input directory that correspond to the Function: QAicGraph_slice02
+[DecodeLog] [error] Failed to identify any stats buffers in the input directory that correspond to the Function: QAicGraph_slice03
+(opstats nonzero — continuing)
+total 8
+drwxrwxr-x 2 chihao chihao 4096  八  28 09:04 .
+drwxrwxr-x 4 chihao chihao 4096  八  28 09:04 ..

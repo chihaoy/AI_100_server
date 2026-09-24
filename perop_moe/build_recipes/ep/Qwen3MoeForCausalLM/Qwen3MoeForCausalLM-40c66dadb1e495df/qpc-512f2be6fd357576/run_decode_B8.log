@@ -1,0 +1,46 @@
+Using bounded random inputs
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-1-QAicGraph_slice02-aiccyclecounts_QAicGraph_slice02_.bin
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-1-QAicGraph_slice01-aiccyclecounts_QAicGraph_slice01_.bin
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-1-QAicGraph_slice03-aiccyclecounts_QAicGraph_slice03_.bin
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-1-QAicGraph_slice00-aiccyclecounts_QAicGraph_slice00_.bin
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-2-QAicGraph_slice02-aiccyclecounts_QAicGraph_slice02_.bin
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-2-QAicGraph_slice01-aiccyclecounts_QAicGraph_slice01_.bin
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-2-QAicGraph_slice03-aiccyclecounts_QAicGraph_slice03_.bin
+Writing file:/home/chihao/models/qwen3_30b_a3b/ep/Qwen3MoeForCausalLM/Qwen3MoeForCausalLM-40c66dadb1e495df/qpc-512f2be6fd357576/stats_B8/aic-profiling-program-19-inf-2-QAicGraph_slice00-aiccyclecounts_QAicGraph_slice00_.bin
+ ---- Stats ----
+InferenceCnt 20 TotalDuration 2601561us BatchSize 1 Inf/Sec 7.688
+Device Performance: 
+--- Cumulative Device Metrics Report ---
+Metric,                 Value,         Unit           
+ProfilingSamples_Func_0,20,            Samples        
+--- Aggregated Device Metrics Report ---
+Metric,                            Avg,           Min,           Max,           Std            
+ExecTimeUs_Dev_2_Func_0,           118076.773,    117851.250,    118479.479,    153.279        
+BatchInfPerSec_Dev_2_Func_0,       8.469,         8.440,         8.485,         0.011          
+InfPerSec_Dev_2_Func_0,            8.469,         8.440,         8.485,         0.011          
+InfPCycles_Dev_2_Func_0,           129879807.950, 129631324.000, 130321847.000, 168218.171     
+EffectiveFrequencyMHz_Dev_2_Func_0,1099.961,      1099.942,      1099.979,      0.009          
+InputWaitTimeUs_Dev_2_Func_0,      180663.740,    56435.521,     2530408.750,   539068.542     
+OutputWaitTimeUs_Dev_2_Func_0,     22003.536,     21664.167,     22322.188,     214.016        
+ExecTimeUs_Dev_1_Func_0,           118076.505,    117854.792,    118488.281,    152.133        
+BatchInfPerSec_Dev_1_Func_0,       8.469,         8.440,         8.485,         0.011          
+InfPerSec_Dev_1_Func_0,            8.469,         8.440,         8.485,         0.011          
+InfPCycles_Dev_1_Func_0,           129880309.550, 129635804.000, 130333124.000, 167552.272     
+EffectiveFrequencyMHz_Dev_1_Func_0,1099.967,      1099.953,      1099.982,      0.008          
+InputWaitTimeUs_Dev_1_Func_0,      183747.604,    59328.385,     2528909.375,   538017.403     
+OutputWaitTimeUs_Dev_1_Func_0,     21821.307,     21490.729,     22177.604,     171.849        
+ExecTimeUs_Dev_3_Func_0,           118071.997,    117841.667,    118478.542,    153.028        
+BatchInfPerSec_Dev_3_Func_0,       8.469,         8.440,         8.486,         0.011          
+InfPerSec_Dev_3_Func_0,            8.469,         8.440,         8.486,         0.011          
+InfPCycles_Dev_3_Func_0,           129873421.350, 129616437.000, 130319335.000, 168519.250     
+EffectiveFrequencyMHz_Dev_3_Func_0,1099.951,      1099.920,      1099.967,      0.011          
+InputWaitTimeUs_Dev_3_Func_0,      184635.315,    60527.083,     2526819.375,   537334.255     
+OutputWaitTimeUs_Dev_3_Func_0,     22113.664,     21767.604,     22608.229,     206.629        
+ExecTimeUs_Dev_0_Func_0,           118284.273,    118054.531,    118695.625,    153.599        
+BatchInfPerSec_Dev_0_Func_0,       8.454,         8.425,         8.471,         0.011          
+InfPerSec_Dev_0_Func_0,            8.454,         8.425,         8.471,         0.011          
+InfPCycles_Dev_0_Func_0,           129926113.000, 129125342.000, 130227891.000, 309961.760     
+EffectiveFrequencyMHz_Dev_0_Func_0,1098.427,      1089.655,      1099.983,      3.680          
+InputWaitTimeUs_Dev_0_Func_0,      189458.966,    63999.323,     2529430.833,   536827.084     
+OutputWaitTimeUs_Dev_0_Func_0,     23413.841,     23044.792,     23651.875,     150.102        
+

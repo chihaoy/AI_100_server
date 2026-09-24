@@ -1,4 +1,5 @@
 # 本目录数据的出处
+> **2026-09-22:** `/home/chihao/models/qwen3_30b_a3b/{ep,4card}` 与三个 `qeff*_cache` 已删除以腾磁盘(共 518 GB)。原始权重 `hf/` 保留;重建脚本、spec、custom_io 和日志见 [`build_recipes/`](../build_recipes/README.md)。
 
 **没有跑 benchmark。** 输入是**单个 token `9707`**。
 
