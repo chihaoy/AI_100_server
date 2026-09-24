@@ -33,7 +33,10 @@ hot stage compute-bound at T=512; the eight-row, token-owned combine (E15)
 then takes the MXFP6 layer to 2.20/3.21/5.72 ms at T=128/256/512 (−16/−38/−43% vs the
 oracle-capacity anchor), leaving the cross-card root and exact-shape expert compute; the refinements tried in
 E16 (fp16 partials, smaller index build, a reduce-scatter expression) gain nothing, and
-the reduce-scatter collapses onto card 0 with a DDR spill under this compiler.
+the reduce-scatter collapses onto card 0 with a DDR spill under this compiler. Finally, the KV-cache pairing the flag
+broke is restored by a head-parallel attention block (E17): the full model keeps its
+KV cache on device and prefills in 148.1 ms against the 499.0 ms production baseline
+measured in the same session, 3.37×, with retained state.
 
 ## 1. What the flag does
 
@@ -537,7 +540,8 @@ measurement therefore uses prefill-only graphs (`scripts/kvfree_graph.py`: KV in
 replaced by fp16 zero initializers, retained outputs dropped), which are numerically
 identical (bit-exact logits) but cost about 50 ms more than the retained-state
 program even without the flag, so the flag is read within the KV-free pair. Making
-the flag coexist with retained state is a compiler question for the deployed model.
+the flag coexist with retained state looked like a compiler question for the deployed
+model; 3.15 resolves it at the graph level (head-parallel attention).
 
 | Program (MXFP6, T=128, 4 cards) | KV cache | Flag | Host median, ms | Rounds, ms | Logits rel. L2 vs FP32 | Next token |
 |---|---|---|---:|---|---:|---|
@@ -798,8 +802,8 @@ token-centric build), the largest session-to-session spread seen in this work; w
 one session the rounds agree to 0.1 ms, so only same-session ratios are compared.
 
 The full-model profile (item 2 of this round) waits on a compiler fix: with
-`-mdts-mos=1` the KV cache cannot be retained (3.9), so a traced full-model program
-would carry the prefill-only structure and its 50 ms penalty.
+`-mdts-mos=1` the KV cache could not be retained (3.9, lifted in 3.15), so a traced
+full-model program would have carried the prefill-only structure and its 50 ms penalty.
 
 ## 3.13 Token-owned combine (E15)
 
@@ -910,6 +914,116 @@ remaining levers are therefore the expert stages themselves (exact-shape compute
 the hot stage at T ≥ 256) and, on the compiler side, a distributed cross-card
 reduction and the retained-state pairing under the flag.
 
+## 3.15 Retained-state KV cache with the flag: head-parallel attention (E17)
+
+Section 3.9 left one problem open: with `-mdts-mos=1` the compiler exposed all 192
+KV-cache buffers as host IO instead of pairing each `past_*` input with its
+`_RetainedState` output, so every full-model flag result so far was a prefill-only
+graph (about 50 ms penalty, no multi-chunk or decode use). This round finds the
+cause and removes it at the graph level, on 2026-09-24, MXFP6, four cards.
+
+**Diagnosis on a 2-layer truncation.** `scripts/truncate_layers.py` cuts the rebuilt
+48-layer graph to its first N decoder layers (KV IO kept for those layers, final norm
+and LM head rewired), so a retained-state compile takes 40 s instead of 6–11 min.
+The pairing depends only on the weight-splitting degree:
+
+| `-mdts-mos` on the 2-layer graph (retained-state compile) | KV buffers exposed | Device ms (stats 70) | P2P MiB | Uninstrumented inferences/s |
+|---|---:|---:|---:|---:|
+| heuristic (no flag; production setting) | 0 of 8 | 23.27 | 264.6 | 43.1 |
+| 1 | 8 | 17.18 | 114.3 | – |
+| 2 | 8 | – | – | – |
+| 4 | 0 | 34.88 | 672.6 | 28.3 |
+| **1 + head-parallel attention (below)** | **0** | **12.52** | **30.3** | **79.8** |
+| head-parallel attention, no flag | 8 | – | – | 43.4 |
+
+Degree 4 keeps the pairing and is numerically identical to the heuristic (bit-exact
+logits) but splits every expert bank too: the T=256 token-owned replay takes 10.08 ms
+at `-mdts-mos=4` against 3.26 ms at 1, and the flag itself remains essential (the same
+replay without any flag: 6.61 ms, 83 MiB of P2P against 3.5 MiB, because the down
+projection is tensor-sliced again even with the token-owned combine). So the degree is
+a global knob: 4 shards every weight across the cards, 1 shards none. What the KV
+cache needs is the layout that degree 4 happens to produce for attention: the k/v
+projection weights split by output column, i.e. **one KV head per card**, so that the
+`CtxScatter` that writes head h and the `CtxGather` that reads it run on the same card
+and the input and output slices of the cache coincide. With degree 1 the projections
+are not split, the compiler token-splits them instead (the 2-layer `-mdts-mos=1`
+profile shows the MoE token gathers multicasting 48 MiB per layer to re-collect a
+token-sliced attention output), the cache update is token-sliced while its input is
+whole, and the compiler falls back to host IO (its error strings for the strict case
+read "Mis-matched retained state input and output splits size" and
+"lowerRetainedStateIO: mis-matched input and output cores").
+
+**The rewrite** (`scripts/headpar_graph.py <src dir> <out dir>`) gives the compiler that
+layout without asking it to split anything: the KV-head group (4 groups × 8 query
+heads) becomes a leading batch axis of every attention op, the same device the expert
+banks already use.
+
+- `Expand(x)` → `[4, T, 2048]`; `MatMul` with `Wq_g [4, 2048, 1024]`, `Wk_g [4, 2048, 128]`,
+  `Wv_g [4, 2048, 128]` (the export's `[in, out]` weights re-laid out once as fp16
+  files under `<out>/weights_hp/`); q/k norm, `[4, 8, T, 128]` / `[4, 1, T, 128]`
+  transposes and rotary per group; the K/V updates reshaped to `[1, 4, T, 128]` feed
+  the **unchanged** `CtxScatter` nodes, and the unchanged `CtxGather` outputs are read
+  back as `[4, 1, ctx, 128]`, expanded to the 8 query heads, scores, mask, softmax and
+  the PV product per group; `o_proj` as `[4, T, 1024] @ Wo_g [4, 1024, 2048]` (a pure
+  reshape of the existing file) followed by `ReduceSum` over the groups.
+- Under `-mdts-mos=1` the batch axis lands one group per card on all 16 cores
+  (profile: q/k/v projections, softmax and PV on 64 cores, 16 per card), and the two
+  cache ops of head h stay on card h: the 2-layer QPC exposes no KV buffer. Without
+  the flag the same graph loses the pairing (the heuristic splits the batched weights
+  along another axis), so flag and rewrite are a pair.
+- Numerics: the per-group `o_proj` partial sums change the fp16 accumulation order.
+  On the 2-layer model the logits differ from the heuristic program by 6.8e-4
+  relative L2 (max 0.009 on logits up to 12.6), same argmax, identical with and
+  without the flag.
+
+**Full model, retained state, same session** (`tools/moe_qwen3_baseline.py`, 3 rounds
+× 20, anchor recompiled and re-run; the FP32 reference tree under `/home/chihao`
+had been deleted, it was regenerated locally with the same inputs, see 4):
+
+| Program (MXFP6, T=128, 4 cards, KV retained on device) | Flag | Host median, ms | Rounds, ms | Logits rel. L2 vs FP32 | Next token |
+|---|---|---:|---|---:|---|
+| Native C128 (production baseline, anchor) | no | 499.0 | 498.0 / 499.6 / 498.9 | 0.1884 | ' jav' ✓ |
+| Native C128 + head-parallel attention | yes | 267.6 | 267.7 / 267.4 / 267.6 | 0.1724 | ✓ |
+| **Rewrites + token-centric combine + head-parallel attention** | **yes** | **148.1** | 147.6 / 147.9 / 148.7 | 0.1724 | ✓ |
+| *for reference, prefill-only (E9/E12): native + flag / stack + token-centric* | yes | 352.0 / 231.8 | | 0.1884 | ✓ |
+
+- **3.37× the production baseline with the KV cache retained**, 1.16 ms per token,
+  and 84 ms below the best prefill-only program: the retained-state version is
+  cheaper than the KV-free one by more than the 50 ms penalty measured in E9, so
+  the head-parallel attention also beats what the compiler made of the original
+  attention under the flag. The native graph alone goes 499.0 → 267.6 ms.
+- The QPC exposes exactly `input_ids`, `position_ids`, `logits`, `routing_counts`
+  (`scripts/qpc_bindings.py`), so the program is usable for multi-chunk prefill and
+  decode as the production one is; only the first 128-token chunk is timed here.
+- Not bit-exact, for the first time in the series: the attention reordering moves 343
+  of 49,152 routing assignments (47 layers touched, from layer 0 on), the logits
+  differ from the anchor program by 0.031 relative L2, and the error against FP32 is
+  0.1724 against the anchor's 0.1884, inside the band of the other MXFP6 programs
+  (0.1720–0.1884); the top-5 next tokens are the same in the same order.
+
+**Profile of the final program** (`-stats-level=70`, `full_model/profile_stack_hp_flag/`;
+device 160.0 ms under instrumentation against 148.1 host uninstrumented):
+the MoE-to-MoE period is 3.3–3.5 ms per layer, the MoE block 2.9–3.5 ms of it.
+Core-busy time splits 86% MoE, 13% attention, 1% rest (99 ms busy per core of 160 ms);
+the three expert MatMul families alone are 3.27 s of core time, the token-centric
+lane-reduce tiles 0.82 s, then `o_proj` with its cross-card partial exchange 0.32 s,
+RMSNorm 0.27 s, the routing scatter 0.22 s, `ReduceSum` of the o_proj groups 0.11 s,
+softmax 0.11 s, `q_proj` 0.10 s. Cross-card traffic is 505 MiB for the model,
+10.5 MiB per layer, and now mostly attention: the `o_proj` partials are exchanged as an
+all-gather of `[4, T, 2048]` (every card receives all four partials and reduces),
+plus the `Expand(x)` broadcast; the MoE combine is 14% of it. That exchange is the
+same root-and-multicast pattern as the combine's (3.13, 3.14) and the same
+reduce-scatter question, now for a dense tensor. What remains to port is the
+token-owned combine of E15, which the full-model stack does not yet use.
+
+Artifacts: `full_model/trunc2_native`, `trunc2_headpar` (graphs), `full_model/kvtest/`
+(2-layer compile logs, bindings, `run_*` logits, `prof_*` profiles), `native_c128_hp`,
+`stack_native_rw_tc_ret`, `stack_native_rw_tc_hp` (48-layer graphs; `weights_hp/` 961 MB
+each), `run_native_hp_flag`, `run_anchor3_native_noflag`, `run_stack_hp_flag`,
+`profile_stack_hp_flag`, compile logs; `scripts/truncate_layers.py`,
+`scripts/headpar_graph.py`, `scripts/trunc_io.py`, `scripts/spans.py`,
+`scripts/placement.py`, drivers `scripts/run_kv1.sh` … `run_kv7.sh`.
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -922,9 +1036,17 @@ reduction and the retained-state pairing under the flag.
   only.
 - Full-model results (E9) come from rebuilt graphs whose non-expert weights were
   regenerated from the checkpoint; the rebuilt native program is bit-exact against
-  the historical MXFP6 logits, which validates the reconstruction. The flag builds
-  are prefill-only (zero KV cache) because retained state does not pair under the
-  flag; that costs about 50 ms against a retained-state program.
+  the historical MXFP6 logits, which validates the reconstruction. The E9–E12 flag builds
+  are prefill-only (zero KV cache) because retained state did not pair under the
+  flag, about 50 ms against a retained-state program; E17 (3.15) restores the retained
+  cache with a head-parallel attention block, measured on the first 128-token chunk
+  only (multi-chunk and decode correctness of the retained cache are not yet tested;
+  prompt 41 has 140 tokens, so a second chunk needs another prompt). The FP32
+  reference tree (`/home/chihao/mllm/9.17.2026/e2e/ref`) was deleted before E17; it
+  was regenerated into `full_model/ref/` with `scripts/e2e_cpu_ref_local.py` (the
+  repo's `tools/moe_e2e_cpu_ref.py` minus two validation loads into the deleted tree):
+  same input ids (sha256 match with the saved runs), and the saved E9 logits reproduce
+  their 0.1884 (MXFP6) and 0.0503 (FP16) errors against it.
 - The earlier full 48-layer redo could not be compiled: the shared QEfficient export under
   `/home/chihao/models/qwen3_30b_a3b/ep` disappeared on 2026-09-22 at 16:31, and
   every non-expert weight of the full-model graphs (`diagnostic_graph`,
@@ -935,7 +1057,10 @@ reduction and the retained-state pairing under the flag.
   `scripts/` and `scripts/mdp_ts_4.json`.
 - The empty-expert skip is data dependent and its mechanism is not established.
 - `-mdts-mos=1` also forbids weight splitting for the dense layers of a full model
-  (attention, LM head); its effect there is unmeasured.
+  (attention, LM head). With the original attention block that costs the KV-cache
+  pairing and a token-split attention (3.15); with the head-parallel block attention
+  is 13% of core-busy time and most of the remaining cross-card traffic, its exact
+  cost against the heuristic attention is not isolated.
 
 ## 5. Reproduction
 
@@ -980,4 +1105,10 @@ replay graph dir, driven by `scripts/run_e11.sh`; the same combine is available 
 `scripts/run_e13.sh`; the naive-vs-oracle matrix via `scripts/run_e14.sh`. E15: `scripts/make_tokencombine.py <src dir> <out dir> tokenowned`, driven by
 `scripts/run_e15.sh`. E16: modes `to_fp16|to_idx|to_rs` of the same script, driven by
 `scripts/run_e16.sh` and `scripts/run_e16b.sh` (profiles and figures). Layer QPCs recompile in 10–20 s, full-model QPCs in
-about 10 minutes.
+about 10 minutes. E17: `scripts/truncate_layers.py <src dir> <out dir> <N> <custom_io.yaml>` (N-layer
+truncation with KV IO), `scripts/headpar_graph.py <src dir> <out dir>` (head-parallel attention; run it on a
+rebuilt graph or on a `build_full_stack.py` output), `scripts/trunc_io.py <qpc> <work dir>` (qaic-runner IO
+for any of these QPCs), `scripts/spans.py` and `scripts/placement.py <analysis dir> [layer prefix]` on a
+`detail_analyze.py` output, `scripts/make_inputs.py <out dir>` and `scripts/e2e_cpu_ref_local.py` for the
+reference; drivers `scripts/run_kv1.sh` … `run_kv7.sh` (2-layer sweep, replay flag/no-flag/mos4 timing,
+head-parallel bindings, 2-layer logits and profiles, full-model compiles, runs and profile).
