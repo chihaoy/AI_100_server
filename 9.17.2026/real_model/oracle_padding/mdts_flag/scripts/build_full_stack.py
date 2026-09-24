@@ -9,7 +9,7 @@ Usage: build_full_stack.py <src dir> <out dir> <counts_i32.bin> --regroup native
 import sys, os, json, copy, argparse, numpy as np, onnx
 from onnx import helper as h, numpy_helper as nh, TensorProto as TP
 from onnx.reference import ReferenceEvaluator
-ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('counts'); ap.add_argument('--regroup', default='native'); ap.add_argument('--caps', default='128'); ap.add_argument('--rewrites', type=int, default=1); ap.add_argument('--banks', default=None); ap.add_argument('--poscounts', default=None, help='counts in position order from a run of the same layout; capacities are taken from these')
+ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('counts'); ap.add_argument('--regroup', default='native'); ap.add_argument('--caps', default='128'); ap.add_argument('--rewrites', type=int, default=1); ap.add_argument('--banks', default=None); ap.add_argument('--poscounts', default=None, help='counts in position order from a run of the same layout; capacities are taken from these'); ap.add_argument('--combine', default='dense', help='dense | tokencentric (drop the accumulator: per token tile gather+mask+lane-reduce+card-reduce, needs --rewrites 1)')
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
 O = '/home/wentao/workspace/AI_100_server/9.17.2026/real_model/oracle_padding'; F = f'{O}/mdts_flag/full_model'
 m = onnx.load(f'{a.src}/model.onnx', load_external_data=False); g = m.graph
@@ -129,11 +129,60 @@ if a.rewrites:
             for n in g.node: nodes.extend(rep if n.name == original.name else [n])
             del g.node[:]; g.node.extend(nodes); g.initializer.extend(inits); bn = by_name()
         if L % 8 == 0: print('rewrites layer', L, flush=True)
+
+# ---------------- token-centric combine (E11 design), per layer
+if a.combine == 'tokencentric':
+    assert a.rewrites, 'token-centric combine builds on the rewritten graph'
+    T = 128; W = T // 16; DOM = 'com.qualcomm.cloud'
+    def init(name, arr): t = nh.from_array(np.asarray(arr), name); g.initializer.append(t); return name
+    ax1 = init('tc_axis1', np.array([1], np.int64)); ax2 = init('tc_axis2', np.array([2], np.int64)); zero_i32 = init('tc_zero_i32', np.array(0, np.int32)); shape4 = init('tc_shape4', np.array([4, 16, W, 2048], np.int64))
+    tok = [(init(f'tc_tok_start_{i}', np.array([i * W], np.int64)), init(f'tc_tok_end_{i}', np.array([(i + 1) * W], np.int64))) for i in range(16)]
+    for L in range(48):
+        p = f'/model/layers.{L}/mlp/'; bn = by_name(); pre = f'tc_L{L}_'
+        for nm, op in (('Where_1', 'Where'), ('Where_5', 'Where'), ('Where_3', 'Where'), ('Where_7', 'Where'), ('Mul_10', 'Mul'), ('Greater', 'Greater'), ('Greater_1', 'Greater'), ('Einsum_4', 'Einsum')):
+            assert bn[p + nm].op_type == op, (L, nm, bn[p + nm].op_type)
+        w7 = bn[p + 'Where_7']; assert w7.input[1] == p + 'Add_2_output_0'
+        zsrc = {n.output[0]: n for n in g.node}[w7.input[2]]; assert zsrc.op_type == 'ConstantOfShape'; zval = [x for x in zsrc.attribute if x.name == 'value']
+        slot = {0: p + 'Where_1_output_0', 1: p + 'Where_5_output_0'}; mask = {0: p + 'Greater_output_0', 1: p + 'Greater_1_output_0'}; data = {0: p + 'Where_3_output_0', 1: pre + 'stage1_masked'}
+        nn = [h.make_node('Shape', [p + 'Mul_10_output_0'], [pre + 'stage1_shape'], name=p + 'tc_stage1_shape'),
+              h.make_node('ConstantOfShape', [pre + 'stage1_shape'], [pre + 'stage1_zeros'], name=p + 'tc_stage1_zeros', **({'value': zval[0].t} if zval else {})),
+              h.make_node('Where', [w7.input[0], p + 'Mul_10_output_0', pre + 'stage1_zeros'], [pre + 'stage1_masked'], name=p + 'tc_stage1_masked')]
+        for s_ in (0, 1):
+            nn += [h.make_node('Where', [mask[s_], slot[s_], zero_i32], [pre + f'slotsafe_s{s_}'], name=p + f'tc_slotsafe_s{s_}'),
+                   h.make_node('Cast', [mask[s_]], [pre + f'mask_s{s_}'], to=TP.FLOAT16, name=p + f'tc_mask_s{s_}'),
+                   h.make_node('Unsqueeze', [pre + f'mask_s{s_}', ax2], [pre + f'maskf_s{s_}'], name=p + f'tc_maskf_s{s_}')]
+            slot[s_] = pre + f'slotsafe_s{s_}'
+        finals = []
+        for i in range(16):
+            ts, te = tok[i]; gathered = []
+            for s_ in (0, 1):
+                idx, gth, mk, gm = [pre + f'{k}_s{s_}_t{i}' for k in ('idx', 'g', 'mk', 'gm')]
+                nn += [h.make_node('Slice', [slot[s_], ts, te, ax1], [idx], name=p + f'tc_idx_s{s_}_t{i}'),
+                       h.make_node('CtxGather3D', [data[s_], idx], [gth], name=p + f'tc_g_s{s_}_t{i}', domain=DOM),
+                       h.make_node('Slice', [pre + f'maskf_s{s_}', ts, te, ax1], [mk], name=p + f'tc_mk_s{s_}_t{i}'),
+                       h.make_node('Mul', [gth, mk], [gm], name=p + f'tc_gm_s{s_}_t{i}')]
+                gathered.append(gm)
+            add, rs, lanes, cards = [pre + f'{k}_t{i}' for k in ('add', 'rs', 'lanes', 'final')]
+            nn += [h.make_node('Add', gathered, [add], name=p + f'tc_add_t{i}'), h.make_node('Reshape', [add, shape4], [rs], name=p + f'tc_rs_t{i}'),
+                   h.make_node('Einsum', [rs], [lanes], equation='dpth->dth', name=p + f'tc_reduce_tile_{i}'), h.make_node('Einsum', [lanes], [cards], equation='dth->th', name=p + f'final_tile_{i}')]
+            finals.append(cards)
+        e4 = bn[p + 'Einsum_4']; outname = e4.output[0]
+        nodes = []
+        for n in g.node:
+            if n.name == e4.name: nodes.extend(nn); nodes.append(h.make_node('Concat', finals, [outname], axis=0, name=e4.name))
+            else: nodes.append(n)
+        del g.node[:]; g.node.extend(nodes)
+        if L % 8 == 0: print('token-centric combine layer', L, flush=True)
+    needed = {o.name for o in g.output}; keep = []
+    for n in reversed(list(g.node)):
+        if any(o in needed for o in n.output): keep.append(n); needed.update(n.input)
+    print('pruned dead accumulator nodes:', len(g.node) - len(keep)); keep.reverse(); del g.node[:]; g.node.extend(keep)
+    inits = [t for t in g.initializer if t.name in needed]; del g.initializer[:]; g.initializer.extend(inits)
 del g.value_info[:]
 for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
     ps = f'{a.src}/{link}'
     if os.path.islink(ps) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(ps), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-json.dump(dict(src=a.src, regroup=a.regroup, caps=a.caps, rewrites=a.rewrites, layers=plan), open(f'{a.out}/plan.json', 'w'))
+json.dump(dict(src=a.src, regroup=a.regroup, caps=a.caps, rewrites=a.rewrites, combine=a.combine, layers=plan), open(f'{a.out}/plan.json', 'w'))
 busiest = [max(v['active_per_card']) for v in plan.values()]; padded = sum(sum(v['capacities'][s] * sum(1 for e in v['order'][s*64:(s+1)*64] if counts[int(k)][e] > 0) for s in range(2)) for k, v in plan.items())
-print(f'{a.out}: regroup={a.regroup} caps={a.caps} rewrites={a.rewrites}; nodes {len(g.node)}; busiest-card active experts mean {np.mean(busiest):.1f}; padded rows total {padded} (real {int(counts.sum())})')
+print(f'{a.out}: regroup={a.regroup} caps={a.caps} rewrites={a.rewrites} combine={a.combine}; nodes {len(g.node)}; busiest-card active experts mean {np.mean(busiest):.1f}; padded rows total {padded} (real {int(counts.sum())})')
