@@ -29,8 +29,11 @@ accumulator (E11) is bit-exact and cuts the MXFP6 layer 10% at T=128, 27% at T=2
 and 31% at T=512, restoring the per-token gain of larger chunks; on the full model it gives 231.8 ms,
 2.14× the production baseline (E12). The profiling round after it (E13) puts the
 remaining combine at a constant 5 µs per token, a serialized 16-tile pipeline, and the
-hot stage compute-bound at T=512; the next steps are an eight-row combine and
-exact-shape expert compute.
+hot stage compute-bound at T=512; the eight-row, token-owned combine (E15)
+then takes the MXFP6 layer to 2.20/3.21/5.72 ms at T=128/256/512 (−16/−38/−43% vs the
+oracle-capacity anchor), leaving the cross-card root and exact-shape expert compute; the refinements tried in
+E16 (fp16 partials, smaller index build, a reduce-scatter expression) gain nothing, and
+the reduce-scatter collapses onto card 0 with a DDR spill under this compiler.
 
 ## 1. What the flag does
 
@@ -798,6 +801,115 @@ The full-model profile (item 2 of this round) waits on a compiler fix: with
 `-mdts-mos=1` the KV cache cannot be retained (3.9), so a traced full-model program
 would carry the prefill-only structure and its 50 ms penalty.
 
+## 3.13 Token-owned combine (E15)
+
+The design that matches the problem of 3.12: ownership by token instead of by lane.
+`scripts/make_tokencombine.py ... tokenowned` recovers each token's eight positions
+with a `TopK` over the routing columns, maps position → (stage, lane, card, slot) with
+integer arithmetic and a `GatherElements` on the existing slot tensors, and builds a
+`[4 cards, T·8]` index per stage whose entries are the row of that expert's output in
+the card's stage block (reshaped, layout-preserving, to `[4, 16·C, 2048]`) or a masked
+zero when the expert lives on another card or in the other stage. One `CtxGather3D`
+per stage then fetches at most eight rows per token per card, the two stages are
+masked and added, `ReduceSum` over the eight rows gives the card's `[T, 2048]` partial
+with no cross-core traffic, and the tiled cross-card combine finishes. Same protocol
+as E11 (MXFP6, flag, hot/cold oracle capacities, anchors recompiled in the session):
+
+| T | Anchor, ms | Token-centric (E11 design), ms | Token-owned, ms | vs token-centric | vs anchor | µs per token |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 2.613 | 2.389 | **2.198** | −8% | −16% | 17.2 |
+| 256 | 5.198 | 3.741 | **3.208** | −14% | −38% | 12.5 |
+| 512 | 9.949 | 6.817 | **5.717** | −16% | −43% | 11.2 |
+
+Outputs agree with the anchor to a relative L2 of 1–2e-5 (eight rows summed per token
+instead of lanes then cards), routing counts exact.
+
+The T=256 profile (`combine/T256_tokenowned_mxfp6_profile/`) shows the compiler did
+what the graph asked within a card: every core gathers its own tokens' rows (25 µs
+median), masks and adds them (20 µs) and reduces them locally (15 µs, one
+`aicbatchedreduceadd` per core, no multicast), so the per-card combine work after the
+cold stage fell from 1.2 ms to under 0.1 ms and cards 1–3 finish at 1.69 ms against
+2.6 before. Two items remain, both visible in the trace:
+
+- **The cross-card combine is still rooted on card 0**: 0.57 ms on five cores, and it
+  now carries 6.9 MiB of P2P instead of 3, because the per-card partials leave the
+  `ReduceSum` in fp32. A cast to fp16 before the cross-card step halves the transfer;
+  spreading the final reduction over the four cards (reduce-scatter) removes the root.
+- **The index build costs 0.25–0.36 ms per core** and is lowered into about 1,200
+  tiny kernels per card (copies, multicasts, boolean reductions), scheduled between the
+  stages, which widens the inter-stage gap from 0.04 to 0.3–0.5 ms. It depends only
+  on the routing, so it can be computed once, with fewer and larger ops, under the hot
+  stage.
+
+With those two, the T=256 layer should approach 1.8 ms on device (about 7 µs per
+token), leaving the expert stages as the whole of the layer.
+
+## 3.14 Final combine refinements and the profiling round after them (E16)
+
+The three refinements suggested by the E15 profile were built as stackable variants
+of the token-owned combine (`scripts/make_tokencombine.py to_fp16|to_idx|to_rs`) and
+timed in one session with the anchors and the E15 base (MXFP6, flag, hot/cold oracle
+capacities, 3 alternating rounds × 100):
+
+| T | Anchor (dense) | Token-owned (E15) | + fp16 partials | + broadcast index build | + reduce-scatter |
+|---:|---:|---:|---:|---:|---:|
+| 128 | 2.613 | 2.189 | 2.012 | 2.188 | 2.213 |
+| 256 | 5.298 | 3.226 | 3.220 | 3.199 | 4.314 |
+| 512 | 9.926 | 5.694 | 5.688 | 5.660 | 8.157 |
+
+- **Casting the per-card partials to fp16** halves the cross-card bytes (P2P 6.9 → 3.6
+  MiB at T=256 in the profile) but changes the time by nothing at T=256 and 512; the
+  cross-card step is latency- and root-bound, not byte-bound. At T=128 every variant,
+  base included, alternates between a 2.0 ms and a 2.2 ms mode from round to round,
+  so the apparent 8% there is that bimodality, not the cast.
+- **The broadcast index build** (one `Equal` against a `[4,1,1]` card range instead of
+  a per-card chain) removes about 40 nodes per stage and gives 1%: the index work was
+  already hidden under the expert stages.
+- **The reduce-scatter expression backfires**, +34% at T=256 and +43% at T=512.
+  The profile (`combine/T256_reducescatter_mxfp6_profile/`) shows why: the compiler
+  shipped all three partials to card 0 (P2P ports 1→0, 2→0, 3→0 only), materialized
+  the transposed `[4, 4, T/4, 2048]` tensor in DDR there and ran the per-quarter
+  reduction as one DDR-backed reduce-add on a single core (0.83 ms), the same failure
+  mode as the dense `Einsum_4`. A transpose across the card-partitioned axis is not
+  lowered as an all-to-all by this compiler, so the reduce-scatter has to be expressed
+  some other way or left to the compiler's collectives.
+
+The token-owned combine of E15 therefore stands as the final combine design. Per
+layer in MXFP6 it is 2.19 / 3.23 / 5.69 ms at T = 128 / 256 / 512 (17.1 / 12.6 / 11.1
+µs per token), against 2.61 / 5.30 / 9.93 for the dense combine with the same
+capacities and 2.75 / 5.81 / 11.07 for the naive design (both stages at capacity T,
+E14): 20% / 44% / 49% below the naive layer.
+
+Profiles of the kept design at all three chunk sizes (`combine/*_tokenowned_*`), with
+the per-core figures next to their anchors:
+
+![T=128 anchor](combine/T128_anchor_cores.png)
+![T=128 token-owned](combine/T128_tokenowned_cores.png)
+![T=256 anchor](combine/T256_anchor_cores.png)
+![T=256 token-owned](combine/T256_tokenowned_cores.png)
+![T=512 anchor](combine/T512_anchor_cores.png)
+![T=512 token-owned](combine/T512_tokenowned_cores.png)
+
+Phase breakdown of the kept design (instrumented device time, card 0):
+
+| T | Device, ms | Prologue | Hot stage, 16 experts per card | Gap (index build) | Cold stage | Per-card combine | Card-0 cross-card root |
+|---:|---:|---:|---|---:|---|---:|---:|
+| 128 | 1.52 | 0.05 | 0.61 ms, 38 µs/exp (floor) | 0.22 | 0.24 ms, 42–49 µs/exp | 0.06–0.08 | 0.39 |
+| 256 | 2.28 | 0.08 | 0.66–0.85 ms, 41–53 µs/exp | 0.30–0.50 | 0.34 ms, 42 µs/exp | 0.07–0.12 | 0.57 |
+| 512 | 4.18 | 0.11 | 1.45–1.70 ms, 91–106 µs/exp | 0.51–0.77 | 0.47 ms, 42 µs/exp | 0.12–0.16 | 1.37 |
+
+The cross-card root grows with T (0.39 / 0.57 / 1.37 ms) and is now the single
+largest item after the hot stage at T=512; the index-build gap grows with T as well.
+
+What is left after the combine work, in the T=256 token-owned profile (device 2.28 ms):
+the hot stage 0.66–0.85 ms (16 experts per card at 41–53 µs per expert against the
+37 µs floor), the cold stage 0.33–0.38 ms at the floor, an inter-stage gap of
+0.3–0.5 ms in which the index build runs, the per-card combine under 0.1 ms, and the
+cross-card root on card 0, 0.57 ms, which no graph-level expression removed. The
+remaining levers are therefore the expert stages themselves (exact-shape compute for
+the hot stage at T ≥ 256) and, on the compiler side, a distributed cross-card
+reduction and the retained-state pairing under the flag.
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -865,5 +977,7 @@ to check that a QPC hides its KV cache. E10: `scripts/build_full_stack.py <src d
 replay graph dir, driven by `scripts/run_e11.sh`; the same combine is available in
 `scripts/build_full_stack.py --combine tokencentric` for the full model. E13: `scripts/tail_breakdown.py <analysis dir> <T> <label>` and
 `scripts/tile_timeline.py <analysis dir> [tiles]` on a `detail_analyze.py` output; profiles via
-`scripts/run_e13.sh`; the naive-vs-oracle matrix via `scripts/run_e14.sh`. Layer QPCs recompile in 10–20 s, full-model QPCs in
+`scripts/run_e13.sh`; the naive-vs-oracle matrix via `scripts/run_e14.sh`. E15: `scripts/make_tokencombine.py <src dir> <out dir> tokenowned`, driven by
+`scripts/run_e15.sh`. E16: modes `to_fp16|to_idx|to_rs` of the same script, driven by
+`scripts/run_e16.sh` and `scripts/run_e16b.sh` (profiles and figures). Layer QPCs recompile in 10–20 s, full-model QPCs in
 about 10 minutes.
