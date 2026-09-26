@@ -15,3 +15,10 @@
 **/qpc/
 **/qpc_*/
 **/__pycache__/
+
+# build_recipes/ holds the full rebuild recipe (json/yaml/log configs) for the deleted
+# full-model QPCs; it is 720 KB and every file type in it is tracked on purpose.
+!perop_moe/build_recipes/**
+
+# GitHub pack for the final-combine write-up: its figures are tracked
+!github_pack/figures/*.png
