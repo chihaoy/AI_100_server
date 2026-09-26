@@ -154,6 +154,32 @@ only three things can reduce it:
 3. Topology: each card receives a quarter of the tokens (reduce-scatter), 1.5 MiB and about 0.13 ms per card. Both the
    original README (3.14) and this round saw the compiler collapse it back onto card 0; it needs compiler support.
 
+## 8. Attempts to remove the hot-stage side effect (2026-09-26, afternoon)
+
+Every untested item of the table in Section 5 was tried (T=512, device, median sample; `scripts/fc_compare.py`):
+
+| Method | Form | Card-0 hot end | Card-0 tail | Device | Outcome |
+|---|---|---:|---:|---:|---|
+| Chained 16 tiles (chain) | 16 elementwise tiles, tile k+1's input adds row 0 of tile k's output times 1e-5 x 1e-5 | 2.56 | 0.67 | 4.40 | adds run strictly at the link cadence (34 us per tile), tail as expected; hot stage still slow, so "landing-buffer reuse" is not the cause |
+| Compiler option `-vtcm-working-set-limit-ratio` 0.5 / 0.25 / 0.1 | addtree graph unchanged, option only | 2.39 / 2.46 / 2.39 | 0.71 | 4.29 / 4.33 / 4.26 | op inventory identical to no option; no effect |
+| Hierarchical tree (tree) | 16 Einsum tiles over lanes 0+1, 16 over lanes 2+3, then an elementwise add | 1.98 | 2.41 | 5.54 | compiler puts both Einsum chains on cores 0-1 of card 0, serial (1.5 ms busy each), tail doubles; hot stage normal |
+| Four-root reduce-scatter (quarters) | four independent addtrees on quarter row ranges, operands rotated per card | 2.49 | 0.68 | 4.33 | all elementadds still on card 0; operand order is ignored |
+| Send only nonzero rows | not expressible in a static graph (rows per card vary with the input); with the current hot/cold placement a token touches 3.8 cards on average, at most 7% fewer bytes | - | - | - | arithmetic only, no experiment |
+
+Pattern: Einsum-based forms (the collective-reduction template) keep the landing buffer small and reused and leave the hot
+stage alone, but the template uses 2-4 cores serially; elementwise forms run on 16 cores, but the compiler statically
+allocates every slice, partial sum and output in card 0's TCM, costing the hot stage 0.4 ms, and neither ordering
+constraints (chain), smaller pieces (32 tiles, halves) nor the compiler option change that allocation. Every attempt to
+move the root off card 0 (tree, quarters, rev, the README's reduce-scatter) is folded back onto card 0.
+
+Status: addtree remains the best usable variant (-12% host latency). Getting both the parallel add and an unaffected hot
+stage needs a compiler-side way to place reduction inputs in DDR or reuse intermediate buffers; no graph-level expression
+is left to try.
+
+Figures (T=512, sample 1): `figures/T512_fc_chain_cores.png`, `figures/T512_fc_tree_cores.png`, `figures/T512_fc_quarters_cores.png`,
+`figures/T512_fc_addtree_vtcm0.5_cores.png`, `figures/T512_fc_addtree_vtcm0.25_cores.png`, `figures/T512_fc_addtree_vtcm0.1_cores.png`,
+plus the earlier `T512_fc_rev/half/tileadd32/stagesplit_cores.png`.
+
 ## 7. Reproduction
 
 ```
