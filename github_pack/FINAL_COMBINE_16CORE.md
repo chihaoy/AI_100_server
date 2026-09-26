@@ -21,6 +21,8 @@ of the original mdts_flag README. Scripts, graphs and profiles live in `/home/ch
   remove it; sending the hot-stage partial early (stagesplit) does, but doubles the bytes and stalls card 0's cold stage,
   so it is worse overall.
 
+**Update 2026-09-27 (Section 12):** every path to the hot-stage side effect was tried; only "fewer hot experts on card 0" removes it on the profile, but on the production build the effect is mostly an occasional jitter invisible on the host clock; with the elementwise final sum in all 48 layers of the full model, the T=128 first chunk goes from 147.3 / 147.0 ms to 132.9 / 133.2 ms (-9.7%) with logits no worse.
+
 ## 2. What the original tail actually does
 
 After each card has summed each token's eight rows locally, token-owned (README 3.13) still has to add the four per-card
@@ -386,3 +388,109 @@ in that card's TCM at once. The original form concentrates just as much, but its
 The two forms each hold one advantage: one saves space but is serial (4 cores, 1.03 ms), the other is parallel but occupies space
 (16 cores, 8 us, 0.4 ms lost in the hot stage). The current compiler offers no expression that is both parallel and streaming, which
 is also why a reduce-scatter (each card receives a quarter: parallel and only 1.5 MiB resident) is worth pursuing on the compiler side.
+
+## 12. Second round: every path to the hot-stage side effect tried (2026-09-27)
+
+The open problem of the first round was that addtree pushes card 0's hot stage from 1.99 to 2.42 ms. This round tried every path
+listed at the end of Section 11, and looked at the same thing through three different clocks: the per-op traced profile (used by all
+figures and tables above), the runtime's own device timer (the same stats-70 QPC, no trace collection, mean of 200 runs), and the
+host latency of the production QPC (3 alternating rounds x 100 in one session). The three clocks disagree, and that disagreement is
+the most important result of the round.
+
+### 12.1 Paths and results
+
+| Path | What was done | Compiler inventory | Traced profile (median sample) | Host ms (same session) |
+|---|---|---|---|---:|
+| 1a budget `-aic-depth-first-mem` 1 / 8 / 64 / 512 | addtree graph unchanged | op-for-op identical to addtree | 4.12 / 4.21 / 4.29 / 4.14, card 0 hot end 2.25 to 2.41 | - |
+| 1b partials as a retained-state output (`addtree_rs`) | one Identity from `to_partials` to `fc_state_RetainedState` | add inputs now read from DDR (48 `aiccopytovtcm`, 6 MiB) | 5.19; P2P doubled to 12 MiB, cards 1-3 end 4.71; hot end still 2.45 | - |
+| 1c partials as a plain output (`addtree_out`) | as 1b, but returned to the host | as 1b | 5.24; P2P 12 MiB; hot end 2.51 | 7.68 (6 MiB extra host DMA) |
+| 2 fewer hot experts on card 0 (`hc0k3` / `hc0k4`) | card 0 keeps 13 / 12 active hot experts (its empty slots hold token-less experts, skipped under the flag); the 3 / 4 smallest hot experts move to the cold stage | identical to addtree (only the placement differs) | 3.79 / 3.77; card 0 hot end 1.87 / 1.70, cards 1-3 end 3.09 / 3.06; tail 0.70 | 4.94 / 4.80 |
+| 3 `-allow-mxint8-mdp-io` (both spellings) | addtree graph unchanged | identical to addtree | 4.25; P2P still 6.0 MiB, tail 0.71 | 4.93 |
+| 4 all-reduce into the next layer's lane input | see 12.3 | the compiler replicates the whole sum on all four cards | see 12.3 | full model in 12.4 |
+| 5 custom op | not attempted | - | - | - |
+| reference: token-owned / addtree | - | - | 4.36 / 4.29 | 5.32 / 4.86 |
+
+- 1a behaves like `-vtcm-working-set-limit-ratio`: all four values give op-for-op the same inventory, device times inside addtree's sample range.
+- 1b and 1c do make the add read from DDR, but the compiler then sends every partial twice (once to the output/state buffer in DDR, once to
+  the add's landing buffer in TCM): the cross-card bytes double, cards 1-3 finish 1.1 ms later, and card 0's hot stage does not recover.
+  This also refutes the first round's inference that "add inputs staged through DDR" is what keeps stagesplit's hot stage normal; that has
+  another cause, still unexplained.
+- 3: with either spelling the compiler compresses nothing (inventory, P2P bytes and tail unchanged).
+- 2 does exactly what was predicted on the traced profile: card 0's hot stage shrinks to 1.87 ms and is no longer the last one, the cold
+  stage returns to 2.4-2.9 ms, cards 1-3 finish at 3.09, device 3.79 ms, 0.50 below addtree and 0.57 below the original. But the host
+  latency does not move (4.94 / 4.80 vs 4.86).
+
+![hc0k3: card 0 holds 13 active hot experts (device 3.79 ms)](figures/T512_hc0k3_addtree_cores.png)
+
+### 12.2 The three clocks disagree: the hot-stage side effect is mostly a trace-collection phenomenon
+
+The runtime's own device timer (same stats-70 QPC, no trace collection, 200 runs, two alternating rounds):
+
+| Variant | Mean ms (two rounds) | Min | Max | Std |
+|---|---|---:|---:|---:|
+| token-owned | 4.26 / 4.31 | 4.08 | 4.47 | 0.07 |
+| addtree | 3.90 / 3.78 | 3.44 | 4.40 | 0.18 to 0.19 |
+| tileadd | 3.87 / 3.79 | 3.51 | 4.62 | 0.19 to 0.20 |
+| hc0k3 addtree | 3.72 / 3.71 | 3.57 | 3.90 | 0.05 |
+| hc0k4 addtree | 3.68 / 3.69 | 3.49 | 3.86 | 0.05 to 0.07 |
+| stagesplit | 4.34 / 4.32 | 3.93 | 4.68 | 0.13 |
+
+- Without tracing, addtree is 0.36 to 0.53 ms faster than token-owned, close to the whole tail gain (1.23 to 0.71); the host gains of the
+  three sessions, 0.66 / 0.43 / 0.46 ms, are the same size. Neither number is possible if the hot stage really lost a steady 0.43 ms.
+- addtree without tracing: mean 3.78 to 3.90, min 3.44, max 4.40, std 0.19. It has a slow mode in which a minority of iterations take
+  4.4 ms. The three traced samples, 4.38 / 4.29 / 4.11, all fall in the slow mode: per-op trace collection triggers it reliably.
+- hc0k3 / hc0k4 remove the slow mode (max 3.9, std 0.05) and lower the mean by 0.1 to 0.15 ms; the host clock's round-to-round jitter of
+  about 0.3 ms cannot resolve that.
+- So on the production QPC the hot-stage cost of addtree is "an occasional 0.5 ms jitter, about 0.1 ms on average", not the steady
+  0.43 ms of the profile. The mechanism described in Sections 5 and 11 (elementwise intermediates materialized whole in card 0's TCM)
+  still holds; in the production build it is hidden most of the time, and trace collection turns it into the norm. Unloading card 0 is
+  the right fix for the jitter; its gain on the host clock is inside the noise.
+
+### 12.3 Single-layer probes: with a lane-partitioned consumer the compiler replicates the whole sum on all four cards
+
+In the full model the MoE output feeds the residual add, RMSNorm, then an Expand to [4, T, 2048] for the head-parallel attention (one
+lane per card). That structure was appended to the layer-2 replay graph as a probe: the residual uses the hidden part of the layer input,
+followed by a per-lane [4, 2048, 1024] MatMul standing in for q_proj.
+
+| Probe | Final sum | Compiler placement | Device (runtime timer, mean) | Traced profile |
+|---|---|---|---:|---:|
+| bcast_einsum | 16 Einsum tiles, Expand to 4 lanes, MatMul | 80 reduce-adds on every card (1.2 ms serial per card, cards in parallel), P2P 24 MiB | 5.09 / 5.14 | 5.12 |
+| bcast | elementwise addtree, Expand, MatMul | 48 elementadds on every card, P2P 24 MiB | 4.38 / 4.34 | 4.66 |
+| allred | each lane writes its own (p_c + ...), Concat | compiles to exactly the same program as bcast | - | 4.66 |
+| rn_einsum | Einsum tiles + residual + RMSNorm + Expand + MatMul | sum, residual and norm all replicated on the four cards | 5.01 / 5.04 | 5.14 |
+| rn_add | addtree + residual + RMSNorm + Expand + MatMul | same, 64 elementadds per card | 4.70 / 4.71 | 4.93 |
+
+- As soon as the consumer is lane-partitioned the compiler no longer reduces to card 0 and broadcasts: every card gathers the other three
+  partials (an all-gather, 6 MiB into each card, 24 MiB in total) and computes the full sum, the residual and the norm itself. There is no
+  root card and no broadcast step; the "card 0 receives, card 0 adds" tail of Section 4 does not exist in the full model.
+- The elementwise form is still faster there: by 0.75 ms when the MatMul follows directly and by 0.3 ms through the residual and norm
+  (per layer, T=512). The Einsum form pays a serial 4-core template on every card; the elementwise form pays a TCM footprint on every
+  card (traced hot ends 2.05 to 2.51 on the four cards).
+- With the four cards symmetric, "unload card 0" has no target; only the compiler can reduce the footprint.
+
+![rn_einsum: Einsum tiles + residual + norm + 4-lane MatMul (profile 5.14 ms)](figures/T512_fc_rn_einsum_cores.png)
+
+![rn_add: elementwise addtree + residual + norm + 4-lane MatMul (profile 4.93 ms)](figures/T512_fc_rn_add_cores.png)
+
+### 12.4 Full model: the elementwise final sum in all 48 layers
+
+Every layer's final sum of `hpb_stack_tc` (rewrites + token-centric + head-parallel, KV retained on device, flag) was replaced by addtree
+(`scripts/build_full_fc.py`), nothing else changed; compile 8 min, QPC 25 GB, 4 bindings. Both models ran twice, alternating, in one
+session (3 rounds x 20 each):
+
+| Full model, T=128 first chunk, MXFP6, flag | run 1 | run 2 | logits rel L2 |
+|---|---:|---:|---:|
+| hpb_stack_tc (original, Einsum tiles) | 147.3 | 147.0 | 0.1724 |
+| hpb_stack_fc (addtree in every layer) | 132.9 | 133.2 | 0.1682 |
+
+### 12.5 Conclusions of this round
+
+1. Of the six paths only "fewer hot experts on card 0" removes the hot-stage side effect on the profile; the compiler options (1a, 3)
+   do nothing and forcing DDR (1b, 1c) is worse.
+2. On the production build the side effect is mostly an occasional jitter of addtree (about 0.1 ms on average), not a steady 0.43 ms;
+   the traced profile amplifies it. Variants must be judged on the host clock (or the runtime timer without tracing); the profile is
+   for structure only.
+3. In the full model the final sum is already "replicated on all four cards", without a root card; the elementwise form is 0.3 ms per
+   layer faster there (T=512 probe); the full-model result is in 12.4.
+4. Reproduction: `fc2/chain_a.sh` (compiles, inventories and profiles of 1a, 1b, 1c, 2, 3), `fc2/chain_b.sh` and `fc2/chain_c.sh`
+   (probes and runtime timing), `timing/S13_allpaths_spec.json` (host session), `fc2/chain_d.sh` (full model).
