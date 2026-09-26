@@ -1,140 +1,169 @@
-# 最终跨卡求和改为 16 核并行:方法、结果与原设计的对比
+# Final cross-card sum on 16 cores: method, results, and comparison with the original design
 
-日期 2026-09-26。四张 AI 100(每卡 16 核),SDK 1.21.6,Qwen3-30B-A3B layer 2 replay,MXFP6 专家权重,`-mdts-mos=1`,
-prompt-41 路由(T=256/512 为合成路由),hot/cold 放置与 oracle 容量(T=128: 92/2,T=256: 158/4,T=512: 296/32)。
-起点是原 README 3.13 的最终设计 token-owned combine。所有脚本、graph、profile 在 `/home/chihao/testing`。
+Date 2026-09-26. Four AI 100 cards (16 cores each), SDK 1.21.6, Qwen3-30B-A3B layer-2 replay, MXFP6 expert weights,
+`-mdts-mos=1`, prompt-41 routing (synthetic routing at T=256/512), hot/cold placement with oracle capacities
+(T=128: 92/2, T=256: 158/4, T=512: 296/32). The starting point is the token-owned combine, the final design of Section 3.13
+of the original mdts_flag README. Scripts, graphs and profiles live in `/home/chihao/testing`.
 
-## 1. 结论
+## 1. Summary
 
-- token-owned 设计的尾部(卡 1 到 3 结束之后卡 0 还要做的部分,T=512 时 1.23 ms)不是跨卡搬运,而是卡 0 上
-  **4 个核串行执行 16 个归约 tile 的计算**(1.03 ms),跨卡搬运(6 MiB,0.53 ms)藏在它下面。
-- 把最终求和改写成按 token 行切分的元素级 Add,编译器把它铺到卡 0 的 16 个核上,相加从 1.03 ms 降到 8 µs。
-  单层主机时延 T=512 从 5.57 ms 降到 4.91 ms(**−12%**),尾部从 1.23 降到 0.71 ms。
-- 相加去掉之后,尾部的下限就是链路:6 / 3 / 1.5 MiB 各需 0.53 / 0.25 / 0.125 ms(T=512/256/128),约 **12 GB/s**,
-  严格按字节计费。这是 combine 里唯一剩下的开销,再压缩只能少传字节或换拓扑。
-- 副作用:卡 0 的热 stage 慢了约 0.4 ms(T=512),吃掉了约一半的收益。原因指向 6 MiB 的 P2P 落地缓冲静态驻留在卡 0
-  的 TCM。四种减小驻留的写法都没有消除它;把热 stage 那份提前传(stagesplit)能消除,但字节翻倍、卡 0 的冷 stage 被拖慢,整体更差。
+- The tail of the token-owned design (what card 0 still does after cards 1-3 have finished, 1.23 ms at T=512) is not the
+  cross-card transfer but **compute: 16 reduction tiles executed serially on 4 cores of card 0** (1.03 ms). The 6 MiB
+  transfer (0.53 ms) is hidden underneath it.
+- Rewriting the final sum as elementwise Adds split along the token axis lets the compiler spread it over all 16 cores of
+  card 0; the add drops from 1.03 ms to 8 us. Single-layer host latency at T=512 goes from 5.57 ms to 4.91 ms (**-12%**);
+  the tail from 1.23 to 0.71 ms.
+- With the add gone, the floor of the tail is the link: 6 / 3 / 1.5 MiB take 0.53 / 0.25 / 0.125 ms (T=512/256/128),
+  about **12 GB/s**, exactly proportional to bytes. This is the only cost left in the combine; shrinking it further needs
+  fewer bytes or a different topology.
+- Side effect: card 0's hot stage becomes about 0.4 ms slower (T=512), eating roughly half of the gain. The evidence points
+  at the 6 MiB P2P landing buffer being statically resident in card 0's TCM. Four variants that reduce residency did not
+  remove it; sending the hot-stage partial early (stagesplit) does, but doubles the bytes and stalls card 0's cold stage,
+  so it is worse overall.
 
-## 2. 原设计的尾部到底在做什么
+## 2. What the original tail actually does
 
-token-owned(原 README 3.13)在每张卡本地把每个 token 的 8 行加好之后,剩下的是把四张卡的 [T, 2048] 部分和加成一个。
-原图把它写成 16 个 `Einsum('dth->th')` tile(每个 32 行)加 Concat。编译器把每个 Einsum 降成同一模板:
+After each card has summed each token's eight rows locally, token-owned (README 3.13) still has to add the four per-card
+[T, 2048] partial sums into one. The original graph writes that as 16 `Einsum('dth->th')` tiles of 32 rows plus a Concat.
+The compiler lowers every Einsum to the same template:
 
 ```
-1、2、3 号核各加一份(一卡对一核)→ multicast 给 0 号核 → 0 号核再加(两次 reduce-add)
+cores 1, 2, 3 each add one incoming share (one core per source card) -> multicast to core 0 -> core 0 adds again (two reduce-adds)
 ```
 
-16 个 tile 共用这 4 个核和同一个汇合点,所以一个 tile 做完才能做下一个。T=512 的 trace(`profile/K_T512_hc_296_32_tokenowned_mxfp6_s70_flag`):
+All 16 tiles share those 4 cores and the same merge point, so one tile must finish before the next starts. From the T=512
+trace (`profile/K_T512_hc_296_32_tokenowned_mxfp6_s70_flag`):
 
-| 项 | 数值 |
+| Item | Value |
 |---|---:|
-| 卡 1 到 3 结束 | 3.14 ms |
-| 三张卡发出部分和(48 次 P2P,6 MiB) | 3.136 到 3.151 ms 发起 |
-| 16 个 tile,每个 5 个算子在 0 到 3 号核 | 3.135 到 4.162 ms,每 tile 73 µs |
-| 0 号核输出写回 2 MiB | 4.163 到 4.230 ms |
-| 卡 0 结束 | 4.36 ms |
+| Cards 1-3 finish | 3.14 ms |
+| Partials issued by the three cards (48 P2P sends, 6 MiB) | 3.136-3.151 ms |
+| 16 tiles, 5 ops each on cores 0-3 | 3.135-4.162 ms, 73 us per tile |
+| Core 0 writes the 2 MiB output back | 4.163-4.230 ms |
+| Card 0 finishes | 4.36 ms |
 
-链路给一个 tile 送 384 KiB 只要 33 µs,比 tile 的 73 µs 快,而且 6 MiB 在 3.67 ms 就全部到齐,后面的 tile 都在已到达的数据上跑。
-所以这 1.03 ms 是串行计算,不是传输。原 README 3.12 把它描述为"串行 tile 流水线、根在卡 0",3.14 说 fp16 部分和不省时间,与此一致。
+The link delivers one tile's 384 KiB in about 33 us, faster than the 73 us a tile takes, and all 6 MiB have arrived by
+about 3.67 ms; the later tiles run on data that is already present. So the 1.03 ms is serialized compute, not transfer.
+This matches the README's own description in 3.12 ("a serialized tile pipeline, rooted on card 0") and its observation in
+3.14 that fp16 partials do not save time.
 
-## 3. 改法:按 token 行切分的元素级相加
+## 3. The change: elementwise adds split along the token axis
 
 `scripts/make_final_combine.py <token-owned graph> <out> addtree`:
 
 ```
-p_c = Slice(to_partials, card c)          # 四份 [T, 2048]
-out = (p0 + p1) + (p2 + p3)               # 元素级 Add
+p_c = Slice(to_partials, card c)          # four [T, 2048] slices
+out = (p0 + p1) + (p2 + p3)               # elementwise Adds
 ```
 
-编译器对元素级 Add 按行分核:卡 0 的 16 个核各加自己的 32 行,核之间没有依赖、没有 multicast(清单:elementadd 48 个算子,
-卡 0 全部 16 核)。并行轴从"来源卡"(4 → 4 个核)换成了"token 行"(512 → 16 个核),和每卡本地归约(绿色)用的是同一种写法。
+The compiler partitions an elementwise Add by rows: the 16 cores of card 0 each add their own 32 rows, with no
+dependency or multicast between cores (op inventory: 48 `elementadd` ops on all 16 cores of card 0). The parallel axis
+changes from "source card" (4 -> 4 cores) to "token row" (512 -> 16 cores), which is the same form the per-card local
+reduction (green in the figures) already used.
 
-试过的其他写法:`Sum` 算子和 `Transpose + ReduceSum` 都被编译器退回 4 核 `aicbatchedreduceadd` 加一次 DDR 归约,无效。
+Other forms tried: a variadic `Sum` and `Transpose + ReduceSum` both fall back to the 4-core `aicbatchedreduceadd` plus
+a DDR reduce, so they do not help.
 
-## 4. 结果
+## 4. Results
 
-### 4.1 时延(T=512,同会话,3 轮 × 100,主机中位)
+### 4.1 Latency (T=512, one session, 3 alternating rounds x 100, host median)
 
-| 版本 | 主机 ms | 相对 token-owned | device ms(3 样本) | 卡 0 尾部 |
+| Build | Host ms | vs token-owned | Device ms (3 samples) | Card-0 tail |
 |---|---:|---:|---|---:|
-| anchor,dense combine(3.8) | 9.735 | | | |
-| token-owned(3.13) | 5.573 | – | 4.38 / 4.36 / 4.34 | 1.23 ms |
-| **addtree(本文)** | **4.912** | **−12%** | 4.38 / 4.29 / 4.11 | 0.71 ms |
-| tileadd,16 段各自元素级相加 | 5.140 | −8% | 4.31 / 4.15 / 4.21 | 0.67 ms |
-| addtree + fp16 部分和 | 5.192 | −7% | 4.35 / 4.32 / 4.01 | 0.71 ms |
+| anchor, dense combine (README 3.8) | 9.735 | | | |
+| token-owned (README 3.13) | 5.573 | - | 4.38 / 4.36 / 4.34 | 1.23 ms |
+| **addtree (this note)** | **4.912** | **-12%** | 4.38 / 4.29 / 4.11 | 0.71 ms |
+| tileadd, 16 elementwise tiles | 5.140 | -8% | 4.31 / 4.15 / 4.21 | 0.67 ms |
+| addtree + fp16 partials | 5.192 | -7% | 4.35 / 4.32 / 4.01 | 0.71 ms |
 
-不带探针、SDK runner 连跑 40 次的每次总时长:token-owned 5.90 ms,addtree 5.39,tileadd 5.22,和主机计时一致。
-输出与 anchor 的相对 L2 为 3.5e-4(fp16 元素级相加的结合顺序),token-owned 为 1.3e-5。
+Uninstrumented, the SDK runner's per-iteration total over 40 iterations is 5.90 ms (token-owned), 5.39 (addtree),
+5.22 (tileadd), consistent with the host timing. Outputs differ from the anchor by a relative L2 of 3.5e-4 (fp16
+elementwise adds in a different association), against 1.3e-5 for token-owned.
 
-### 4.2 尾部分解(device,中位样本)
+### 4.2 Tail breakdown (device, median sample)
 
-| T | 部分和字节 | 到齐前空档(链路) | 相加 | 输出写回 | 尾部:token-owned → addtree |
+| T | Partial bytes | Idle gap before the add (link) | Add | Output write | Tail: token-owned -> addtree |
 |---:|---:|---:|---:|---:|---|
-| 128 | 1.5 MiB | 0.125 ms | 8 µs | | 0.30 → 0.16 ms |
-| 256 | 3.0 MiB | 0.25 ms | 8 µs | | 0.58 → 0.32 ms |
-| 512 | 6.0 MiB | 0.53 ms | 8 µs | 0.17 ms | 1.21 → 0.71 ms |
+| 128 | 1.5 MiB | 0.125 ms | 8 us | | 0.30 -> 0.16 ms |
+| 256 | 3.0 MiB | 0.25 ms | 8 us | | 0.58 -> 0.32 ms |
+| 512 | 6.0 MiB | 0.53 ms | 8 us | 0.17 ms | 1.21 -> 0.71 ms |
 
-空档三个样本各自精确到 0.01 ms,与字节数严格成正比,约 12 GB/s。trace 里的 P2P 事件(12 到 15 µs)记录的是发起时刻,
-到达时间只能从接收端第一个消费算子反推。
+The gap is reproducible to 0.01 ms across three samples and strictly proportional to bytes, about 12 GB/s. The trace's
+P2P events (12-15 us) record when a transfer is issued, not when it completes; arrival can only be inferred from the
+first consuming op on the receiving side.
 
-### 4.3 线段图:改前(上)与改后(下),T=512
+### 4.3 Per-core timelines: before (top) and after (bottom), T=512
 
 ![token-owned vs addtree](figures/T512_tokenowned_vs_addtree.png)
 
-读图(横轴 ms,四个子图是四张卡,每行一个核;蓝/橙热冷 GEMM,紫权重 DMA,棕解量化,粉 gather 与 index build,绿本地归约,红最终求和,灰等待):
+How to read it (x axis in ms; the four panels are the four cards, one row per core; blue/orange hot and cold GEMMs,
+purple weight DMA, brown dequantize, pink gathers and index build, green local reduction, red final sum, grey waits):
 
-- 上图卡 0 右端:0 到 3 号核上四条红色长条,3.15 到 4.16 ms,其余 12 核灰色等待。
-- 下图卡 0 右端:16 行各一个红点(4.11 ms,8 µs)。红点左边 3.59 到 4.11 ms 四张卡全灰,是 6 MiB 在链路上的时间。
-- 下图卡 0 的热 stage(蓝)比上图长约 0.4 ms(1.99 → 2.42),其他三张卡不变;因此粉色的 index build 和橙色冷 stage 整体右移 0.45 ms,
-  卡 1 到 3 的结束从 3.14 变成 3.58。
+- Top, right end of card 0: four long red bars on cores 0-3 from 3.15 to 4.16 ms; the other 12 cores wait in grey.
+- Bottom, right end of card 0: one small red dot per row (4.11 ms, 8 us). Left of the dots, 3.59-4.11 ms, all four cards
+  are grey: that is the 6 MiB on the link.
+- Bottom, card 0's hot stage (blue) is about 0.4 ms longer than on top (1.99 -> 2.42 ms); the other three cards are
+  unchanged. Consequently the pink index build and the orange cold stage shift right by 0.45 ms, and cards 1-3 finish at
+  3.58 instead of 3.14.
 
-单张图:[T512_tokenowned_cores.png](figures/T512_tokenowned_cores.png)、[T512_fc_addtree_cores.png](figures/T512_fc_addtree_cores.png)、[T512_fc_tileadd_cores.png](figures/T512_fc_tileadd_cores.png)、[T512_fc_stagesplit_cores.png](figures/T512_fc_stagesplit_cores.png)。
+Single figures: [T512_tokenowned_cores.png](figures/T512_tokenowned_cores.png),
+[T512_fc_addtree_cores.png](figures/T512_fc_addtree_cores.png), [T512_fc_tileadd_cores.png](figures/T512_fc_tileadd_cores.png),
+[T512_fc_stagesplit_cores.png](figures/T512_fc_stagesplit_cores.png).
 
-## 5. 副作用:卡 0 热 stage 变慢
+## 5. Side effect: card 0's hot stage slows down
 
-| 观察 | 数据 |
+| Observation | Data |
 |---|---|
-| 算子结构不变 | 卡 0 每核 36 个 GEMM、36 个解量化、36 次权重 DMA,字节相同 |
-| 每个算子均匀变慢 | GEMM 每次 21.7 → 49.8 µs,解量化 12.2 → 21.6 µs;HMX 等权重的时间翻倍;卡 1 到 3 不变 |
-| 随 T 增长 | 热 stage 结束时间差:T=128 约 0,T=256 约 +0.1 ms,T=512 +0.3 到 +0.5 ms;对应部分和 1.5 / 3 / 6 MiB |
+| Op structure unchanged | card 0, per core: 36 GEMMs, 36 dequantizes, 36 weight DMAs, same bytes |
+| Every op uniformly slower | GEMM 21.7 -> 49.8 us per event, dequantize 12.2 -> 21.6 us; HMX waits on weights double; cards 1-3 unchanged |
+| Grows with T | hot-stage end shift: T=128 about 0, T=256 about +0.1 ms, T=512 +0.3 to +0.5 ms; partials are 1.5 / 3 / 6 MiB |
 
-为消除它试的变体(T=512,device,中位样本;`scripts/fc_compare.py`):
+Variants tried to remove it (T=512, device, median sample; `scripts/fc_compare.py`):
 
-| 变体 | device | 卡 0 热 stage 结束 | 卡 0 尾部 | 结果 |
+| Variant | Device | Card-0 hot end | Card-0 tail | Outcome |
 |---|---:|---:|---:|---|
-| addtree | 4.29 | 2.42 | 0.71 | 基准 |
-| rev,(p3+p2)+(p1+p0) | 4.25 | 2.37 | 0.70 | 编译器仍把相加放在卡 0,无效 |
-| tileadd 32 段 | 4.39 | 2.56 | 0.66 | 无效 |
-| half,分两半 | 4.46 | 2.57 | 0.71 | 无效 |
-| stagesplit,热 stage 部分和提前传 | 4.50 | **2.06** | 0.71 | 热 stage 恢复,但跨卡 12 MiB,卡 0 冷 stage 被推迟到 3.27 ms,整体更差 |
+| addtree | 4.29 | 2.42 | 0.71 | baseline |
+| rev, (p3+p2)+(p1+p0) | 4.25 | 2.37 | 0.70 | compiler still roots on card 0; no change |
+| tileadd, 32 tiles | 4.39 | 2.56 | 0.66 | no change |
+| half, two halves | 4.46 | 2.57 | 0.71 | no change |
+| stagesplit, hot-stage partial sent early | 4.50 | **2.06** | 0.71 | hot stage recovers, but 12 MiB cross-card and card 0's cold stage is pushed to 3.27 ms; worse overall |
 
-解释:P2P 落地缓冲是静态分配的,发送方直接写卡 0 的 TCM 地址,这块区域整层期间都保留。原设计 16 个 tile 串行,只需一个 384 KiB 的
-落地区复用 16 次;元素级写法让所有段同时可执行,6 MiB 全部驻留,每核少了约 384 KiB 的 TCM,热 stage 的权重预取深度下降。
-切 32 段或分两半不改变"全部同时落地",所以无效;stagesplit 要落地 12 MiB,超出编译器放进 TCM 的量,改走 DDR,热 stage 恢复,
-代价换成冷 stage 期间的 DDR 争用。这是从 trace 反推的,编译器的分配表看不到。
-可验证的修法:16 段元素级相加但段间加数据依赖,让编译器回到"一个落地缓冲复用 16 次",同时保留 16 核并行;预期热 stage 回到
-1.99 ms、尾部不变,整层收益从 −12% 到约 −20%。
+Interpretation: P2P landing buffers are allocated statically; the senders write straight into fixed TCM addresses on
+card 0, so the region is reserved for the whole layer. The original design runs its 16 tiles serially and needs one
+384 KiB landing buffer reused 16 times; the elementwise forms make all tiles runnable at once, so the whole 6 MiB is
+resident and each core loses about 384 KiB of TCM, which shortens the hot stage's weight prefetch. Splitting into 32 tiles
+or two halves does not change "everything lands at once", so it does not help; stagesplit needs 12 MiB, more than the
+compiler puts in TCM, so it goes through DDR and the hot stage recovers, at the price of DDR contention during the cold
+stage. This is inferred from the traces; the compiler's allocation table is not visible.
+A testable fix: 16 elementwise tiles with an explicit data dependency between consecutive tiles, so the compiler goes
+back to one landing buffer reused 16 times while keeping the 16-core add; expected hot stage back at 1.99 ms, tail
+unchanged, layer gain from -12% to about -20%.
 
-## 6. 现在还剩什么
+## 6. What is left
 
-改后 T=512 一层(device 约 4.2 ms)的构成:热 stage 约 2.1 ms(含副作用 0.4),stage 间索引交换约 0.5,冷 stage 约 0.5,
-每卡本地归约 0.05,**跨卡搬运 0.53**,相加 0.01,输出写回 0.17。跨卡搬运是 combine 里唯一剩下的项,占整层 12%,只能靠:
+After the change, a T=512 layer (about 4.2 ms device) consists of: hot stage about 2.1 ms (including the 0.4 ms side
+effect), inter-stage index exchange about 0.5, cold stage about 0.5, per-card local reduction 0.05, **cross-card
+transfer 0.53**, add 0.01, output write 0.17. The transfer is the only item left in the combine, 12% of the layer, and
+only three things can reduce it:
 
-1. 少传字节:只传该卡上有 expert 参与的 token 行。现在的放置下每个 token 平均碰 3.8 张卡,只能省 7%(sorted 布局 39%,但它在 flag
-   下慢 0.7 ms),必须和放置一起设计,并与 balance 对冲。
-2. 重叠:热 stage 那份提前传。stagesplit 表明接收方要付带宽代价,除非冷 stage 那份是稀疏的、字节很少。
-3. 换拓扑:四张卡各收四分之一的 token(reduce-scatter),每卡 1.5 MiB、约 0.13 ms。原 README 3.14 和本轮都被编译器折叠回卡 0,需编译器支持。
+1. Fewer bytes: send only the rows of tokens that touched the card. With the current placements a token touches 3.8 cards
+   on average, so this saves only 7% (39% on the sorted layout, which is 0.7 ms slower under the flag); it has to be
+   designed together with placement and traded against balance.
+2. Overlap: send the hot-stage partial early. stagesplit shows the receiving card pays for the transfer during its cold
+   stage, so this only pays if the cold-stage share is sparse and small.
+3. Topology: each card receives a quarter of the tokens (reduce-scatter), 1.5 MiB and about 0.13 ms per card. Both the
+   original README (3.14) and this round saw the compiler collapse it back onto card 0; it needs compiler support.
 
-## 7. 复现
+## 7. Reproduction
 
 ```
-scripts/make_final_combine.py combine/T512_hc_296_32_tokenowned combine/T512_to_fc_addtree addtree     # 或 tileadd [段数] | rev | half | stagesplit | sum | treduce
-scripts/compile_any.sh combine/T512_to_fc_addtree F_T512_fc_addtree_mxfp6_s0_flag mxfp6 0 flag          # s70 为带探针
-scripts/timing.py timing/S11b_fc_spec.json timing/S11b_fc.json 3 100                                    # 同会话计时
+scripts/make_final_combine.py combine/T512_hc_296_32_tokenowned combine/T512_to_fc_addtree addtree     # or tileadd [N] | rev | half | stagesplit | sum | treduce
+scripts/compile_any.sh combine/T512_to_fc_addtree F_T512_fc_addtree_mxfp6_s0_flag mxfp6 0 flag          # s70 for the instrumented build
+scripts/timing.py timing/S11b_fc_spec.json timing/S11b_fc.json 3 100                                    # same-session timing
 scripts/profile_case.sh qpc/F_T512_fc_addtree_mxfp6_s70_flag profile/F_T512_fc_addtree_mxfp6_s70_flag F_T512_fc_addtree 512 combine/T512_to_fc_addtree/input_f16.bin
 plotvenv/bin/python scripts/detail_plot2.py profile/F_T512_fc_addtree_mxfp6_s70_flag/analysis/sample1 "title" figures/x.png 0,1,2,3
-scripts/fc_compare.py                                                                                   # 变体对比表
+scripts/fc_compare.py                                                                                   # variant comparison table
 ```
 
-数据:`timing/S11b_fc*.json`(计时),`profile/F_T*_fc_*`(trace、每核 CSV、分析),`inventory/F_T512_fc_*`(编译期算子清单),
-`combine/T*_to_fc_*`(graph)。
+Data: `timing/S11b_fc*.json` (timing), `profile/F_T*_fc_*` (traces, per-core CSVs, analysis), `inventory/F_T512_fc_*`
+(compile-time op inventories), `combine/T*_to_fc_*` (graphs).
