@@ -180,87 +180,57 @@ Figures (T=512, sample 1): `figures/T512_fc_chain_cores.png`, `figures/T512_fc_t
 `figures/T512_fc_addtree_vtcm0.5_cores.png`, `figures/T512_fc_addtree_vtcm0.25_cores.png`, `figures/T512_fc_addtree_vtcm0.1_cores.png`,
 plus the earlier `T512_fc_rev/half/tileadd32/stagesplit_cores.png`.
 
-## 9. One figure per method (T=512, sample 1)
+## 9. The five variants kept: what each optimizes and what to look for (T=512, sample 1)
 
 Reading: x axis in ms, four panels are the four cards, one row per core; red is the final sum on card 0, blue the hot stage, grey waits.
 
-### token-owned
+| Variant | Device ms | Host ms | In one line |
+|---|---:|---:|---|
+| token-owned | 4.36 | 5.57 | original, 4-core serial add |
+| addtree | 4.29 | 4.91 | elementwise add on 16 cores, best |
+| tileadd | 4.21 | 5.14 | 16 elementwise tiles, tied with addtree |
+| rev | 4.25 | - | reversed operand order, root unchanged, no effect |
+| vtcm 0.1 | 4.26 | - | compiler option, no effect |
 
-The original design (README 3.13). Card 0, right end: four long red bars on cores 0-3 (3.15-4.16 ms), 16 tiles added serially while the other 12 cores wait; hot stage unaffected. Device 4.36 ms, host 5.57 ms.
+### token-owned (original design, device 4.36 ms)
 
-![token-owned](figures/T512_tokenowned_cores.png)
+**What it does.** The final design of README 3.13: each core finds its tokens' eight rows with a TopK and sums them locally (green), then the four per-card partial sums travel to card 0 and are summed over the card axis by 16 Einsum tiles.
 
-### addtree
+**What to look at.** Card 0, right end: four long red bars on cores 0-3 from 3.15 to 4.16 ms. The compiler lowers each Einsum to the template "three cores add one share each, merge on core 0"; all 16 tiles share those 4 cores and run one after another while the other 12 cores wait in grey. The hot stage (blue) ends at 1.99 ms, unaffected. Tail 1.23 ms, of which 1.03 ms is this serial compute; the 6 MiB transfer is hidden underneath.
 
-The best variant. The red becomes one dot per row (4.11 ms, 8 us); the all-card blank at 3.59-4.11 ms is the 6 MiB link transfer; card 0's hot stage is 0.4 ms longer. Device 4.29, host 4.91 ms (-12%).
+![token-owned (original design, device 4.36 ms)](figures/T512_tokenowned_cores.png)
 
-![addtree](figures/T512_fc_addtree_cores.png)
+### addtree (device 4.29 ms, host 4.91 ms, -12%)
 
-### tileadd
+**What it does.** Rewrites the final sum from "an Einsum over the card axis" into elementwise adds: slice the four [T, 2048] partials by card, then compute (p0+p1)+(p2+p3). The compiler partitions an elementwise add by rows, so the 16 cores of card 0 each add their own 32 rows with no dependency or multicast between cores.
 
-16 elementwise tiles. Same family as addtree: 16-core add, 0.67 ms tail, same hot-stage cost. Device 4.21, host 5.14 ms (-8%).
+**What to look at.** The red becomes one dot per row (4.11 ms, 8 us in total). Left of the dots, 3.59-4.11 ms, all four cards are grey with no op at all: that 0.53 ms is the 6 MiB of partial sums on the link (about 12 GB/s), previously hidden under the red bars and now the floor of the tail. Side effect: card 0's blue hot stage stretches to 2.42 ms, 0.4 ms longer, because the elementwise form makes the compiler place the slices, intermediate sums and output (about 14 MiB) statically in card 0's TCM, squeezing the hot stage's weight prefetch; the other cards are unaffected but wait for card 0, so the cold stage shifts right. Tail 0.71 ms (0.53 transfer + 0.17 output write).
 
-![tileadd](figures/T512_fc_tileadd_cores.png)
+![addtree (device 4.29 ms, host 4.91 ms, -12%)](figures/T512_fc_addtree_cores.png)
 
-### tileadd32
+### tileadd (device 4.21 ms, host 5.14 ms, -8%)
 
-32 tiles. Smaller pieces do not reduce the intermediates materialized at once; hot stage still slow; device 4.39.
+**What it does.** Same idea as addtree, but the 512 rows are cut into 16 pieces, each computing (p0+p1)+(p2+p3) on its own, followed by a Concat, hoping the smaller per-piece buffers give the compiler a chance to reuse them.
 
-![tileadd32](figures/T512_fc_tileadd32_cores.png)
+**What to look at.** Almost identical to addtree: 16-core red dots, the link blank before them, the stretched hot stage (2.39 ms). Cutting into pieces does not reduce the intermediates materialized at once. Device time is slightly better than addtree over three samples, host latency slightly worse; the two are tied within the spread.
 
-### half
+![tileadd (device 4.21 ms, host 5.14 ms, -8%)](figures/T512_fc_tileadd_cores.png)
 
-Two halves, each an addtree. Same outcome, device 4.46.
+### rev (device 4.25 ms)
 
-![half](figures/T512_fc_half_cores.png)
+**What it does.** addtree with the operand order reversed, (p3+p2)+(p1+p0), probing whether the compiler roots the reduction on the card of the first operand (card 3) so that card 0 need not hold all the buffers.
 
-### rev
+**What to look at.** No difference from addtree: the red dots are still on the 16 cores of card 0, the hot stage is still stretched (2.37 ms), the link blank is still there. The compiler ignores operand order; the root is always card 0. Its value is ruling out "change the order to move the root".
 
-Reversed operand order (p3+p2)+(p1+p0), meant to move the root to card 3. The compiler ignores the order; still card 0; device 4.25.
+![rev (device 4.25 ms)](figures/T512_fc_rev_cores.png)
 
-![rev](figures/T512_fc_rev_cores.png)
+### vtcm 0.1 (device 4.26 ms)
 
-### chain
+**What it does.** The addtree graph unchanged, compiled with `-vtcm-working-set-limit-ratio=0.1`, which limits the share of fast memory a single op may use, hoping to push the add's inputs to DDR and free the TCM the hot stage needs.
 
-16 elementwise tiles with a data dependency between consecutive tiles. The red dots are spaced exactly 34 us apart, the add follows the link cadence; the hot stage is still slow (2.56), so ordering does not change allocation. Device 4.40, host 5.33 ms.
+**What to look at.** Same as addtree: the hot stage still ends at 2.39 ms, tail 0.71 ms. The compile-time op inventory is identical to the build without the option; the option does not govern the placement of these buffers. The values 0.5 and 0.25 are equally ineffective.
 
-![chain](figures/T512_fc_chain_cores.png)
-
-### vtcm 0.5
-
-addtree with -vtcm-working-set-limit-ratio=0.5. Op inventory identical to no option, figure indistinguishable from addtree; device 4.29.
-
-![vtcm 0.5](figures/T512_fc_addtree_vtcm0.5_cores.png)
-
-### vtcm 0.25
-
-Same with ratio 0.25; device 4.33.
-
-![vtcm 0.25](figures/T512_fc_addtree_vtcm0.25_cores.png)
-
-### vtcm 0.1
-
-Same with ratio 0.1; device 4.26.
-
-![vtcm 0.1](figures/T512_fc_addtree_vtcm0.1_cores.png)
-
-### quarters
-
-Four independent addtrees on quarter row ranges with operands rotated per card, an attempt at a four-root reduce-scatter. All adds still on card 0; device 4.33.
-
-![quarters](figures/T512_fc_quarters_cores.png)
-
-### stagesplit
-
-Hot- and cold-stage partials reduced separately, the hot one sent during the cold stage (pink block at 2.68-3.17 ms and the first red group at 3.2 ms). Hot stage recovers (2.06), but 12 MiB cross-card, card 0's cold stage is pushed to 3.27 and the tail waits for another 6 MiB; device 4.50.
-
-![stagesplit](figures/T512_fc_stagesplit_cores.png)
-
-### tree
-
-Hierarchical tree: 16 Einsum tiles over lanes 0+1 and 16 over lanes 2+3, then an add. Both chains land on cores 0-1 of card 0 and run serially, red from 3.0 to 5.3 ms; hot stage normal (1.98). Device 5.54, the slowest.
-
-![tree](figures/T512_fc_tree_cores.png)
+![vtcm 0.1 (device 4.26 ms)](figures/T512_fc_addtree_vtcm0.1_cores.png)
 
 ## 7. Reproduction
 
