@@ -494,3 +494,32 @@ session (3 rounds x 20 each):
    layer faster there (T=512 probe); the full-model result is in 12.4.
 4. Reproduction: `fc2/chain_a.sh` (compiles, inventories and profiles of 1a, 1b, 1c, 2, 3), `fc2/chain_b.sh` and `fc2/chain_c.sh`
    (probes and runtime timing), `timing/S13_allpaths_spec.json` (host session), `fc2/chain_d.sh` (full model).
+5. Three more paths (12.6): the linear chain, `-multicast-weights` and `-mos=2`. The first two reduce card 0's traced hot-stage squeeze
+   to 2.27 and 2.11 ms, but neither the runtime timer nor the host latency differs from addtree; `-mos=2` changes nothing.
+
+### 12.6 Addendum: chainadd, `-multicast-weights`, `-mos=2` (2026-09-27, morning)
+
+All three leave the sum and the later all-gather untouched and only try to ease the contention between the sum's buffers and the hot
+stage: the linear chain ((p0+p1)+p2)+p3 gives the compiler a chance to accumulate in place with one intermediate less;
+`-multicast-weights` loads weights shared by several cores once from DDR, reducing the hot stage's dependence on prefetch buffers;
+`-mos=2` splits weights across cores to shrink each core's resident weights. Each was built for both the token-owned and the addtree
+graph (`-mos=2`, `-multicast-weights`) or for addtree alone (chainadd), with host timing in one session and one runtime-timer sweep.
+
+| Variant | Compiler inventory | Traced card 0 hot end / device (median) | Runtime device mean / std (two rounds) | Host ms (same session) |
+|---|---|---:|---:|---:|
+| token-owned | - | 1.99 / 4.36 | 4.26 / 0.07 | 5.72 |
+| addtree | - | 2.42 / 4.29 | 3.89 / 0.18 | 5.27 |
+| chainadd | op-for-op identical to addtree | 2.27 / 4.15 | 3.82 / 0.14 | 5.31 |
+| addtree + `-multicast-weights` | hot-stage ops unchanged (no weight-multicast op appears) | 2.11 / 3.98 | 3.87 / 0.19 | 5.31 |
+| token-owned + `-multicast-weights` | as above | 1.94 / 4.36 | 4.26 / 0.08 | 5.71 |
+| addtree + `-mos=2` | op-for-op identical | 2.45 / 4.32 | 3.87 / 0.20 | 5.27 |
+| token-owned + `-mos=2` | op-for-op identical | 1.93 / 4.31 | 4.25 / 0.07 | 5.66 |
+
+- Under tracing, `-multicast-weights` halves the squeeze (2.42 to 2.11, token-owned unchanged) and chainadd removes a third of it (2.27);
+  `-mos=2` changes nothing.
+- Without tracing, all three have the same mean, the same slow mode (max 4.15 to 4.35) and the same spread as addtree; host latency
+  5.27 to 5.31, one and the same number.
+- This confirms 12.2 once more: the hot-stage squeeze exists mainly under trace collection; the production build shows no measurable cost,
+  hence no measurable gain. None of the three needs to enter the final design. This session as a whole was about 0.4 ms slower than
+  S13 (token-owned 5.72 vs 5.32); only in-session comparisons are valid.
+- Reproduction: `fc2/chain_e.sh`, `timing/S14_opts_spec.json`.
