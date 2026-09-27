@@ -74,6 +74,10 @@ little, since the full model already reduces the MoE partial sums with a reduce-
 the model at 512 tokens), while spreading those experts balances the cards. In the full model the elementwise final
 sum stays distributed and saves 2.4% on two layers at T=512 (E31); the slower hot stages of two SoCs follow the
 physical SoC, which throttles under the shared 150 W cap of the AI 100 Ultra board, not the graph.
+An end-to-end profile at 512 tokens (E32) puts the hot stage at a quarter of each layer. Tiering the per-card ranks
+into three stages of 8, 8 and 16 lanes per card with capacities T, a calibrated middle one and T/8 (E34) cuts the
+512-token model from 426 to 362 ms (−15%, bit-identical, 2.90× the production baseline) and the 256-token model by
+3.6%; at T=512 the hot stage is bound by the card's shared memory traffic, and each extra stage costs a sequential window.
 
 ## 1. What the flag does
 
@@ -1960,6 +1964,100 @@ full model if it carries through.
 
 The next step is the 48-layer tileadd programs at 256 and 512 tokens against the current runtime sort.
 
+## 3.29 End-to-end profile of the 512-token model (E32)
+
+Instrumented profile of the best 512-token program of 3.26 (48 layers, runtime sort 512/64, 1024 KiB tiles, KV retained;
+`scripts/run_e32.sh`, `scripts/e32_breakdown.py`, `e2e_profile/e32_T512.txt`), 2026-09-27: 444.3 ms device time against
+427.2 ms uninstrumented, 75% of the core-time busy, 2.1 GiB of cross-card traffic. Per layer, median over layers 1–46
+(9.24 ms period), phases in execution order, the slowest SoC:
+
+| Phase | ms | Share |
+|---|---:|---:|
+| Attention core (input norm .. o_proj) | 2.10 | 23% |
+| Attention's sum over the four head groups (`ReduceSum_o`) | 2.42 | 26% |
+| Residual, post-attention norm, router | 0.22 | 2% |
+| Router → first hot GEMM (per-card sort, weight streams) | 0.66 | 7% |
+| Hot stage | 2.35 | 25% |
+| Hot end → first cold GEMM | 0.50 | 5% |
+| Cold stage | 1.03 | 11% |
+| Cold end → final MoE sum done | 0.58 | 6% |
+
+Busy core-time: hot stage 31%, token-owned combine 22% (index build, gathers, local and cross-card sums, largely
+overlapped with the stages), weight gathers 8%, `o_proj` and its group sum 8%, routing chain and sort 7%, RMSNorm
+exchanges 7%, activation 4%, attention scores/softmax/pv 3%, router 3%, cold stage 2%. Cross-card bytes: `o_proj`
+partials 55%, norm exchanges 27%, MoE partial sums 14%. The hot stage's median per SoC is 2.14 / 1.80 / 1.62 / 2.09 ms
+(SoCs 0–3; SoC 0 or 3 is the slowest in 38 of 48 layers), the power effect of 3.28 across the whole model.
+
+Attention's group sum is lowered as batched reduce-adds on four cores per card, one of them through DDR on three of the
+cards (about 1.7 ms). It lies outside this study's MoE scope: a two-layer test that writes it as elementwise adds
+(`headpar_graph.py --osum addtree|tileadd`, `scripts/run_e33.sh`, `e2e_profile/e33_osum_2layer.txt`) is 30% faster at
+T=512 and 12% at T=128 with unchanged accuracy, and is not used in any result below. The largest MoE item is the hot stage.
+
+## 3.30 Tiered capacities: removing most of the hot-stage padding (E34)
+
+The per-card runtime sort (3.20) ranks each card's 32 experts by count at run time; today ranks 1–16 run in one stage
+padded to T and ranks 17–32 in a cold stage at T/8. Tiered capacities cut the ranks into several stages, each with its own
+lane count per card (1, 2, 4, 8 or 16, the even core mappings of 3.17) and capacity. Every expert keeps exactly one lane,
+so the routing and the combine do not change in kind and the output is bit-identical. `scripts/tier_budget.py` sizes the
+capacities from the calibration chunks of 3.25/3.26 (1.28× headroom over the largest count of each tier's first rank,
+capped at T, rounded up to 16):
+
+| Design, padded rows vs today | T=256 | T=512 |
+|---|---:|---:|
+| 3 stages: 8 lanes per card at T, 8, 16 | 67% | 65–67% |
+| 4 stages: 4 at T, 4, 8, 16 | 53–58% | 52–55% |
+| 5 stages | 50–56% | 48–53% |
+
+The lower values use the spread placement of 3.27; both held-out prompts fit every design.
+
+`scripts/build_full_tiered.py <stack dir> <out> --T 512 --tiers 8x512,8x128,16x64`: tier 0 is the original stage-0
+subgraph fed with the first ranks; each further tier is a clone of it with its own row order, bank gathers and capacity
+(Slice end, Range stop); the token-owned combine maps a lane position to (tier, card, row) through small per-tier tables;
+the per-layer routing counts list the tiers' lanes in order (still 128). Two export details had to be handled: layer 0
+folds one 64-lane constant into the stage (a `[64, 1]` zero input to `Max`), resized per tier, and a static `If` squeezes
+the `[lanes, T, 1]` token table, which the clones replace with the `Squeeze`. A tiered build with today's layout
+(16×512 + 16×64) is bit-identical to the runtime sort.
+
+**Two-layer cuts** (`scripts/run_e34a.sh`, `tiers/e34a_two_layer.txt`), one session, the runtime sort before and after:
+
+| Two layers | T=256 | T=512 |
+|---|---:|---:|
+| Runtime sort (16×T + 16×T/8) | 10.060 / 10.279 ms | 18.659 / 18.526 ms |
+| 3 tiers | 9.770 ms (−3.9%) | 15.973 ms (−14.1%) |
+| 4 tiers | 10.164 ms (0%) | 16.987 ms (−8.6%) |
+
+Accuracy identical to the runtime sort.
+
+**Why three tiers and not more** (instrumented two-layer profiles at T=512, `full_model/kvtest/prof_e34_512_tier{3,4}`,
+`prof_t512_2_dyncard_ssg1024`). The compiler runs the stages one after another in its own order (the cold tier first),
+and a stage with L lanes per card runs one lane per core on L cores. GEMM windows per stage, in execution order:
+
+| Program | Stages |
+|---|---|
+| Runtime sort | 16×512: 2.18–2.20 ms on 64 cores; 16×64: 1.03–1.31 ms |
+| 3 tiers | 16×64: 0.59–0.61 ms; 8×512: 0.79–0.97 ms on 32 cores; 8×128: 0.65–0.72 ms on 32 cores |
+| 4 tiers | 16×64: 0.56–0.63 ms; 8×128: 0.62–0.75 ms; 4×512: 0.56–0.58 ms on 16–18 cores; 4×240: 0.43–0.46 ms |
+
+With eight lanes per card at 512 rows the top tier takes 0.8–1.0 ms against 2.2 ms for sixteen, although each core does
+the same work: at T=512 the hot stage is bound by the card's shared memory traffic, not by per-core compute, and the
+tiers cut that traffic. Each extra stage adds its own sequential window while most cores wait, so a fourth tier loses
+more than its rows save.
+
+**Full model** (`scripts/run_e34b.sh`, `run_e34c.sh`, `tiers/e34b_full_T512.txt`, `tiers/e34c_full_T256.txt`), 48 layers,
+KV retained, one session per chunk length, the runtime sort before and after:
+
+| | Runtime sort | 3 tiers | Change | Tokens/s | Largest lane count per tier |
+|---|---:|---:|---:|---:|---|
+| T=512 (8×512, 8×128, 16×64; 1024 KiB tiles) | 425.3 / 427.2 ms | **361.7 ms** | **−15.1%** | 1416 | 508 / 79 / 37 |
+| T=256 (8×256, 8×64, 16×32; 512 KiB tiles) | 217.3 / 218.4 ms | 210.0 ms | −3.6% | 1219 | 250 / 36 / 17 |
+
+The logits are bit-identical to the runtime sort at both lengths (the same experts compute the same tokens; only the
+padding changes), no lane exceeded its capacity, and memory stays at 22.5 GiB per card. Against the production baseline
+(1048.4 ms at 512 tokens, 505.6 ms at 256) the 512-token model is now 2.90× and the 256-token model 2.41×. At 256 tokens
+the extra stage's fixed window eats most of the saving. The next lever is the half of each card's cores that waits during
+the eight-lane tiers (splitting each top expert over two lanes of that tier). The four 48-layer programs were deleted
+after timing (88 GB each).
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -2013,6 +2111,9 @@ The next step is the 48-layer tileadd programs at 256 and 512 tokens against the
   combine were not built; the time estimates rest on the 3.16 hot-stage measurements. E31 measures two-layer cuts only.
 - The "four cards" are four SoCs on one AI 100 Ultra board with a shared 150 W cap (E31); per-SoC clocks dip under
   load, so absolute timings carry run-to-run variation and only same-session back-to-back comparisons are used.
+- E34's tier capacities rest on the calibration chunks of E28/E29 with 1.28× headroom; a prompt that exceeds a tier's
+  capacity would drop assignments. The stage order and the cores per stage are the compiler's choice. Tiers were not
+  tried at T=128, where the hot stage sits at its floor. E32 is one instrumented sample of one prompt.
 
 ## 5. Reproduction
 
@@ -2087,3 +2188,11 @@ is saved to `realcase/coact_placement_T128.npy`), `scripts/balance_placement.py 
 placements), `scripts/run_e30a.sh` (instrumented two-layer T=512 profile). E31: `scripts/build_full_dyncard.py ... --final
 addtree|tileadd`, `scripts/run_e31.sh` (compiles, same-session two-layer timing, profiles under two device orders),
 `scripts/e31_cards.py <analysis dir> <label>` (per-card hot stage, final sum and P2P from a profile).
+E32: `scripts/run_e32.sh` (instrumented 48-layer compile, profile, `detail_analyze.py`, `layer_timeline.py`),
+`scripts/e32_breakdown.py <analysis dir> <label>` (busy core-time by op family, per-layer phases from explicit markers,
+cross-card bytes, per-SoC hot stage); E33: `scripts/headpar_graph.py <src> <out> --osum addtree|tileadd [--T]`,
+`scripts/run_e33.sh`. E34: `scripts/balance_placement.py` (also saves the spread placement), `scripts/tier_budget.py
+<mdts_flag dir>` (tier designs from the calibration chunks), `scripts/build_full_tiered.py <stack dir> <out> --T <T>
+--tiers <lanes>x<capacity>,... [--final ...] [--placement <npy>]`, then `headpar_graph.py` and `truncate_layers.py`;
+drivers `scripts/run_e34a.sh` (two-layer timing and the 4-tier profile), `run_e34b.sh` (48 layers at T=512 and the 3-tier
+profile), `run_e34c.sh` (48 layers at T=256). The 3-tier 48-layer programs compile in 18–20 minutes.
