@@ -36,7 +36,44 @@ E16 (fp16 partials, smaller index build, a reduce-scatter expression) gain nothi
 the reduce-scatter collapses onto card 0 with a DDR spill under this compiler. Finally, the KV-cache pairing the flag
 broke is restored by a head-parallel attention block (E17): the full model keeps its
 KV cache on device and prefills in 148.1 ms against the 499.0 ms production baseline
-measured in the same session, 3.37×, with retained state.
+measured in the same session, 3.37×, with retained state. Splitting the hottest
+experts across several lanes with a smaller capacity (E18) halves the hot stage at
+T=512, −16% on the layer (row-chunking the GEMMs instead costs 25–66%), and leaves the
+card-0 cross-card root as the largest item. Kept deployable, with all 128 experts and the
+cold stage widened to 76 lanes (E19), the split keeps −10% at both T=256 and T=512; the
+rest of the oracle gain is lost to the compiler's core mapping of a 19-lane batch (20- or
+32-lane stages collapse onto 4 cores per card). On real routing from 74 prompts (E20) a
+calibrated static plan loses 3–4% and drops 0.1% of assignments to outliers; the compiler
+has no data-dependent control flow, but weights selected by a runtime index cost nothing,
+so one graph per chunk size sorts the experts by count at run time and serves every prompt
+without drops, at +4/+18/+8% today, a scheduling cost with a known fix. Across MMLU,
+SWE-bench Lite and HumanEval (E21) the hot experts change (cross-domain overlap 0.4–0.6,
+a GSM8K-calibrated plan covers only half of a coding prompt's tokens) but the sorted
+count statistics do not, and the one dynamic graph served all 200 prompts of the four
+workloads without a drop. Built as a per-card sort with native-order routing chains (E22), the
+dynamic split runs at parity with the static oracle at T=128 and 4–6% behind at 256/512; the
+banks stay replicated on every card because the compiler keeps only a single-constant `Gather`
+fast. One partition per card (E23) stores each bank once and keeps MXFP6, but the runtime
+executes partitions in sequence, so a single inference gets slower and only pipelined
+throughput gains. Across eight workloads and all 48 layers (E24) the hottest experts are
+workload-specific, so a fixed layout's safe capacities converge on the chunk length. On the
+full model (E26) the token-owned combine gives the best program, 131.9 ms against 496.6 ms for
+the production baseline (3.77×); the runtime sort is 5% slower at 128-token chunks, where
+capacity does not matter, and saves 20–31% per layer against naive T/T at 256–512 tokens.
+Compiled with 512 KiB tiles (E27), which help only gathered weights, the runtime sort becomes
+the fastest full-model program at 128-token chunks too: 128.7 ms, 3.85× the production baseline.
+At 256-token chunks (E28, held-out prompt) the runtime sort prefills in 217.0 ms against 258.3 ms
+for naive T/T (−16%) and 505.6 ms for the production baseline (2.33×), 1180 tokens/s against 991
+and 506, with no capacity overflow. At 512 (E29) it needs 1024 KiB tiles and takes 427.2 ms
+against 495.8 ms for naive T/T (−14%) and 1048.4 ms for production (2.45×), 1198 tokens/s:
+with the hot stage kept at T, which some layer always fills, the advantage levels off at
+14–16%, below the replay's 20/31% at hot capacities calibrated on layer 2 without margin.
+Offline (E30), a run-time lane split with a small third stage would need 32–46% of today's padded rows; placing
+experts that fire together on one card halves the cards a token touches but doubles the cold capacity and saves
+little, since the full model already reduces the MoE partial sums with a reduce-scatter over the four cards (3% of
+the model at 512 tokens), while spreading those experts balances the cards. In the full model the elementwise final
+sum stays distributed and saves 2.4% on two layers at T=512 (E31); the slower hot stages of two SoCs follow the
+physical SoC, which throttles under the shared 150 W cap of the AI 100 Ultra board, not the graph.
 
 ## 1. What the flag does
 
@@ -1024,6 +1061,905 @@ each), `run_native_hp_flag`, `run_anchor3_native_noflag`, `run_stack_hp_flag`,
 `scripts/headpar_graph.py`, `scripts/trunc_io.py`, `scripts/spans.py`,
 `scripts/placement.py`, drivers `scripts/run_kv1.sh` … `run_kv7.sh`.
 
+## 3.16 Exact-shape hot stage: lane-split experts against row-chunked GEMMs (E18)
+
+The token-owned profiles (3.13, 3.14) left the hot stage above the weight floor at
+T ≥ 256, and the per-core engine times say why: the HMX time of the 16 hot experts
+per card is 44 / 310 / 921 µs per core (median) at capacity 92 / 158 / 296, a 21×
+increase for 3.2× the padded rows, while the 36 `blockdequantize_mxfp6` tiles per
+core are the same count and bytes at every T (one per 64-column weight tile, not per
+row) and the weight DMA is constant. The padded rows are paid on the HMX, and
+super-linearly. Two ways of shrinking them were built on the T=256 and T=512
+token-owned replays and timed against their anchors in one session (MXFP6, flag,
+uninstrumented, 3 alternating rounds × 100; 2026-09-24):
+
+- **Row-chunked GEMMs** (`scripts/make_rowchunk.py <src> <out> <k>`): the hot
+  gate/up/SiLU/down chain runs k times on consecutive row chunks of the gathered
+  `[64, C, 2048]` activation, outputs concatenated; no routing or weight change.
+- **Lane-split experts** (`scripts/make_split.py <T> <counts.npy> <out> <C_hot>`): a
+  hot lane is (expert, chunk of C_hot rows). Experts with more than C_hot tokens take
+  ⌈count / C_hot⌉ lanes, each a duplicate of the expert's bank holding a consecutive
+  chunk of its tokens; the smallest hot experts move to the cold stage until the 64
+  hot lanes suffice, empty cold experts are dropped to make room, and the cold
+  capacity rises to the largest demoted count. The graph is unchanged: the split
+  expert's routing column is presented once per lane, masked to that lane's chunk
+  ("virtual lanes"), so mask, scans, slots and the token-owned combine see 64
+  ordinary lanes with at most C_hot tokens each. Weight DMA per stage is unchanged
+  (64 lanes stream one bank each, as before).
+
+| Variant (token-owned, MXFP6, flag) | C hot / cold | Hot experts (split → extra lanes, demoted) | Padded rows / real | Host median, ms | vs anchor | µs per token |
+|---|---:|---|---:|---:|---:|---:|
+| T=256 anchor (hc 158/4) | 158 / 4 | 64 | 5.0× | 3.224 | | 12.6 |
+| T=256 split | 84 / 4 | 61 (3 → 3, 3 demoted) | 2.75× | 3.015 | −6.5% | 11.8 |
+| **T=256 split** | **58 / 8** | 57 (5 → 7, 7 demoted) | 2.06× | **2.991** | **−7.2%** | 11.7 |
+| T=512 anchor (hc 296/32) | 296 / 32 | 64 | 5.0× | 5.656 | | 11.0 |
+| T=512 row-chunked, k = 2 | 296 / 32 | 64 | 5.0× | 7.050 | +24.7% | 13.8 |
+| T=512 row-chunked, k = 4 | 296 / 32 | 64 | 5.0× | 9.387 | +66.0% | 18.3 |
+| T=512 split | 148 / 8 | 60 (4 → 4, 4 demoted) | 2.44× | 5.147 | −9.0% | 10.1 |
+| T=512 split | 104 / 16 | 52 (9 → 12, 12 demoted) | 1.88× | 4.855 | −14.2% | 9.5 |
+| **T=512 split** | **88 / 20** | 48 (11 → 16, 16 demoted) | 1.69× | **4.738** | **−16.2%** | **9.3** |
+
+Outputs of every variant agree with the anchor's to 1e-4–6e-4 relative L2 (the
+split changes which lane accumulates a row, nothing else); routing counts are exact.
+
+- **Row chunking is counterproductive**: 2 chunks cost 25%, 4 chunks 66%. The
+  compiler does not pipeline the chunks; each one re-streams and re-dequantizes the
+  expert's weights, so the weight side is multiplied by k while the HMX work is
+  unchanged. Padded rows have to be removed, not re-tiled.
+- **Lane splitting halves the hot stage.** In the T=512 profile (`-stats-level=70`,
+  `exact_shape/`), the hot stage goes from 1.56–1.97 ms per card (98–123 µs per
+  expert) to 0.81–0.99 ms (51–62 µs per expert) at C_hot = 104; the per-core HMX
+  time falls from 1020 µs (median, max 1673) to 260 µs (max 447) while dequantize
+  (654 → 611 µs) and weight DMA (357 → 441 µs) stay where they were. The stage is now
+  bounded by dequantize and DMA, not by the padded GEMM: the same 36 dequantize
+  tiles per core that take 143 µs at T=128 take 611 µs here, so the next hot-stage
+  lever is on the compiler's side of the MXFP6 path, not in the graph. The cold
+  stage grows 0.1 ms (14–15 active experts per card instead of 11–12, at the floor).
+- **Splitting shifts the balance the same way hot/cold did**: the demoted experts are
+  the ones with 8–20 tokens, exactly the population that the hot capacity padded
+  10–30×. With C_hot = 88 the padded rows are 1.69× the real rows against 5.0× in
+  the anchor; the returns flatten below C_hot ≈ 100 because the stage is at its
+  floor. At T=256 the whole gain is 0.2 ms because the hot stage was only 0.1–0.25 ms
+  above the floor to begin with.
+- **What is left at T=512** (split 104, device 3.38 ms): the card-0 cross-card root
+  1.37 ms (40%), the hot stage 0.85 (25%), the cold stage 0.55 (16%), the index-build
+  gap 0.36–0.53 (13%), prologue 0.1. The root and the gap are the T-scaled items of
+  3.14, unchanged by this round, and the root is now the single largest item.
+
+![T=512 anchor](exact_shape/T512_anchor_cores.png)
+![T=512 split 104](exact_shape/T512_split104_cores.png)
+
+For a static plan the split is a routing-table change only (which lane a token's
+slot falls in), and in a dynamic setting it is the natural continuation of the
+capacity policy: capacities are chosen per lane and the hottest experts are given
+several lanes rather than one deep one.
+
+Artifacts: `exact_shape/e18_timing_stats0.json`, `e18_spec.json`, `plans/*.json`
+(lane orders, chunks, demotions), `T512_{anchor,split104}_mxfp6_profile/`,
+`T512_{anchor,split104}_cores.png`; `scripts/make_split.py`, `scripts/make_rowchunk.py`,
+`scripts/e18_hot.py`, `scripts/run_e18.sh` (build, compile, time, profile).
+
+## 3.17 Lane splitting with all 128 experts kept: the widened cold stage (E19)
+
+E18 paid for its extra chunk lanes by dropping cold experts that happened to be empty
+for the prompt. A deployed graph cannot do that: 128 experts plus k chunks need
+128 + k lanes, and a stage's lane count is what the compiler partitions over the
+16 cores of a card. This round keeps every expert and widens the cold stage to
+64 + k lanes (`scripts/make_split_wide.py <T> <counts.npy> <out> <C_hot> [C_cold_min]
+[cold lanes]`, then `make_tokencombine.py ... tokenowned` and
+`scripts/patch_wide_to.py <dir> <cold lanes>`, which generalizes the token-owned index
+arithmetic to L1/4 lanes per card). Stage 1 of the graph is re-batched from 64 to L1
+lanes: routes sliced instead of reshaped `[2, 64, T]`, scan-chain zeros `[L1, s]`,
+banks `[L1, ...]`, counts output `[64 + L1]`. Same protocol as E18, 2026-09-25:
+
+| T=512 variant (token-owned, MXFP6, flag) | Cold lanes (per card) | Host median, ms | vs anchor |
+|---|---:|---:|---:|
+| anchor (hc 296/32) | 64 (16) | 5.727 | |
+| oracle split C_hot 104, empties dropped (E18) | 64 (16) | 4.856 | −15.2% |
+| oracle split C_hot 88, empties dropped (E18) | 64 (16) | 4.781 | −16.5% |
+| **all experts, split 104, cold widened** | **76 (19)** | **5.172** | **−9.7%** |
+| all experts, split 88, cold widened | 80 (20) | 8.238 | +43.8% |
+| all experts, split 104, cold widened to two lanes per core | 128 (32) | 9.265 | +62% |
+| all experts, split 88, two lanes per core | 128 (32) | 9.025 | +58% |
+| the 80- and 128-lane graphs with `-ols=2` / `-ols=4` | | 8.50 / 8.34 / 9.49 | no change |
+
+| T=256 variant | Cold lanes (per card) | Host median, ms | vs anchor |
+|---|---:|---:|---:|
+| anchor (hc 158/4) | 64 (16) | 3.326 | |
+| oracle split C_hot 58, empties dropped (E18) | 64 (16) | 2.990 | −10.1% |
+| all experts, split 84, cold widened | 68 (17) | 3.212 | −3.4% |
+| **all experts, split 58, cold widened** | **72 (18)** | **3.013** | **−9.4%** |
+
+Outputs match the E18 splits exactly (same relative L2 against the anchor,
+6.5e-4 / 3.9e-4), routing counts exact for all 140–192 lanes.
+
+What the profiles show (`exact_shape/T512_wide*_mxfp6_profile/`, `T256_wide58_*`):
+
+- **The compiler maps a stage onto cores by its batch size, and only 16 lanes per
+  card gives one lane per core.** With 19 lanes per card it splits the batched
+  GEMMs by tiles unevenly over all 16 cores (3 to 36 HMX events per core) and the
+  cold stage takes 0.75–0.79 ms instead of 0.55; it also reorders the stages, cold
+  first, so the token-owned index build now overlaps the hot stage's weight stream
+  (hot-stage DMA 539 µs per core against 441). With 20 or 32 lanes per card it
+  packs the whole cold stage onto 4 cores per card, 5 or 8 lanes each, 29–33 MiB of
+  weights per core at the ~9 GB/s a single core's DMA reaches: 3.7–4.3 ms for a
+  stage that takes 0.5 ms on 16 cores. `-ols` does not change this. At T=256 the
+  18-lane stage lands on 12 cores (0.50–0.54 ms against 0.34) but the hot-stage
+  saving still carries the variant to −9.4%.
+- **The mapping cannot be steered by flags, but it is regular below 16 lanes per
+  card.** `-mos=2` and `-mos=4` leave the 80-lane stage on 4 cores (8.18–8.19 ms);
+  raising the cold capacity to 64 rows moves it to 5 cores (7.73 ms). Probes with
+  16 and 8 cold lanes in total, i.e. 4 and 2 per card (`scripts/make_probe_wide.py`,
+  not a valid layout, mapping test only), are split perfectly: each lane's GEMMs are
+  divided over 16/lanes cores by column tiles, 9 or 3 HMX events and 0.9 or 0.4 MiB of
+  weights on every core, and the stage runs at the card's DMA floor (0.16 / 0.09 ms).
+  So the partitioner is balanced whenever the lanes per card divide 16 (1, 2, 4, 8, 16),
+  degrades for 17–19 and packs from 20 on; the lane counts a plan generator may use
+  are those divisors, one stage each.
+- **Inactive lanes are not free in the one-lane-per-core mapping.** The anchor's cold
+  stage streams 3.5 MiB on every core although only 11–12 of 16 lanes per card are
+  active, so a third 64-lane stage for the demoted experts would cost a full bank
+  round (~0.57 ms per card), which cancels most of the T=512 gain and all of the
+  T=256 gain; the 16-lane alternative (4 per card) would meet the same packing
+  heuristic as the 20- and 32-lane stages.
+
+So the deployable form of lane splitting under this compiler is the 76-lane cold
+stage: −9.7% at T=512 and −9.4% at T=256 with all 128 experts present, against
+−15/−16% and −10% for the oracle layout. The difference is the compiler's core
+assignment for a 19-lane batch and its stage reordering, not the split itself. Given
+the probe result, the way to recover it is a third stage of 16 lanes (4 per card) for
+the demoted experts: mapped evenly by construction, at its DMA floor of about 0.15 ms
+per card, plus the stage's own gathers and combine term; expected to land within
+0.1–0.2 ms of the oracle layout at T=512. Not built yet.
+
+Artifacts: `exact_shape/e19*_timing_stats0.json`, `spec19*.json`, `plans/T*_wide*_to.json`,
+profiles above; `scripts/make_split_wide.py`, `scripts/patch_wide_to.py`,
+`scripts/profile_case2.sh` (IO sizes from the files), drivers `scripts/run_e19.sh`
+(compile, time, profile), `run_e19b.sh` (profiles of the 76/80-lane variants),
+`run_e19c.sh` (128-lane variants), `run_e19d.sh` (`-ols` and the T=256 profile), `run_e19e.sh` (`-mos`, cold capacity 64),
+`run_e19f.sh` (16- and 8-lane mapping probes). E20: see the artifact list at the end of 3.18; the routing data under `realcase/routing/`
+is local (gitignored) and regenerates in about eight minutes with `scripts/collect_routing_fp32.py <out dir> <threads>`. E21:
+`scripts/download.py <data dir>` (MMLU, SWE-bench Lite via `datasets`), `scripts/make_prompts.py <data dir> <out dir>`,
+`scripts/collect_routing_generic.py <out dir> <threads> <prompts.npz>` (driver `scripts/run_e21.sh`),
+`scripts/analyze_workloads.py <layer|-1> <T> name=dir ...`, `scripts/run_e21b.sh` (the 200-prompt sweep). E22:
+`scripts/make_dyncard4.py <src dir> <out dir> <C_hot> <C_cold>` (the kept variant; `make_dyncard.py`, `make_dyncard2.py`,
+`make_dyncard3.py` are the three residency attempts), then `make_tokencombine.py … tokenowned`; drivers `scripts/run_e22.sh`
+… `run_e22f.sh` (timing, DRAM per card, profiles, sweeps at T=128/256/512), `run_e22g.sh` (sweeps of the tight
+T=256/512 QPCs). E23: see the artifact list at the end of 3.21. E24: `scripts/download_more.py <data dir>`,
+`scripts/make_prompts_text.py <jsonl> <name> <out dir> <n> [T]`, collection with `scripts/collect_routing_generic.py` (driver
+`scripts/run_e24.sh`), `scripts/calib_study.py <T> <out dir> name=dir ...`. E25: `scripts/make_cap_native.py` (make_cap.py with a
+`native` placement), `scripts/run_e25.sh`. E26: `scripts/build_full_dyncard.py <src dir> <out dir> --mode naive|dyncard
+[--C_cold 16]` on a `build_full_stack.py --rewrites 1` output, then `scripts/headpar_graph.py`; drivers `scripts/run_e26a.sh`
+(two-layer check) and `scripts/run_e26b.sh` (compiles and the four-program session). E27: `build_full_dyncard.py --mode
+sortfirst`; drivers `scripts/run_e27.sh` (sort-first and producer-DMA pairs), `run_e27b.sh` (tile-size sweep), `run_e27c.sh` (the
+48-layer session with `-size-split-granularity=512` for the runtime sort only).
+
+## 3.18 The real case on one layer: what can be decided at run time, and what it costs (E20)
+
+Everything up to here used one prompt's routing, scaled synthetically for T > 128, and
+plans built from it (oracle). This round asks what a deployed graph can do with routing
+it only sees at run time, on layer 2, with real routing: 74 chat prompts built from
+GSM8K questions (10 natural ones that reach 128 tokens, 40 concatenations to 128 tokens,
+16 to 256, 8 to 512) run through the FP32 layer stack on the CPU
+(`scripts/collect_routing_fp32.py`; `realcase/routing/*.npz` hold every layer's top-8
+indices and weights and the layer-2 MoE input). 2026-09-25.
+
+**What the routing looks like (layer 2, `scripts/analyze_routing.py`,
+`realcase/analysis_layer2_T*.txt`):**
+
+| | T=128 (50 prompts) | T=256 (16) | T=512 (8) |
+|---|---:|---:|---:|
+| active experts per prompt | 80–99 | 91–100 | 102–105 |
+| experts empty in every prompt | 11 | 16 | 17 |
+| top-64 set, pairwise Jaccard (median / min) | 0.75 / 0.62 | 0.78 / 0.68 | 0.86 / 0.78 |
+| calibrated hot set (leave-one-out): share of assignments it covers | 92.9% (min 81%) | 94.1% | 94.3% |
+| largest count per prompt (median, range) | 70 (49–92) | 140 (117–151) | 263 (246–280) |
+| 65th-largest count per prompt (median, max) | 3, 79 | 6, 25 | 12, 50 |
+| static plan (hot set + capacities = max over the other prompts): drops | 1 of 50 prompts, 48 assignments | 1 of 16, 4 | 2 of 8, 37 |
+| static plan padded rows vs the per-prompt oracle | 10.7× vs 4.5× | 5.5× vs 4.6× | 4.8× vs 4.3× |
+| model time of the static plan vs oracle (expert stages) | at the floor | +3% | +4% |
+
+The hot set is stable enough to calibrate (58 of a prompt's own top-64 are in the
+calibrated set), and a static plan loses only 3–4% of expert-stage time in the model at
+T ≥ 256 and nothing at T = 128. What a static plan cannot absorb is the outlier: one
+prompt in 50 gives 79 tokens to an expert that is cold everywhere else, so the cold
+capacity must be 79 or that prompt drops 48 assignments. With a fixed lane order the
+choice is headroom (free below about 120 rows, since the cold stage is DMA-bound) or
+a 0.1% drop rate.
+
+**Which mechanisms the compiler offers.** Three probes:
+
+- **Control flow: none.** A data-dependent `If` is rejected at compile time
+  (`If: Non-constant condition tensor not supported`, `realcase/ifprobe_compile.log`).
+  Empty experts are counted in the graph but cannot be skipped; every lane streams its
+  bank.
+- **Weights selected by a runtime index: free.** The hot stage of the T=128 replay with
+  its three banks replaced by `Gather(bank[128, …], idx[64])`, the index arriving with
+  the input (`scripts/make_dyngather.py`), runs in 2.796 ms against 2.796 for the static
+  MXFP6 anchor, bit-identical output. The compiler lowers the gather to an indirect
+  weight DMA that reads the MXFP6 bytes (dequantize kernels present, 3.5 MiB per lane,
+  `realcase/profiles/T128_dyngather_mxfp6_profile/`). The price is memory: the QPC grows
+  from 453 MB to 2.0 GB (an fp16 copy of the bank is kept in the file), and on the device
+  every card must hold all 128 banks, 814 MiB in use per card against 446 for the static
+  program, about +0.37 GiB per layer per card.
+- **Dynamic hot/cold split: works, one QPC per T for every prompt.**
+  `scripts/make_dynsplit.py` counts each expert's tokens in the graph, sorts the 128
+  experts by count (`TopK`), gathers the 64 largest into the hot stage and the rest into
+  the cold stage, permutes the routing columns by the same order, and keeps static
+  capacities calibrated on the sorted order statistics (96/16, 160/32, 288/56 for
+  T=128/256/512). All 74 prompts run through the three QPCs with exact sorted counts, no
+  dropped assignment, and a per-token error against the FP32 reference of 3.2% median,
+  4.8% worst, the MXFP6 level (`realcase/e20_sweep*.txt`).
+
+| Same session, token-owned combine, MXFP6, flag | static oracle anchor | dynamic split | |
+|---|---:|---:|---:|
+| T=128 (prompt 41) | 2.598 ms | 2.712 ms | +4% |
+| T=256 | 3.290 ms | 3.868 ms | +18% |
+| T=512 | 5.675 ms | 6.134 ms | +8% |
+
+The overhead is scheduling, not arithmetic: in the T=256 profile
+(`realcase/profiles/T256_dynsplit_mxfp6_profile/`) the sort itself is done at 0.04 ms,
+but everything that used to run in the prologue now waits for it: the routing
+permutation (0.04–0.09 ms), then the scan chains, token gathers and the bank gathers,
+which start at 0.15 ms instead of 0. The scan chains end up interleaved with the hot
+GEMMs (0.12–1.76 ms instead of the prologue), the hot stage spans 1.24 ms instead of
+0.85, and the cold stage starts at 1.70. The fix is structural and not built yet: compute
+masks, scans and slot tables in native expert order, independent of the sort, and permute
+only the resulting `[128, T]` tables and the banks, so that nothing but the bank gathers
+depends on the `TopK`.
+
+**What this buys in the real case.**
+
+- *Empty experts:* identifiable, not skippable. With the dynamic sort they sit at the
+  bottom of the order, so a 64 + 32 + 16 lane layout (all divisors of 16 per card) would
+  compute every expert that was active in any of the 74 prompts (at most 105) and leave
+  16 banks per layer unstreamed, about 0.14 ms per card; a prompt with more than 112
+  active experts would lose tokens.
+- *Hot/cold split:* dynamic at the cost above; it removes the outlier problem entirely,
+  so capacities can follow the order statistics: the largest count varies 49–92 across
+  prompts at T=128 and the 65th-largest 2–12, against a static cold capacity of 79.
+- *Padding size:* static per stage, but calibrated on sorted counts it carries little
+  headroom, about 20–30 rows on the hot stage, 0.1 ms at T ≥ 256, and none on the cold
+  stage below ~120 rows. Per-prompt capacity selection would need one program per
+  capacity and host-side switching per layer; nothing measured suggests it is worth it.
+- *Lane splitting* (3.16, 3.17) composes with the dynamic order: the chunk masks are
+  the same running-count arithmetic, applied to the sorted lanes.
+
+Artifacts: `realcase/routing/`, `realcase/analysis_layer2_T*.txt`, `realcase/collect.log`,
+`realcase/e20b_dyngather_timing.json`, `realcase/e20c_dynsplit_timing.json`,
+`realcase/e20_sweep{128,256,512}.{json,txt}`, `realcase/profiles/`,
+`realcase/ifprobe_compile.log`; `scripts/collect_routing_fp32.py`,
+`scripts/analyze_routing.py <routing dir> <layer> <T>`, `scripts/make_ifprobe.py`,
+`scripts/make_dyngather.py <src> <out>`, `scripts/make_dynsplit.py <src> <out> <C_hot>
+<C_cold>` (then `make_tokencombine.py … tokenowned`), `scripts/make_inputs_dyn.py
+<routing dir> <out> <T>` with `scripts/ref_moe_l2.py`, drivers `scripts/run_e20a.sh`
+(If probe), `run_e20b.sh` (gather probe), `run_e20c.sh` (dynamic split: compile, timing,
+sweeps), `run_e20d.sh` (profile).
+
+## 3.19 Other workloads: how the expert pattern changes (E21)
+
+Same collection as E20 for three more workloads, 50 prompts of 128 tokens and 4 of
+512 tokens each: MMLU (consecutive test questions with their four choices, shuffled
+across subjects), SWE-bench Lite (issue statements) and HumanEval (function stubs),
+against the GSM8K set of E20 (`scripts/download.py`, `scripts/make_prompts.py`,
+`scripts/collect_routing_generic.py`, `scripts/analyze_workloads.py`;
+`realcase/routing_{mmlu,swe,humaneval}/`, `realcase/workloads_*.txt`). 2026-09-25.
+
+**Identities move, shapes do not.** Layer 2, T=128, 50 prompts per workload:
+
+| | GSM8K | MMLU | SWE-bench Lite | HumanEval |
+|---|---:|---:|---:|---:|
+| active experts per prompt (median, range) | 90, 80–99 | 92, 75–104 | 97, 91–106 | 97, 87–103 |
+| never used in the workload | 11 | 5 | 2 | 7 |
+| largest count per prompt (median, max) | 70, 92 | 59, 111 | 70, 101 | 66, 96 |
+| 65th-largest count (median, max) | 3, 4 | 4, 6 | 4, 7 | 5, 6 |
+
+Calibrated hot sets (top-64 by mean count) overlap with Jaccard 0.75 between GSM8K and
+MMLU, but only 0.38–0.56 between either of them and the two coding workloads; roughly
+40 of the 64 hot experts are shared across domains, and only 2 experts are unused by
+all four workloads. A plan calibrated on one workload and applied to another:
+
+| calibration → evaluation | share of assignments in the hot set | prompts that drop | dropped assignments | cold capacity a drop-free static plan would need |
+|---|---:|---:|---:|---:|
+| GSM8K → GSM8K | 93% | 0 of 50 | 0 | 79 |
+| GSM8K → MMLU | 77% | 5 of 50 | 0.23% | 111 |
+| GSM8K → SWE-bench | 52% | 12 of 50 | 0.19% | 101 |
+| GSM8K → HumanEval | 50% | 13 of 50 | 0.26% | 96 |
+| HumanEval → MMLU | 55% | 17 of 50 | 0.71% | 111 |
+
+Across domains half of the tokens land in the "cold" stage, whose capacity would have
+to equal the hot one; the static hot/cold layout does not transfer. The per-layer
+profile (`realcase/workloads_perlayer_T128.txt`) shows the same at every depth,
+cross-domain Jaccard 0.3–0.5 from layer 0 to 40 and a modest convergence in the last
+seven layers (0.5–0.78, 26–33 universally hot experts). At T=512 the picture is the same
+(`realcase/workloads_layer2_T512.txt`).
+
+What does transfer is the shape of the sorted count vector: the largest count
+59–70 median and at most 111, the 65th-largest 3–5 and at most 7, 75–106 active
+experts. These are what the dynamic split (3.18) keys its capacities on.
+
+**One graph, four workloads.** The T=128 dynamic-split QPC recompiled with capacities
+128/16 (`scripts/run_e21b.sh`) served all 200 prompts: exact sorted counts on every
+prompt, no dropped assignment, per-token error against the FP32 reference 3.0–3.2%
+median and 5.0% worst (the MXFP6 level), latency 2.81–2.84 ms median per workload,
+input-independent (`realcase/e21_sweep_summary.txt`, `e21_sweep_all_workloads.txt`).
+
+So for deployment the choice is between a static layout calibrated per workload, which
+drops 0.2–0.7% of assignments the moment the workload changes, and the dynamic split,
+which is workload-agnostic at the cost measured in 3.18 (+4% at T=128 today, a
+scheduling cost with a known fix) and the per-card residency of all 128 banks. Skipping
+empty experts is off the table either way: the never-used sets are workload-specific.
+
+## 3.20 Per-card dynamic split, built (E22)
+
+Goal: the dynamic hot/cold split of 3.18 with each card sorting only its own 32
+experts, so that a card would only need its own banks resident, plus the fix for the
+scheduling cost: the mask / prefix-scan / slot-table chain computed once over all 128
+experts in native order, with only the row permutations and the bank gathers depending
+on the sort (`scripts/make_dyncard*.py`; the chain is cloned from the stage-0 chain of
+the E7/E8 anchor graphs, drivers `scripts/run_e22*.sh`). 2026-09-25.
+
+**Residency cannot be expressed.** Three ways to give each card its own bank constant,
+all correct (exact counts, outputs within the MXFP6 or fp16 error of the reference),
+none acceptable; the fourth row is the formulation that was kept:
+
+| Bank formulation (T=128, per-card sort, native chains) | Weights kept | Host median | DRAM per card |
+|---|---|---:|---:|
+| four per-card constants, per-card `Gather`, `Concat` into one `[64, …]` weight | fp16: MXFP6 not applied behind the `Concat` (output error 7.5e-4, the fp16 level) | 6.09 ms | not measured |
+| one `[4, 32, …]` constant, batch-wise `CtxGather3D` with a `[4, 16]` index | fp16 (output error 7.5e-4) | 9.50 ms | not measured |
+| four per-card constants, four 16-lane MatMuls per stage, outputs concatenated | MXFP6 | 8.15 ms | 1278 MiB |
+| **one `[128, …]` constant, one `Gather` per matrix with the card-major lane order** | **MXFP6, indirect DMA** | **2.59 ms** | **759 MiB** |
+
+The third row is the telling one: the partitioner spread each of the four 16-lane
+MatMuls over all four cards (192 HMX events per card for every one of them, 35 ms of
+core time in bank gathers), so a per-card constant ends up on every card anyway. The
+only formulation the compiler keeps fast is a single `Gather` on a single constant
+feeding the batched MatMul, and that constant is replicated: 759 MiB in use per card
+against 420 for the static program (816 for the global dynamic split of 3.18), about
++0.33 GiB per layer per card. Per-card residency would need per-node device placement
+inside a tensor-sliced partition, which the partition config used here does not express
+(it assigns node lists to whole partitions); a config with one partition per card gives
+residency but runs the cards one after another (3.21).
+
+**The per-card sort with native-order chains is at parity.** Same session, token-owned
+combine, MXFP6, flag. Capacities are the largest per-card order statistics seen in the
+collected prompts (200 over four workloads at T=128, 16 GSM8K prompts at T=256, 20 over
+four workloads at T=512), rounded up without further margin: hot 128/160/304, cold
+16/16/48:
+
+| T | static oracle anchor | global dynamic split (3.18) | per-card dynamic, native chains | |
+|---:|---:|---:|---:|---:|
+| 128 | 2.632 ms | 2.801 ms (+6%) | 2.590 ms | −2% |
+| 256 | 3.315 ms | 3.957 ms (+19%) | 3.514 ms | +6% |
+| 512 | 5.678 ms | 6.150 ms (+8%) | 5.920 ms | +4% |
+
+Generous capacities cost real time at T ≥ 256 (176/48 and 320/96 instead of 160/16 and
+304/48: 3.73 and 6.55 ms, +6% and +11%), so the capacities must come from the order
+statistics, not from a margin on the static plan. Correctness: all 200 prompts of the
+four workloads through the one T=128 QPC with exact per-card sorted counts and per-token
+errors of 3.0–3.2% median, 5.0% worst (MXFP6 level), latency 2.59–2.61 ms for every
+workload (`realcase/e22_sweep128_dyncard4.txt`); the 16 prompts at T=256 and the 20 at
+T=512 through the tight QPCs likewise, exact counts, 3.0–3.2% median and 5.1% worst,
+3.42 and 5.98 ms median (`realcase/e22_sweep{256,512}_tight.txt`).
+
+These capacities carry no margin beyond the observed maxima. A prompt whose largest
+expert exceeds the hot capacity loses the excess assignments (the largest count at
+T=512 ranges 211–304 across the four workloads), and T=256 was calibrated on GSM8K
+alone. A deployment needs either headroom, which costs time as the generous variants
+show, or the lane splitting of 3.16 to absorb overflow in extra chunk lanes.
+
+The 512-token profile (`realcase/e22_profile_T512_summary.txt`) shows where the
+remaining 4% is: the prologue is 0.4 ms instead of 0.1. The bank gathers depend only on
+the sort, which is done at 0.03 ms, yet they start at 0.18 ms and the first hot GEMM at
+0.28 ms, while the static program starts its weight stream at 0.1 ms; why the gathers
+wait is not established. The stages themselves are about as long as the anchor's.
+
+So the deployable, workload-agnostic layer is: fixed native quarters of experts per
+card, per-card sort at run time, capacities from calibrated order statistics, native
+chains, single-constant gathers. Its price against a static oracle is 0–6% at these
+chunk sizes and 0.33 GiB of DDR per layer per card for the replicated banks.
+
+## 3.21 One partition per card: residency works, the cards serialize (E23)
+
+The one lever left for per-card expert residency (3.20) was a partition config with one
+partition per card. Tested on a probe that isolates the pattern: per card, a gather of
+16 of the card's 32 experts from a per-card constant (the real layer-2 gate bank), a
+batched MatMul over 128 tokens, a sum over the lanes, and a sum over the cards
+(`scripts/make_toy.py`). Configs come from a compiler dump of the graph's internal node
+names, reassigned by card and kept in the dump's order (`scripts/make_pconfig.py`).
+2026-09-25, MXFP6.
+
+How the compiler reads such a config:
+
+- **Partitions are an ordered pipeline.** A node may consume only outputs of its own or
+  an earlier partition; the first attempt, with the cross-card sum in partition 0, was
+  rejected ("Consumer node … appears in partition before producer node"). The sum has to
+  sit in the last partition, and the compiler forwards card 0's partial through cards 1
+  and 2 to reach card 3.
+- **Partitions run one after another within an inference.** The profile of the
+  per-card layout shows card 0 busy 0–1.13 ms, card 1 1.76–3.21, card 2 3.85–5.35, card 3
+  6.01–7.09, about 0.63 ms between consecutive partitions. A variant in which the four
+  cards share no data at all (four separate outputs, `scripts/make_toy_indep.py`) runs at
+  the same times: the order is imposed by the runtime, not by the data. This repeats an
+  earlier team result listed in the top-level README (item 13, partitions in one QPC run
+  strictly in list order, verified with a zero-edge graph); the linked note is not in
+  this checkout.
+
+| Probe, per-card constants | QPC | DRAM in use per card | Device time | One inference in flight | Ten in flight |
+|---|---:|---:|---|---:|---:|
+| one partition over four cards (as in every build so far) | 602 MB | 481–499 MiB | 3.3–3.9 ms, cards concurrent | 230 inf/s | 261 inf/s |
+| one partition per card | 151 MB | 375–432 MiB | 1.1–1.5 ms per card, in sequence, 7.1 ms end to end | 133 inf/s | 655 inf/s |
+
+Both keep MXFP6 (output error 1.42e-2 against the FP32 reference). Under the single
+partition the per-card constants are replicated on every card, 481 MiB, the same as one
+shared constant; this is the mechanism behind 3.20 in isolation: the compiler runs the
+four per-card chains one after another, each spread over all four cards. With one
+partition per card each bank is stored once, 151 MB in the QPC, and card 3 holds 106 MiB
+less, three quarters of the bank; cards 0–2 carry about 50 MiB of extra buffers.
+
+So partitions deliver exactly the residency the dynamic split wanted, and MXFP6 with
+it, but they turn the four cards' expert work into a sequence: for a single inference
+the probe is 1.7× slower end to end, while with four or more inferences in flight the
+pipeline fills and throughput is 2.5× that of the single partition. A linear pipeline
+also allows only one pass over the cards per inference, so a 48-layer model cannot give
+every layer its own per-card expert partitions; the only pipeline-compatible full-model
+layout is layers split across cards, each card holding all experts of its layers, which
+serves many concurrent requests or chunks, not the latency of one chunk. For the
+latency path the single partition with replicated banks of 3.20 stays.
+
+Artifacts: `partition/` (compile, DRAM and timing log; profile timelines of both
+layouts and of the independent variant; throughput table; configs and dumps);
+`scripts/make_toy.py`, `scripts/make_toy_indep.py`, `scripts/make_pconfig.py <model.onnx>
+<dump.json> <out.json> <card regex> [<last-partition regex>]`, `scripts/trace_windows.py
+<trace dir>`, drivers `scripts/run_e23a.sh` (dump, config, compiles, DRAM, timing),
+`run_e23b.sh` (profiles), `run_e23c.sh` (independent variant).
+
+## 3.22 How much the hot-expert pattern moves: eight workloads, all 48 layers (E24)
+
+A fixed expert layout (the only one that keeps each card's weights to a quarter, 3.20,
+3.21) needs its capacities calibrated in advance. This round measures how stable the
+pattern is. 50 chat prompts of 128 tokens per workload, routing of all 48 layers from
+the FP32 CPU stack (collector of 3.18): GSM8K, MMLU, SWE-bench Lite issue statements,
+HumanEval, Alpaca instructions, CNN/DailyMail articles to summarize, Chinese sentence
+pairs from XNLI (the Chinese MMLU set requires running the dataset's own loading code
+and was not used) and the JavaScript version of HumanEval. The first 25 prompts of each
+workload are its calibration half, the last 25 its evaluation half
+(`scripts/calib_study.py`, `realcase/calibration/calib_study_T128.txt`). 2026-09-25.
+
+**Agreement on the 64 most loaded experts** (Jaccard, median over the 48 layers; the
+diagonal compares the two halves of one workload, the sampling floor):
+
+| | GSM8K | MMLU | SWE | HumanEval | Alpaca | News | Chinese | JS |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| GSM8K | *0.91* | 0.63 | 0.42 | 0.44 | 0.62 | 0.62 | 0.51 | 0.45 |
+| MMLU | 0.63 | *0.86* | 0.44 | 0.35 | 0.70 | 0.68 | 0.58 | 0.38 |
+| SWE-bench | 0.42 | 0.44 | *0.87* | 0.48 | 0.45 | 0.48 | 0.35 | 0.51 |
+| HumanEval | 0.44 | 0.35 | 0.48 | *0.83* | 0.42 | 0.31 | 0.29 | 0.86 |
+| Alpaca | 0.62 | 0.70 | 0.45 | 0.42 | *0.86* | 0.67 | 0.56 | 0.44 |
+| News | 0.62 | 0.68 | 0.48 | 0.31 | 0.67 | *0.91* | 0.63 | 0.33 |
+| Chinese | 0.51 | 0.58 | 0.35 | 0.29 | 0.56 | 0.63 | *0.88* | 0.29 |
+| JS | 0.45 | 0.38 | 0.51 | 0.86 | 0.44 | 0.33 | 0.29 | *0.83* |
+
+- **Two clusters.** The natural-language workloads agree with each other at 0.51–0.70;
+  natural language against code at 0.29–0.45; SWE-bench issue text sits in between. The
+  two code sets agree at 0.86, but they share HumanEval's problem statements, so this
+  says little about programming languages in general.
+- **The hottest experts are workload-specific.** For the top 16, the halves of one
+  workload agree at 0.52–0.88 while different workloads agree at 0.00–0.33 (0.68 for
+  the two code sets). Rank correlation of per-expert load ranges from 0.78
+  (MMLU–Alpaca) to −0.24 (HumanEval–Chinese).
+- **A small shared core, a large union.** 14 experts per layer (7–21) are in every
+  workload's top 64 and carry 17–29% of the assignments; 117 of 128 are in some
+  workload's top 64.
+- **Every layer behaves alike.** Median cross-workload Jaccard 0.40–0.53 per layer; the
+  middle layers (7, 15, 19, 27, 31, 40) move most, the first and last layers least.
+
+**What a fixed layout needs.** Hot set = the 64 experts with the highest calibration
+mean count, capacities = the largest count seen in calibration, per layer and stage;
+"prompts with a drop" counts an evaluation prompt if any of its 48 layers overflows.
+
+| Calibration | Capacity hot / cold, median layer | Cold rows needed by evaluation prompts, median layer / worst layer | Evaluation prompts with a drop | Assignments dropped |
+|---|---:|---|---:|---:|
+| 25 prompts of the same workload | 106–117 / 21–61 | 30–77 / 67–121 | 64–92% | 0.04–0.37% |
+| 200 prompts of all eight workloads | 122 / 105 | 53–107 / 95–124 | 12–36% | 0.000–0.022% |
+| 175 prompts of the seven other workloads | 120–122 / 91–106 | 64–110 / 95–125 | 24–100% | 0.001–0.89% |
+| per-card dynamic split, for comparison | | 4–8 / 9–12 | | |
+
+Calibration size, random subsets of the pooled calibration halves, 20 draws each:
+
+| Calibration prompts | 8 | 16 | 32 | 64 | 128 | 200 |
+|---|---:|---:|---:|---:|---:|---:|
+| Evaluation prompts with a drop | 100% | 94% | 70% | 49% | 27% | 21% |
+| Cold capacity, median layer | 38 | 66 | 82 | 93 | 101 | 105 |
+
+So for mixed traffic the conservative capacities of a fixed layout converge on the chunk
+length: with 200 calibration prompts both stages sit at 105–122 of 128 rows and a fifth
+of new prompts still overflow somewhere. The only drop-free fixed layout is both stages
+at capacity T, the naive layout, which cost +10 / +18 / +33% at T = 128 / 256 / 512 in
+E14 (token-centric combine). A fixed layout pays off only for known, homogeneous traffic,
+and then needs more than 25 calibration prompts or explicit headroom, since the tail
+within one workload already reaches 67–121 cold rows in its worst layer. The per-card
+dynamic sort needs at most 12 cold rows in every layer for all eight workloads.
+
+Limits of this study: FP32 CPU routing (the device's MXFP6 routing differs in a few
+assignments per layer, 3.15), 128-token chunks, 50 prompts per workload, capacities
+without margin.
+
+## 3.23 Runtime sort against naive T/T, on one layer and on the full model (E25, E26)
+
+**One layer, one session** (layer-2 replay, MXFP6, flag, token-owned combine unless
+stated; real prompts through naive and runtime-sort programs: GSM8K prompt 41 at T=128,
+the first concatenated GSM8K prompt at 256 and 512; naive = native expert order, both
+stages at capacity T, `scripts/make_cap_native.py`; runtime sort at the capacities of 3.20,
+hot/cold 128/16, 160/16 and 304/48, calibrated on layer 2 without margin; the static oracle runs its own
+synthetic input with capacities sized for it; `runtime_sort/e25_*`):
+
+| T | naive T/T, original dense combine | naive T/T | runtime sort | static oracle |
+|---:|---:|---:|---:|---:|
+| 128 | 2.696 ms | 2.593 ms | **2.462 ms** | 2.607 ms |
+| 256 | 5.524 ms | 4.131 ms | **3.318 ms** | 3.030 ms |
+| 512 | 10.812 ms | 8.212 ms | **5.633 ms** | 5.250 ms |
+
+Against naive T/T with the same combine the runtime sort saves 5 / 20 / 31% at
+T = 128 / 256 / 512, against the original dense naive layer 9 / 40 / 48%, and it stays
+within 7–10% of the static oracle at 256 and 512. All outputs sit at the MXFP6 error
+level against the FP32 reference, counts exact.
+
+**Full model** (`scripts/build_full_dyncard.py <src> <out> --mode naive|dyncard`: the per-card
+sort of 3.20 and the token-owned combine of 3.13 on all 48 layers, applied to the
+retained-state `build_full_stack.py` output, then the head-parallel attention of 3.15;
+nodes are matched by structure because layer 0 numbers its stage gathers one lower than
+the other layers; a two-layer cut was checked first, `scripts/run_e26a.sh`). One session,
+MXFP6, KV retained, 128-token chunk, prompt 41, 3 rounds × 20 (`runtime_sort/e26_full_model_runs.txt`):
+
+| Program | Host median | Device memory per card | Program file | Logits rel. L2 vs FP32 | Next token |
+|---|---:|---:|---:|---:|---|
+| Production baseline | 496.6 ms | 6.6 GiB | 26.4 GB | 0.1884 | ' jav' ✓ |
+| Naive 128/128, token-centric combine (best so far, 3.15) | 147.7 ms | 6.6 GiB | 26.4 GB | 0.1724 | ✓ |
+| **Naive 128/128, token-owned combine** | **131.9 ms** | 6.6 GiB | 26.4 GB | 0.1718 | ✓ |
+| Runtime sort 128/16, token-owned combine | 138.4 ms | 22.4 GiB | 94.3 GB | 0.1689 | ✓ |
+
+- **The token-owned combine on every layer is the new best program**: 131.9 ms, 3.77×
+  the production baseline, 11% below the token-centric program.
+- **At 128-token chunks the runtime sort is 5% slower than naive T/T.** The hot stage
+  sits at the weight floor at this chunk size (3.8, 3.10), so cutting the cold capacity
+  from 128 to 16 buys almost nothing on the full model, while the sort's per-layer cost
+  (bank gathers that wait for the sort, 3.20) is paid 48 times. The replicated banks
+  cost 15.8 GiB per card, as projected, and the program file carries fp16 copies of the
+  gathered banks.
+- **Correct on device.** No cold lane exceeded its capacity of 16 in any layer (the
+  largest held 8 tokens, the largest hot lane 121 of 128); on every card and in every
+  layer the hot lanes hold at least as many tokens as the cold ones; 1024 assignments
+  per layer. Routing differs from the naive program from layer 3 on (45 of 48 layers)
+  because the combine's summation order changes fp16 rounding, as in 3.15; the logits
+  differ by 0.032 relative, same top-5 set.
+
+**Why the layer replay and the full model disagree at 128 tokens** (`scripts/run_e26c.sh`,
+`run_e26d.sh`, `runtime_sort/e26c_*`, `e26d_*`). The penalty grows linearly with depth,
+host timing with the full-model tool on truncations of the same two programs:
+
+| Layers | Naive T/T | Runtime sort | Gap |
+|---:|---:|---:|---:|
+| 2 | 6.54 ms | 6.65 ms | +0.11 ms |
+| 12 | 34.38 ms | 35.79 ms | +1.41 ms |
+| 48 | 131.9 ms | 138.4 ms | +6.5 ms |
+
+About 0.13–0.14 ms per layer. An instrumented two-layer profile shows where it sits: in
+the full model the routing comes from each layer's own router, so router → per-card sort
+→ bank gathers → expert GEMMs is on every layer's critical path; the sort ends 0.10 ms
+after the router, the first expert weights stream 0.12 ms later, and the first expert GEMM
+starts 0.17 ms later than in the naive program. The static program does not stream expert
+weights under attention either; its stream also starts after the router, but it has no sort
+in between. In the replay the routing is a graph input, so the sort and the gathers run in
+the prologue from time zero and stay off the critical path. What the sort saves at 128
+tokens, a cold stage of 16 instead of 128 rows, is smaller than that delay because the hot
+stage streams at its weight floor. (The instrumented two-layer device times, 6.70 ms for
+both, are too coarse to show a 0.1 ms difference; the host timing above does.)
+
+So the runtime sort pays at longer chunks: 20% at 256 and 31% at 512 tokens per layer
+against naive T/T with the same combine. The full model exists only for 128-token chunks;
+measuring the gain on the model needs a 512-token build (per-layer constants regenerated
+for T=512, a longer KV context, a 512-token FP32 reference). Multi-chunk correctness of
+the retained cache is still untested for every program here.
+
+## 3.24 Two optimizations of the runtime sort: sort-first, and the tile size (E27)
+
+The two-layer profiles of 3.23 locate the 0.14 ms per layer that the runtime sort adds
+before its first expert GEMM (layer 1, times after the router): the per-card sort itself
+is cheap, done 0.03 ms after the dense routing scatter that both programs run; the
+128-expert routing chain delivers the hot stage's token table 0.07 ms later than the
+naive program's stage-0 chain; and the first gathered weights precede the first expert
+GEMM by 0.085 ms, against 0.015 ms for directly streamed weights. Two remedies were
+tried on 12-layer cuts of the full model, each timed back to back with naive T/T by the
+full-model tool (`scripts/run_e27*.sh`, `runtime_sort/e27*`). 2026-09-26.
+
+- **Sort first, then the original two stage chains on the permuted routing columns**
+  (`build_full_dyncard.py --mode sortfirst`) is slower: +2.54 ms over naive at 12 layers
+  against +1.60 ms for the native-order chain. The column permutation and both chains now
+  wait for the sort. Rejected.
+- **`-use-producer-dma`**: no gain (+2.94 ms on sort-first; naive −0.06 ms, noise).
+- **`-size-split-granularity`, the compiler's maximum tile size in KiB** (default not
+  documented; 512 is the smallest allowed):
+
+| 12 layers, gap to naive T/T at default tiles | default | 1024 KiB | 512 KiB |
+|---|---:|---:|---:|
+| Naive T/T | 0 | +0.42 ms | +0.75 ms |
+| Runtime sort, native-order chain | +1.60 ms | +1.1 ms (naive pair lost) | **−0.49 ms** |
+| Runtime sort, sort-first | +2.54 ms | not run | +0.12 ms |
+
+Small tiles help only gathered weights: they cost naive T/T 1–2%, and turn the
+runtime sort from 4.7% slower to 1.4% faster. The two-layer profile at 512 KiB
+(`runtime_sort/e27_two_layer_timeline_512KiB.txt`) shows why: the first expert GEMM now
+follows the first gathered weights by 0.032 ms instead of 0.085–0.096, the gathered stream
+pipelines better through the stage, and the two-layer device time drops from 6.70 to
+6.54 ms. The routing chain still delivers weights 0.23–0.25 ms after the router against
+0.15 ms in the naive program, so about 0.1 ms per layer remains to be taken.
+
+**Full model, one session** (48 layers, 128-token chunk, KV retained, MXFP6, prompt 41):
+
+| Program | Host median | Memory per card | Logits rel. L2 vs FP32 | Next token |
+|---|---:|---:|---:|---|
+| Production baseline | 495.7 ms | 6.6 GiB | 0.1884 | ' jav' ✓ |
+| Naive T/T, token-owned combine (runs before and after) | 131.65 / 131.58 ms | 6.6 GiB | 0.1718 | ✓ |
+| **Runtime sort, 512 KiB tiles** | **128.65 ms** | 22.4 GiB | 0.1689 | ✓ |
+
+The runtime sort is now the fastest program at 128-token chunks: 2.3% below naive T/T
+and 3.85× the production baseline. No cold lane exceeded its 16 rows (largest 8), and the
+per-card order holds in every layer. The crossover of 3.23 therefore moves below 128
+tokens; at 256 and 512 the replay's per-layer saving is larger still (the 256-token
+full model follows in 3.25).
+
+## 3.25 256-token chunks on the full model (E28)
+
+The full-model builders were generalized to the chunk length and all three programs
+rebuilt for 256-token chunks (2026-09-26):
+
+- **Graphs.** `scripts/build_full_stack.py --T 256` (Hillis-Steele scans up to a shift of
+  T/2, slice ends T − shift, 16 token tiles of T/16 rows), then
+  `scripts/build_full_dyncard.py --T 256 --mode naive|dyncard --C_cold 32` and the
+  head-parallel attention of 3.15, which has no T-dependent constant (its re-laid attention
+  weights are byte-identical to the 128-token build and are shared). The production baseline
+  is the unmodified export (`native_c128`): its capacities come from the routing tensor's
+  shape, so it compiles to capacity 256 as it is. Specialization `configs/specializations_T256.json`,
+  seq_len 256 with ctx_len 512 (the same 1:2 ratio as the 128-token programs).
+- **Capacities.** Hot stays at T: in the 56 calibration chunks of 256 tokens (16 GSM8K
+  chunks, plus the first and second halves of the 20 512-token captures of GSM8K,
+  HumanEval, MMLU and SWE-bench Lite) one expert receives all 256 tokens (layer 14).
+  Cold is 32 = T/8: under the per-card sort the cold stage needs at most 25 rows at any
+  layer of any chunk (at T=128: 12 of 16; at T=512: 50, so 64 would fit).
+- **Held-out prompt and reference.** GSM8K test questions 1000–1003 in one chat turn,
+  truncated to 256 tokens (the calibration captures used questions 400–642). FP32 CPU
+  reference in `full_model/ref256/` (`scripts/e2e_cpu_ref_local.py --ids … --T 256`).
+  Its next token is a near tie: ' the' 28.84 against ' a' 28.26.
+- **Run tool.** `scripts/moe_qwen3_baseline_T.py` and `scripts/moe_qwen3_baseline_host_T.cpp`
+  are copies of the repository's full-model tool that take T from the reference's input
+  length (IO shapes, count bounds, 8·T assignments per layer, tokens/s).
+
+**Two-layer check** (`scripts/run_e28a.sh`, `chunk256/e28a_two_layer_check.txt`): against the
+FP32 logits of the two-layer truncation (final norm and LM head on layer 1's residual),
+production 0.0555, naive T/T 0.0555 and runtime sort 0.0556 relative L2, same argmax;
+runtime sort against naive 1.3·10⁻³, naive against production 8.2·10⁻⁴.
+
+**Full model, one session** (`scripts/run_e28b.sh`, `run_e28c.sh`, `chunk256/`): 48 layers,
+KV retained, MXFP6, 3 rounds × 20. The 128-token programs of 3.24 (prompt 41) were timed
+in the same session:
+
+| Program | T=128 | T=256 | Tokens/s at 256 | Memory per card at 256 | Logits rel. L2 at 256 | Next token at 256 |
+|---|---:|---:|---:|---:|---:|---|
+| Production baseline | 497.0 ms | 505.6 ms | 506 | 6.8 GiB | 0.0886 | ' a' (near tie) |
+| Naive T/T, token-owned combine (three runs at 256) | 131.6 ms | 258.4 / 260.0 / 258.3 ms | 991 | 6.7 GiB | 0.0733 | ' the' ✓ |
+| **Runtime sort 256/32, 512 KiB tiles** | 129.8 ms | **217.0 ms** | **1180** | 22.5 GiB | 0.0889 | ' a' (near tie) |
+
+- **At 256-token chunks the runtime sort is 16.0% faster than naive T/T** (217.0 against
+  258.3 ms, back to back) and 2.33× the production baseline; at 128 tokens in the same
+  session the gap is 1.4% (3.83× production). The saving is 0.86 ms per layer; the
+  single-layer replay's 0.81 ms at T=256 (3.23) is not comparable, because the replay ran
+  layer 2 at hot 160 / cold 16 while the full model keeps hot at T (3.26). The 512 KiB tiles
+  are the best of default, 512 and 1024 KiB at this chunk length (3.26). Per card and layer
+  the runtime sort computes 16·T + 16·T/8 padded rows, 56% of naive's 32·T.
+- **Scaling with the chunk.** Naive T/T takes 1.96× the time for 2× the tokens (flat at
+  973–991 tokens/s): its padded rows grow with T. The runtime sort takes 1.67× and gains 20%
+  in tokens/s. The production baseline barely moves (+1.7%, so its throughput doubles),
+  consistent with a per-layer cost that does not scale with tokens; it was not profiled at
+  256.
+- **Correct on device.** No lane exceeded its capacity (hot lanes up to 250 of 256, cold up
+  to 17 of 32); in every layer and on every card the hot lanes hold at least as many tokens as
+  the cold ones; 2048 assignments per layer. All three programs sit at the MXFP6 error level
+  against FP32 and have the same top-5 set; production and the runtime sort end 0.01 and 0.04
+  apart on the reference's near tie and flip it (naive keeps it by 0.08). The programs differ
+  from one another by 0.010–0.043 relative, fp16 rounding differences as in 3.23 and the same
+  level as at 128 tokens (0.032–0.038); the three naive runs are bit-identical.
+- **One load failure.** The first load of the runtime-sort program failed with `Device is
+  busy` while two cards were loading its constants (22.5 GiB per card; all cards idle and
+  Ready before and after). An immediate retry loaded in 38 s and ran; the static programs
+  load in 6–12 s. Not reproduced; the cause is unknown.
+
+The 256-token production and runtime-sort programs and the 128-token runtime-sort program
+were deleted after timing (88 GB each for the runtime sort); the 256-token naive program is
+kept as an anchor.
+
+## 3.26 512-token chunks on the full model, and the tile size per chunk length (E29)
+
+Same builders and checks as 3.25 at T=512 (2026-09-26): `build_full_stack.py --T 512`,
+`build_full_dyncard.py --T 512 --C_cold 64`, head-parallel attention, seq_len 512 with
+ctx_len 1024 (`configs/specializations_T512.json`). Hot stays at 512 (the calibration captures
+reach 508); cold 64 = T/8 (the per-card sort needs at most 50 rows in the 20 512-token captures
+of GSM8K, HumanEval, MMLU and SWE-bench Lite). Held-out prompt: GSM8K test questions 1004–1011
+in one chat turn, truncated to 512 tokens; FP32 reference `full_model/ref512/`, next token ' days'
+(24.96, against ' different' 24.43).
+
+**Two-layer check** (`scripts/run_e29a.sh`, `chunk512/e29a_two_layer_check.txt`): production
+0.0525, naive T/T 0.0525, runtime sort 0.0524 relative L2 against the FP32 two-layer logits, same
+argmax; runtime sort against naive 6.7·10⁻⁴.
+
+**Full model** (`scripts/run_e29b.sh`, `chunk512/e29b_full_model.txt`): one session with the kept
+anchors (naive at 256: 258.5 ms; at 128: production 496.2 ms and naive 131.4 ms, against
+258.3–260.0, 497.0 and 131.6 ms in 3.25):
+
+| Program | Host median | Tokens/s | Memory per card | Logits rel. L2 | Next token |
+|---|---:|---:|---:|---:|---|
+| Production baseline | 1048.4 ms | 488 | 7.1 GiB | 0.0949 | ' days' ✓ |
+| Naive T/T, token-owned combine (runs before and after) | 497.1 / 496.1 ms | 1031 | 6.8 GiB | 0.0924 | ✓ |
+| Runtime sort 512/64, 512 KiB tiles (as at 128 and 256) | 467.0 ms | 1096 | 22.6 GiB | 0.0969 | ✓ |
+
+All three have the reference's top-5 in the reference's order and differ from one another by
+0.008–0.011; no lane exceeded its capacity (hot up to 508 of 512, cold up to 37 of 64) and the
+per-card order holds in every layer. The runtime sort gained only 6%, so the tile size was
+checked again on 12-layer cuts (`scripts/run_e29c.sh`, `run_e29d.sh`; host timing, back to back
+with naive T/T):
+
+| 12 layers, gap to naive T/T | default tiles | 512 KiB | 1024 KiB |
+|---|---:|---:|---:|
+| T=256 (naive 67.0 ms, one run: the first failed, see below) | −5.1% | **−18.2%** | −7.9% |
+| T=512 (naive 127.2 / 127.0 ms, before and after) | −12.7% | −9.3% | **−15.9%** |
+
+The best tile size moves with the chunk: 512 KiB at 128 (3.24) and 256, 1024 KiB at 512; the
+default is never best for gathered weights. Each chunk length is its own program, so the tile
+size is chosen per program.
+
+**Full model with 1024 KiB tiles** (`run_e29d.sh`, `chunk512/e29d_full_1024KiB_and_256_tiles.txt`):
+**427.2 ms, 1198 tokens/s**, against naive T/T 497.2 and 494.5 ms before and after (−13.8%) and
+2.45× the production baseline of the E29b session; 22.5 GiB per card, same routing counts, logits
+bit-identical to the 512 KiB program.
+
+**Across chunk lengths** (full model, 48 layers, KV retained, MXFP6; each program at its best tile
+size; production and naive from 3.25 and above):
+
+| T | Production | Naive T/T | Runtime sort | vs naive | vs production | Tokens/s, runtime sort |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 496.2–497.0 ms | 131.4–131.6 ms | 128.7–129.8 ms | −1.4 to −2.3% | 3.83–3.85× | 986–995 |
+| 256 | 505.6 ms | 258.3–260.0 ms | 217.0 ms | −16.0% | 2.33× | 1180 |
+| 512 | 1048.4 ms | 494.5–497.2 ms | 427.2 ms | −13.8% | 2.45× | 1198 |
+
+- **The runtime sort's advantage levels off at 14–16%** instead of growing with T as the
+  single-layer replay suggested (5/20/31%, 3.23). The replay's runtime sort ran layer 2 at
+  capacities calibrated without margin, hot 160 of 256 and 304 of 512; the full model keeps the
+  hot stage at T, because in some layer one expert takes (nearly) every token. With hot = T the
+  sort removes only the cold stage's padding, 16·T·7/8 of naive's 32·T rows per card and layer,
+  and the per-layer saving (0.04–0.06 / 0.86 / 1.43 ms at 128 / 256 / 512) stays a similar
+  fraction of a naive layer that also grows with T. At T=128 the replay used 128/16 like the full model,
+  and both agree that the sort barely pays there.
+- **Per-layer hot capacities are not a way out.** Taking each layer's calibration maximum would
+  average 231 of 256 and 437 of 512 rows (−10% and −15% of the hot stage), and the held-out
+  prompts already exceed those maxima in 1 and 5 layers, which would drop assignments. The hot
+  stage stays at T; the remaining lever for it is splitting its largest experts across lanes
+  (3.16–3.17), not a smaller capacity.
+- **Production** is nearly flat from 128 to 256 tokens (497 → 506 ms) and doubles at 512
+  (1048 ms), so its per-token rate peaks at 256; naive T/T stays at 970–1035 tokens/s; the
+  runtime sort reaches about 1200 tokens/s from 256 tokens on.
+- Two transient device errors in this study, both cleared by the next run: the E28 runtime-sort
+  load (`Device is busy`, 3.25) and one host-tool resource query at the start of a 12-layer run
+  (`qaicGetResourceInfo` returned 300).
+
+The 512-token production program and both 512-token runtime-sort programs (25, 89 and 88 GB) were
+deleted after timing; the naive programs for 128, 256 and 512 tokens and the 128-token production
+program are kept as anchors.
+
+## 3.27 Run-time lane split, expert placement, and the size of the MoE reduction (E30)
+
+Offline studies on the calibration routing (`realcase/routing*`, no new programs except one profile), 2026-09-27. They
+answer three questions raised by 3.26: can the hot stage shrink at run time, can a placement make tokens card-local, and
+how much is there to gain in the cross-card reduction at all.
+
+**Run-time lane split** (`scripts/split_budget.py`). The split of 3.16 decided at run time is only index arithmetic:
+per card, sorted counts, ⌈count / capacity⌉ lanes per expert from a running sum, a lane → (expert, row offset) map for
+the weight gather (repeated indices are fine), and lane = first lane + rank ÷ capacity for the tokens. What limits it is
+the lane budget: every stage must keep 16 lanes per card (3.17), and some layer-card has all 32 of its experts active,
+so a split needs lanes the 32-lane layout does not have. A small third stage of 4 or 8 lanes per card (even mapping,
+3.17) provides them. Cheapest designs that keep today's headroom (1.28× over the calibration maximum, counts capped at T):
+
+| Extra lanes per card | T=256: hot/cold/extra → padded rows vs today | T=512 |
+|---|---|---|
+| 0 | 192/32 → 78% | nothing below hot = 512 fits |
+| 4 | 88/40/16 → 46% | 176/64/32 → 43% |
+| 8 | 72/32/16 → 39% | 144/80/32 → 42% |
+
+The held-out prompts of 3.25 and 3.26 fit every design. Not built; from the hot-stage measurements of 3.16 the gain is
+estimated at about 10% of the full model at 256 and 512 tokens, none at 128.
+
+**Tokens whose experts share a card.** Under the native placement the number of cards a token's eight experts span
+matches random routing (T=128 captures, 51,200 tokens × 48 layers: 4 / 3 / 2 / 1 cards = 64.8 / 33.1 / 2.1 / 0.02%,
+random 64.7 / 33.4 / 1.9 / 0.003%). The small excess of single-card tokens is one token: the `\n` after
+`<|im_start|>user`, identical in every prompt, whose layer-23 experts are 3, 4, 5, 6, 7, 14, 21, 28, all on card 0.
+
+**Co-locating experts that fire together** (`scripts/coact_placement.py`, `coact_placement2.py`): per layer a balanced
+32-per-card partition maximizing within-card co-activation, calibrated on half the T=128 prompts. On the other half a
+token spans 2.42 cards instead of 3.63, 12% of tokens have all eight experts on one card, and the structure transfers
+(2.4–3.0 cards on a workload left out of the calibration). But it concentrates load: the per-card cold need of the
+runtime sort doubles (12 → 25, 25 → 49, 50 → 85 rows at T=128/256/512), also when the search is constrained on the
+calibration prompts (held-out need 23). And a combine that sends only touched rows needs a compile-time row budget per
+card that covers the worst chunk: 87–96% of T on average over layer-card pairs (native 98–100%), so the exchange would
+shrink by only 4–13% against today's full partial sums.
+
+**The MoE reduction in the full model** (`scripts/run_e30a.sh`, `locality/e30a_profile_T512.txt`, and the 2-layer T=128
+profiles of 3.23/3.24). The compiler does not root it on card 0 as in the single-layer replay: the partial sums go
+over all 12 card pairs (48 sends), each card sums 4 of the 16 tiles on its cores 0–3, and the next layer's input
+norm all-gathers the result.
+
+| Per layer | T=128 | T=512 |
+|---|---|---|
+| MoE partial sums exchanged | 1.5 MiB, 0.08–0.09 ms | 6 MiB, 0.30–0.34 ms |
+| Final sum per card (4 tiles, 4 cores) | 0.10–0.13 ms | 0.35–0.45 ms |
+| Tail, last expert GEMM → final sum done | 0.20 ms | 0.56–0.60 ms |
+| Attention `o_proj` partials exchanged | 6 MiB, 0.18–0.19 ms | 24 MiB, 0.74–0.76 ms |
+
+MoE partial sums are 14% of the cross-card bytes, `o_proj` 55%, the norm exchanges 21%. Removing the MoE exchange
+entirely would be worth about 3% of the model; with the row budgets above, under 0.5%. The locality-aware combine was
+therefore not built. The same profile puts the router → first expert GEMM gap at 0.55–0.61 ms per layer at T=512
+(sort, then weight streams).
+
+**Balancing placements** (`scripts/balance_placement.py`, `locality/balance_placement.txt`; after arXiv 2510.05497,
+which excludes all-to-all from its GPU results and quantifies no reduction cost). Out of sample on the 256- and
+512-token chunks:
+
+| Placement | Busiest card / mean, per chunk (median, worst) | Cold need, 256 / 512 | Split rows vs today, 256 / 512 |
+|---|---|---|---|
+| native | 1.27–1.29, 1.78–1.90 | 25 / 50 | 46% / 43% |
+| remap (balance average load) | 1.25–1.27, 2.04–2.17 | 24 / 42 | 46% / 49% |
+| spread experts that fire together | 1.10–1.11, 1.38–1.46 | 20 / 38 | 32% / 32% |
+| co-locate them (above) | 1.99–2.00, 3.39–3.40 | 49 / 85 | 85% / 78% |
+
+Per-chunk imbalance comes from groups of experts that fire together, not from average popularity, so spreading those
+groups is what balances cards and lowers the order statistics. The combine is dense, so no placement changes its
+traffic. In the runtime-sort program a placement costs nothing (every card holds every bank); the split above should
+use the spread placement.
+
+## 3.28 The final-sum form in the full model, and the slow SoCs (E31)
+
+`scripts/build_full_dyncard.py --final einsum|addtree|tileadd` replaces the 16 Einsum tiles of the final cross-card sum
+with the elementwise forms of `github_pack/FINAL_COMBINE_16CORE.md`: `(p0 + p1) + (p2 + p3)` on the whole [T, 2048]
+(addtree) or per token tile (tileadd). The default build is byte-identical to the E26/E27 graphs. Two-layer cuts of the
+runtime sort, one session, host tool, each form bracketed by the Einsum build (`scripts/run_e31.sh`,
+`combine_fullmodel/e31.txt`), 2026-09-27:
+
+| Two layers | T=128 (512 KiB tiles) | T=512 (1024 KiB tiles) |
+|---|---:|---:|
+| Einsum tiles (today), before / after | 6.162 / 6.242 ms | 18.653 / 18.694 ms |
+| addtree | 6.107 ms | 18.399 ms (−1.5%) |
+| tileadd | 6.086 ms | **18.227 ms (−2.4%)** |
+
+Errors against the FP32 two-layer reference are unchanged (0.0497–0.0499 at 128, 0.0524 at 512), same argmax. At
+T=128 the difference is within the noise; at T=512 tileadd saves about 0.22 ms per layer, about 10 ms (2.5%) on the
+full model if it carries through.
+
+- **The compiler keeps the elementwise sum distributed.** The op inventory shows 48 `elementadd` ops on the 16 cores of
+  every card, 1.5 MiB of add outputs per card (a quarter), and the partial-sum traffic is unchanged at 6 MiB per layer.
+  In the instrumented profile the tail falls from 0.58 to 0.48 ms per layer at T=512. The write-up's card-0 root and its
+  0.4 ms hot-stage side effect do not appear: in the replay the result is a graph output read from card 0, so every
+  buffer (about 14 MiB) sits there; in the full model the result feeds the next layer's residual add and input norm,
+  which run split by token rows, and each card holds about a quarter of it.
+- **Two SoCs run their hot stage slower, and that follows the hardware.** With identical work (544 GEMM events per card)
+  SoC 0, and in most runs SoC 3, finish the hot stage up to 0.4–0.5 ms later than SoCs 1 and 2 at T=512 (the amount
+  varies between runs); in the T=128 profile SoC 0 is the slowest too. The same instrumented program run with device
+  order `1:2:3:0` moves the slowness to logical slices 3 and 2, the ones then placed on physical SoCs 0 and 3.
+  Compile-time buffer placement is symmetric (SoC 3 equals SoCs 1–2) and per-card token counts do not correlate with it. The four "cards" are four SoCs on one AI 100 Ultra board
+  (same board serial, `Sku Type: Pcie Ultra`) under a 150 W board cap; during a 48-layer T=512 run board power peaks at
+  154–164 W and the NSP clock, 1100 MHz median on every SoC, dips to 941 MHz on SoCs 0 and 3, which draw 22–23 W against
+  20 W (`combine_fullmodel/e31_telemetry_T512_naive.txt`; 0.5 s sampling cannot attribute individual millisecond
+  slowdowns). The effect is not in the graph and adds run-to-run variation; the combine waits for the slowest SoC.
+
+The next step is the 48-layer tileadd programs at 256 and 512 tokens against the current runtime sort.
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -1051,16 +1987,32 @@ each), `run_native_hp_flag`, `run_anchor3_native_noflag`, `run_stack_hp_flag`,
   `/home/chihao/models/qwen3_30b_a3b/ep` disappeared on 2026-09-22 at 16:31, and
   every non-expert weight of the full-model graphs (`diagnostic_graph`,
   `min_fp16_graph`, `layer_profile/pow2_fp16_graph`) references it through their
-  `weights` symlink. Only the expert banks in `weights_fp16` are local. A re-export
-  is needed before full-model results can be measured; the local copies of the
-  partition config, specialization file and a KV-only custom IO list are in
-  `scripts/` and `scripts/mdp_ts_4.json`.
-- The empty-expert skip is data dependent and its mechanism is not established.
+  `weights` symlink. Only the expert banks in `weights_fp16` are local. E9 removed
+  the dependency instead of re-exporting: the non-expert weights were regenerated from
+  the checkpoint into `full_model/` (see the previous item); the partition config,
+  specialization file and KV-only custom IO list are in `full_model/configs/` and
+  `scripts/mdp_ts_4.json`.
+- The zero-GEMM stage seen once in `layer_profile` (layer 31, a stage with no
+  assignments) is not evidence of a runtime skip: the compiler rejects data-dependent
+  control flow (3.18), and in every profile here each lane of a compiled stage streams
+  its bank whether or not it receives tokens (3.17). Its cause was not established.
+- E20–E22 are single-layer replays of layer 2 with routing and MoE inputs from the FP32
+  CPU stack, 50 prompts per workload at T=128 and far fewer at T=256 (16, GSM8K only)
+  and T=512 (20). The dynamic split has not been ported to the full model; its DDR cost
+  (+0.33 GiB per layer per card) is extrapolated from one layer, and its capacities
+  carry no margin beyond the observed maxima (3.20).
 - `-mdts-mos=1` also forbids weight splitting for the dense layers of a full model
   (attention, LM head). With the original attention block that costs the KV-cache
   pairing and a token-split attention (3.15); with the head-parallel block attention
   is 13% of core-busy time and most of the remaining cross-card traffic, its exact
   cost against the heuristic attention is not isolated.
+- E28 and E29 measure one held-out prompt each (256 and 512 tokens), the first chunk only;
+  their cold capacities (32, 64) rest on 56 and 20 calibration chunks from four workloads.
+  The tile-size comparison of E29 uses 12-layer cuts.
+- E30 is offline analysis of the calibration routing: the run-time lane split, the placements and the row-budget
+  combine were not built; the time estimates rest on the 3.16 hot-stage measurements. E31 measures two-layer cuts only.
+- The "four cards" are four SoCs on one AI 100 Ultra board with a shared 150 W cap (E31); per-SoC clocks dip under
+  load, so absolute timings carry run-to-run variation and only same-session back-to-back comparisons are used.
 
 ## 5. Reproduction
 
@@ -1111,4 +2063,27 @@ rebuilt graph or on a `build_full_stack.py` output), `scripts/trunc_io.py <qpc> 
 for any of these QPCs), `scripts/spans.py` and `scripts/placement.py <analysis dir> [layer prefix]` on a
 `detail_analyze.py` output, `scripts/make_inputs.py <out dir>` and `scripts/e2e_cpu_ref_local.py` for the
 reference; drivers `scripts/run_kv1.sh` … `run_kv7.sh` (2-layer sweep, replay flag/no-flag/mos4 timing,
-head-parallel bindings, 2-layer logits and profiles, full-model compiles, runs and profile).
+head-parallel bindings, 2-layer logits and profiles, full-model compiles, runs and profile). E18:
+`scripts/make_split.py <T> <counts.npy> <out dir> <C_hot> [C_cold_min]` (lane-split hot stage with virtual-lane
+routing; then `make_tokencombine.py <out dir> <out dir>_to tokenowned`), `scripts/make_rowchunk.py <src dir> <out dir>
+<k>`, `scripts/e18_hot.py <analysis dir> <label>` (hot/cold engine time per core), driver `scripts/run_e18.sh`. E19:
+`scripts/make_split_wide.py <T> <counts.npy> <out> <C_hot> [C_cold_min] [cold lanes]`, then `make_tokencombine.py <out>
+<out>_to tokenowned` and `scripts/patch_wide_to.py <out>_to <cold lanes>`; `scripts/profile_case2.sh` profiles graphs whose
+input width and counts length differ from the 128-lane replay; drivers `scripts/run_e19.sh` … `run_e19d.sh`.
+E28: `scripts/build_full_stack.py … --T 256` (the counts file only has to sum to 8·T per layer;
+`ref256/counts_i32.bin` comes from the reference routing), `scripts/build_full_dyncard.py <stack> <out> --mode
+naive|dyncard --T 256 --C_cold 32`, `scripts/headpar_graph.py`, `scripts/e2e_cpu_ref_local.py --ids <ids.npy> --T 256
+--out <dir>` for the reference, `scripts/trunc_io.py <qpc> <work dir> <reference dir>`; drivers `scripts/run_e28a.sh`
+(two-layer check), `run_e28b.sh` (compiles, one-session timing), `run_e28c.sh` (runtime-sort retry and pair); timing
+with `scripts/moe_qwen3_baseline_T.py run --reference <dir> --routing-counts …`. Full-model compiles take 7–14 minutes.
+E29: the same builders with `--T 512 --C_cold 64`, `configs/specializations_T512.json`, reference
+`full_model/ref512/` (`heldout_T512_ids.npy`); drivers `scripts/run_e29a.sh` (two-layer check), `run_e29b.sh` (compiles,
+one-session timing with anchors), `run_e29c.sh` (12-layer tile sizes at 512), `run_e29d.sh` (12-layer tile sizes at 256,
+full model with `-size-split-granularity=1024`). The 512-token runtime-sort compile takes 17 minutes with 1024 KiB tiles,
+30 with 512 KiB.
+E30: `scripts/split_budget.py <mdts_flag dir>` (run-time split designs), `scripts/coact_placement.py <mdts_flag dir>
+[restarts]` and `coact_placement2.py` (co-activation placement, load-constrained and leave-one-workload-out; the placement
+is saved to `realcase/coact_placement_T128.npy`), `scripts/balance_placement.py <mdts_flag dir>` (remap and spread
+placements), `scripts/run_e30a.sh` (instrumented two-layer T=512 profile). E31: `scripts/build_full_dyncard.py ... --final
+addtree|tileadd`, `scripts/run_e31.sh` (compiles, same-session two-layer timing, profiles under two device orders),
+`scripts/e31_cards.py <analysis dir> <label>` (per-card hot stage, final sum and P2P from a profile).
