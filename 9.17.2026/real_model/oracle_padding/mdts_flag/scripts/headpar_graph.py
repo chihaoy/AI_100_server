@@ -9,10 +9,14 @@ head-sliced compile produces, and the KV-cache CtxScatter/CtxGather of each head
   v: Expand(x) @ Wv_g[4,2048,128] -> [1,4,T,128] -> CtxScatter_1 (unchanged node)
   attention per group on the gathered cache, o: [4,T,1024] @ Wo_g[4,1024,2048] -> ReduceSum over groups -> [1,T,2048]
 Wq/Wk/Wv are re-laid out as new fp16 external files (<out>/weights_hp/), Wo is a pure reshape of the existing file.
-Usage: headpar_graph.py <src dir> <out dir>"""
-import sys, os, re, numpy as np, onnx
+Usage: headpar_graph.py <src dir> <out dir> [--osum reducesum|addtree|tileadd --T <chunk>]
+  --osum: form of the sum over the four head groups after o_proj: one ReduceSum (default), elementwise (p0+p1)+(p2+p3)
+          on the whole [1, T, 2048], or the same per token tile (16 tiles, needs --T)"""
+import sys, os, re, argparse, numpy as np, onnx
 from onnx import helper as h, numpy_helper as nh, TensorProto as TP
-src, out = sys.argv[1], sys.argv[2]; os.makedirs(f'{out}/weights_hp', exist_ok=True)
+ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('--osum', choices=['reducesum', 'addtree', 'tileadd'], default='reducesum')
+ap.add_argument('--T', type=int, default=0); a = ap.parse_args(); assert a.osum != 'tileadd' or a.T % 16 == 0 and a.T > 0, '--osum tileadd needs --T'
+src, out = a.src, a.out; os.makedirs(f'{out}/weights_hp', exist_ok=True)
 m = onnx.load(f'{src}/model.onnx', load_external_data=False); g = m.graph
 init = {t.name: t for t in g.initializer}
 def ext_path(t): return f"{src}/{ {e.key: e.value for e in t.external_data}['location'] }"
@@ -87,7 +91,20 @@ for L in layers:
     o = mk2('Reshape', [o, I64('hp_shape_4_T_1024', [G, -1, HQ * D])], [N('ctx2')], 'Reshape_ctx')
     o = mk2('MatMul', [o, wo.name], [N('o_part')], 'o_proj')                                 # [4,T,2048]
     old_o = by_name[P + 'o_proj/MatMul']
-    post.append(h.make_node('ReduceSum', [o, I64('hp_axes0', [0])], [old_o.output[0]], name=N('ReduceSum_o'), keepdims=1))   # [1,T,2048]
+    if a.osum == 'reducesum':
+        post.append(h.make_node('ReduceSum', [o, I64('hp_axes0', [0])], [old_o.output[0]], name=N('ReduceSum_o'), keepdims=1))   # [1,T,2048]
+    else:
+        def osum_tree(src_t, tag, out_t):   # elementwise sum over the group axis, keeps [1, rows, 2048]
+            ps = [mk2('Slice', [src_t, I64(f'hp_g{j}', [j]), I64(f'hp_g{j + 1}', [j + 1]), I64('hp_axes0', [0])], [N(f'{tag}_p{j}')], f'{tag}_slice_{j}') for j in range(G)]
+            a01 = mk2('Add', [ps[0], ps[1]], [N(f'{tag}_a01')], f'{tag}_add01'); a23 = mk2('Add', [ps[2], ps[3]], [N(f'{tag}_a23')], f'{tag}_add23')
+            post.append(h.make_node('Add', [a01, a23], [out_t], name=N(f'{tag}_add')))
+        if a.osum == 'addtree': osum_tree(o, 'osum', old_o.output[0])
+        else:
+            Wt = a.T // 16; tiles = []
+            for i in range(16):
+                t = mk2('Slice', [o, I64(f'hp_t{i}_{a.T}', [i * Wt]), I64(f'hp_t{i + 1}_{a.T}', [(i + 1) * Wt]), I64('hp_axes1', [1])], [N(f'osum_tile{i}')], f'osum_tile_slice_{i}')
+                osum_tree(t, f'osum_t{i}', N(f'osum_tile_out{i}')); tiles.append(N(f'osum_tile_out{i}'))
+            post.append(h.make_node('Concat', tiles, [old_o.output[0]], name=N('osum_concat'), axis=1))
     new_nodes_post[old_o.name] = post; drop.add(old_o.name)
 nodes = []
 for n in g.node:
@@ -107,4 +124,4 @@ for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
     if os.path.islink(p) and not os.path.exists(f'{out}/{link}'): os.symlink(os.path.realpath(p), f'{out}/{link}')
 if os.path.exists(f'{src}/custom_io.yaml') and not os.path.exists(f'{out}/custom_io.yaml'): os.symlink(os.path.realpath(f'{src}/custom_io.yaml'), f'{out}/custom_io.yaml')
 onnx.save(m, f'{out}/model.onnx'); _c = os.getcwd(); os.chdir(out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-print(f'{out}: {len(layers)} layers rewritten, nodes {len(g.node)}, initializers {len(g.initializer)}, new weight files {3*len(layers)}')
+print(f'{out}: {len(layers)} layers rewritten, group sum {a.osum}, nodes {len(g.node)}, initializers {len(g.initializer)}, new weight files {3*len(layers)}')

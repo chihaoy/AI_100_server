@@ -6,7 +6,8 @@ split (scripts/split_budget.py rule, 4 extra lanes per card). Placements per lay
   remap    the paper's remap: experts by decreasing calibration load, each to the least-loaded card with < 32 experts
   spread   swap search that MINIMIZES within-card co-activation (the opposite of coact_placement.py)
   coact    coact_placement.py's localizing placement, for reference
-Evaluated out of sample on the T=256 and T=512 chunks. Usage: balance_placement.py <mdts_flag dir>"""
+Evaluated out of sample on the T=256 and T=512 chunks; the spread placement is saved to realcase/spread_placement_T128.npy.
+Usage: balance_placement.py <mdts_flag dir>"""
 import sys, os, glob, numpy as np
 R = sys.argv[1]; rng = np.random.default_rng(0)
 cal = []
@@ -40,6 +41,7 @@ P = {'native': np.tile(native, (48, 1)), 'remap': np.zeros((48, 128), np.int64),
 for L in range(48):
     X = onehot(cal[L]); A = X.T @ X; np.fill_diagonal(A, 0)
     P['remap'][L] = remap(X.sum(0)); P['spread'][L] = swap_search(A, native, -1)
+np.save(f'{R}/realcase/spread_placement_T128.npy', P['spread'])   # read by tier_budget.py
 def place(n, pools):        # the split_budget.py prefix rule
     placed = np.zeros_like(n, bool)
     for lanes, cap in pools:
