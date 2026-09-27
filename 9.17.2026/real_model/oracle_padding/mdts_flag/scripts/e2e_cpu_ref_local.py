@@ -18,6 +18,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeRotaryEmbed
 HF = R.HF
 ap = argparse.ArgumentParser(); ap.add_argument("--prompt", type=int, default=41); ap.add_argument("--T", type=int, default=128)
 ap.add_argument("--out", required=True); ap.add_argument("--layers", type=int, default=48); ap.add_argument("--threads", type=int, default=16)
+ap.add_argument("--ids", default=None, help="int64 .npy token ids to use instead of GSM8K prompt --prompt (first --T are used)")
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True); torch.set_num_threads(a.threads)
 t0 = time.time(); log = lambda *x: print(f"[{time.time()-t0:7.1f}s]", *x, flush=True)
 cfg = AutoConfig.from_pretrained(HF); H, nh, nkv, hd, E, K, eps = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim, cfg.num_experts, cfg.num_experts_per_tok, cfg.rms_norm_eps
@@ -28,10 +29,10 @@ def W(key):
     if f not in _open: _open[f] = safe_open(os.path.join(HF, f), framework="pt")
     return _open[f].get_tensor(key).float()
 
-tok = AutoTokenizer.from_pretrained(HF); ids = R.prompts(tok, a.prompt + 1, 4096)[a.prompt]
+tok = AutoTokenizer.from_pretrained(HF); ids = np.load(a.ids) if a.ids else R.prompts(tok, a.prompt + 1, 4096)[a.prompt]
 T = a.T; assert len(ids) >= T, (len(ids), T); ids = np.asarray(ids[:T], np.int64)
 np.save(os.path.join(a.out, "input_ids.npy"), ids); ids.tofile(os.path.join(a.out, "input_ids_i64.bin")); np.arange(T, dtype=np.int64).tofile(os.path.join(a.out, "position_ids_i64.bin"))
-log(f"prompt {a.prompt}: {len(R.prompts(tok, a.prompt + 1, 4096)[a.prompt])} tokens, using first {T}")
+log(f"ids from {a.ids}, using first {T}" if a.ids else f"prompt {a.prompt}: {len(R.prompts(tok, a.prompt + 1, 4096)[a.prompt])} tokens, using first {T}")
 
 def rmsnorm(x, w): return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)) * w
 rot = Qwen3MoeRotaryEmbedding(cfg); cos, sin = rot(torch.zeros(1, T, H), torch.arange(T)[None]); cos, sin = cos.float(), sin.float()   # [1,T,hd]

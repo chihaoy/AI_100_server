@@ -5,15 +5,17 @@ Usage: build_full_stack.py <src dir> <out dir> <counts_i32.bin> --regroup native
   regroup hc  : per layer, stage 0 = 64 largest-count experts round-robin over cards, stage 1 = rest (active ones
                 round-robin from card 3); routing Gather before the Transpose, banks materialized under <banks>/weights.bin
   caps oracle : per-stage capacity = largest count in the stage (>=1); edits Slice/Slice_1 end and Range_1/Range_3 stop
-  rewrites 1  : zero-read removal (CtxGather3D_2 + Add), 16 token tiles for Einsum_3, Hillis-Steele tree scans for CumSum/CumSum_1"""
+  rewrites 1  : zero-read removal (CtxGather3D_2 + Add), 16 token tiles for Einsum_3, Hillis-Steele tree scans for CumSum/CumSum_1
+  --T         : chunk length the rewrites are built for (128, 256, 512); --caps 128 keeps the export's capacity, which is T"""
 import sys, os, json, copy, argparse, numpy as np, onnx
 from onnx import helper as h, numpy_helper as nh, TensorProto as TP
 from onnx.reference import ReferenceEvaluator
 ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('counts'); ap.add_argument('--regroup', default='native'); ap.add_argument('--caps', default='128'); ap.add_argument('--rewrites', type=int, default=1); ap.add_argument('--banks', default=None); ap.add_argument('--poscounts', default=None, help='counts in position order from a run of the same layout; capacities are taken from these'); ap.add_argument('--combine', default='dense', help='dense | tokencentric (drop the accumulator: per token tile gather+mask+lane-reduce+card-reduce, needs --rewrites 1)')
+ap.add_argument('--T', type=int, default=128)
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
 O = '/home/wentao/workspace/AI_100_server/9.17.2026/real_model/oracle_padding'; F = f'{O}/mdts_flag/full_model'
 m = onnx.load(f'{a.src}/model.onnx', load_external_data=False); g = m.graph
-counts = np.fromfile(a.counts, np.int32).reshape(48, 128); assert (counts.sum(1) == 1024).all()
+counts = np.fromfile(a.counts, np.int32).reshape(48, 128); assert (counts.sum(1) == 8 * a.T).all()
 poscounts = np.fromfile(a.poscounts, np.int32).reshape(48, 128) if a.poscounts else None
 native_idx = json.load(open(f'{F}/weights_native_fp16/index.json'))['tensors']
 def by_name(): return {n.name: n for n in g.node}
@@ -29,7 +31,7 @@ def hc_order(cnt):
     return sum(s0, []) + sum(s1, [])
 for L in range(48):
     cnt = counts[L]; order = hc_order(cnt) if a.regroup == 'hc' else list(range(128)); assert sorted(order) == list(range(128))
-    if a.caps == '128': caps = [128, 128]
+    if a.caps == '128': caps = [a.T, a.T]
     elif poscounts is not None: caps = [max(1, int(poscounts[L][:64].max())), max(1, int(poscounts[L][64:].max()))]
     else: caps = [max(1, int(cnt[order[:64]].max())), max(1, int(cnt[order[64:]].max()))]
     plan[str(L)] = dict(order=order, capacities=caps, active=int((cnt > 0).sum()),
@@ -82,10 +84,10 @@ def scan_nodes(original, stem):
     nodes, inits = [], []
     def const(name, data): inits.append(nh.from_array(np.asarray(data, np.int64), stem + name)); return stem + name
     axis, start = const('token_axis', [1]), const('start', [0]); cur = original.input[0]
-    for shift in [1, 2, 4, 8, 16, 32, 64]:
+    for shift in [1 << k for k in range(int(np.log2(a.T)))]:
         zero, sliced, shifted, result = [stem + f'{part}_{shift}' for part in ['zero', 'slice', 'shift', 'add']]
         inits.append(nh.from_array(np.zeros((64, shift), np.int32), zero))
-        nodes += [h.make_node('Slice', [cur, start, const(f'end_{shift}', [128 - shift]), axis], [sliced], name=sliced),
+        nodes += [h.make_node('Slice', [cur, start, const(f'end_{shift}', [a.T - shift]), axis], [sliced], name=sliced),
                   h.make_node('Concat', [zero, sliced], [shifted], axis=1, name=shifted), h.make_node('Add', [cur, shifted], [result], name=result)]
         cur = result
     nodes.append(h.make_node('Identity', [cur], list(original.output), name=original.name)); return nodes, inits
@@ -108,7 +110,7 @@ if a.rewrites:
         e3 = bn[p + 'Einsum_3']; assert e3.op_type == 'Einsum' and h.get_attribute_value(e3.attribute[0]) == b'dpth->dth'
         inits = [nh.from_array(np.array([2], np.int64), f'stack_L{L}_tile_axis')]; rep, outs = [], []
         for i in range(16):
-            s, e = f'stack_L{L}_tile_start_{i}', f'stack_L{L}_tile_end_{i}'; inits += [nh.from_array(np.array([i * 8], np.int64), s), nh.from_array(np.array([(i + 1) * 8], np.int64), e)]
+            s, e = f'stack_L{L}_tile_start_{i}', f'stack_L{L}_tile_end_{i}'; inits += [nh.from_array(np.array([i * (a.T // 16)], np.int64), s), nh.from_array(np.array([(i + 1) * (a.T // 16)], np.int64), e)]
             sl, rd = f'stack_L{L}_tile_slice_{i}', f'stack_L{L}_tile_reduced_{i}'
             rep += [h.make_node('Slice', [e3.input[0], s, e, f'stack_L{L}_tile_axis'], [sl], name=p + f'reduce_slice_{i}'), h.make_node('Einsum', [sl], [rd], equation='dpth->dth', name=p + f'reduce_tile_{i}')]
             outs.append(rd)
@@ -122,8 +124,8 @@ if a.rewrites:
             axis_node = next(n for n in g.node if original.input[1] in n.output); assert int(nh.to_array(h.get_attribute_value(axis_node.attribute[0]))) == 1
             rep, inits = scan_nodes(original, original.name + '_retune_')
             if not checked:   # CPU semantic check once
-                cg = h.make_graph(rep, 'scan_check', [h.make_tensor_value_info(original.input[0], TP.INT32, [64, 128])], [h.make_tensor_value_info(original.output[0], TP.INT32, [64, 128])], inits)
-                ev = ReferenceEvaluator(h.make_model(cg, opset_imports=[h.make_opsetid('', 17)])); src = np.random.default_rng(0).integers(0, 2, (64, 128), dtype=np.int32)
+                cg = h.make_graph(rep, 'scan_check', [h.make_tensor_value_info(original.input[0], TP.INT32, [64, a.T])], [h.make_tensor_value_info(original.output[0], TP.INT32, [64, a.T])], inits)
+                ev = ReferenceEvaluator(h.make_model(cg, opset_imports=[h.make_opsetid('', 17)])); src = np.random.default_rng(0).integers(0, 2, (64, a.T), dtype=np.int32)
                 assert np.array_equal(ev.run(None, {original.input[0]: src})[0], np.cumsum(src, axis=1, dtype=np.int32)); checked = True
             nodes = []
             for n in g.node: nodes.extend(rep if n.name == original.name else [n])
@@ -133,7 +135,7 @@ if a.rewrites:
 # ---------------- token-centric combine (E11 design), per layer
 if a.combine == 'tokencentric':
     assert a.rewrites, 'token-centric combine builds on the rewritten graph'
-    T = 128; W = T // 16; DOM = 'com.qualcomm.cloud'
+    T = a.T; W = T // 16; DOM = 'com.qualcomm.cloud'
     def init(name, arr): t = nh.from_array(np.asarray(arr), name); g.initializer.append(t); return name
     ax1 = init('tc_axis1', np.array([1], np.int64)); ax2 = init('tc_axis2', np.array([2], np.int64)); zero_i32 = init('tc_zero_i32', np.array(0, np.int32)); shape4 = init('tc_shape4', np.array([4, 16, W, 2048], np.int64))
     tok = [(init(f'tc_tok_start_{i}', np.array([i * W], np.int64)), init(f'tc_tok_end_{i}', np.array([(i + 1) * W], np.int64))) for i in range(16)]
@@ -183,6 +185,6 @@ for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
     ps = f'{a.src}/{link}'
     if os.path.islink(ps) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(ps), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-json.dump(dict(src=a.src, regroup=a.regroup, caps=a.caps, rewrites=a.rewrites, combine=a.combine, layers=plan), open(f'{a.out}/plan.json', 'w'))
+json.dump(dict(src=a.src, T=a.T, regroup=a.regroup, caps=a.caps, rewrites=a.rewrites, combine=a.combine, layers=plan), open(f'{a.out}/plan.json', 'w'))
 busiest = [max(v['active_per_card']) for v in plan.values()]; padded = sum(sum(v['capacities'][s] * sum(1 for e in v['order'][s*64:(s+1)*64] if counts[int(k)][e] > 0) for s in range(2)) for k, v in plan.items())
 print(f'{a.out}: regroup={a.regroup} caps={a.caps} rewrites={a.rewrites} combine={a.combine}; nodes {len(g.node)}; busiest-card active experts mean {np.mean(busiest):.1f}; padded rows total {padded} (real {int(counts.sum())})')

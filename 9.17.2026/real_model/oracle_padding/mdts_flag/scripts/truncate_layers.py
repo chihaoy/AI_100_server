@@ -25,9 +25,9 @@ for n in reversed(list(g.node)):
 keep.reverse(); del g.node[:]; g.node.extend(keep)
 used = {x for n in g.node for x in n.input}
 for t in [t for t in g.initializer if t.name not in used]: g.initializer.remove(t)
-for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
+for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'weights_hp'):
     p = f'{src}/{link}'
-    if os.path.islink(p) and not os.path.exists(f'{out}/{link}'): os.symlink(os.path.realpath(p), f'{out}/{link}')
+    if os.path.exists(p) and not os.path.exists(f'{out}/{link}'): os.symlink(os.path.realpath(p), f'{out}/{link}')
 onnx.save(m, f'{out}/model.onnx'); _c = os.getcwd(); os.chdir(out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
 # custom IO restricted to surviving names
 names = {i.name for i in g.input} | {o.name for o in g.output}
