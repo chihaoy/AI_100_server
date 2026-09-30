@@ -78,6 +78,14 @@ An end-to-end profile at 512 tokens (E32) puts the hot stage at a quarter of eac
 into three stages of 8, 8 and 16 lanes per card with capacities T, a calibrated middle one and T/8 (E34) cuts the
 512-token model from 426 to 362 ms (−15%, bit-identical, 2.90× the production baseline) and the 256-token model by
 3.6%; at T=512 the hot stage is bound by the card's shared memory traffic, and each extra stage costs a sequential window.
+Using the cores that wait during the eight-lane tiers (E35) does not work: splitting each top expert over two lanes keeps
+the tier on 8 cores per card and doubles its dequantization (+6% on two layers), and without depth-first scheduling the
+stages still run one after another (+1%). The full ladder (E36) takes the 48-layer model from 494.6 / 505.3 / 1049.1 ms
+(production) to 122.2 / 206.2 / 356.3 ms at T = 128 / 256 / 512, 4.05× / 2.45× / 2.94×; in that order the reductions give
+2.06–2.37× and the padding work after them 1.06–1.38×. Against a naive T/T baseline with the same compile (E37: the flag,
+head-parallel attention, the export's own combine, every expert at capacity T), the reductions alone give 2.06–2.38×, the
+padding work alone at most 1.05× (0.69–0.85× with three tiers, which need one dense accumulator per tier width), and both
+together 2.18–3.27×: the padding work pays only after the reductions.
 
 ## 1. What the flag does
 
@@ -2058,6 +2066,140 @@ the extra stage's fixed window eats most of the saving. The next lever is the ha
 the eight-lane tiers (splitting each top expert over two lanes of that tier). The four 48-layer programs were deleted
 after timing (88 GB each).
 
+## 3.31 Using the idle cores of the eight-lane tiers (E35)
+
+In the E34 profiles each eight-lane tier runs on 8 cores per card while the other 8 wait. Two ways to use them, on
+two-layer cuts at T=512 (`scripts/run_e35.sh`, `tiers/e35_idle_cores.txt`), one session, host tool, 2026-09-27:
+
+- **Split the top tier**: `--tiers 8x512s2,8x128,16x64`, each top expert over two adjacent lanes of 256 rows, so the tier
+  has 16 lanes per card (the lane split of 3.16, confined to that tier; the `s<S>` spec of `build_full_tiered.py`).
+- **Compile without `-aic-enable-depth-first`**, in case the compiler then overlaps tiers that share no data.
+
+| Two layers, T=512, host median | depth-first (default) | without depth-first |
+|---|---:|---:|
+| Runtime sort 16×512 + 16×64 | 18.582 / 18.704 ms | 18.835 ms |
+| 3 tiers (E34) | 15.832 / 16.098 ms | 16.137 ms |
+| 3 tiers, top tier split over two lanes | 16.993 ms | 17.249 ms |
+
+All five layouts give bit-identical logits (the same experts compute the same tokens). The split is 6% slower and dropping
+depth-first costs 1–1.5% in every layout. Profiles of layer 1 (`full_model/kvtest/prof_e34_512_tier3`,
+`prof_e35_tier3s_df`, `prof_e35_tier3_nodf`):
+
+| Layer 1, T=512 | Stages in execution order, GEMM window | Top tier: cores with HMX per card, HMX / dequantize core-ms |
+|---|---|---|
+| 3 tiers | 16×64 0.59 ms, 8×512 0.79, 8×128 0.65 | 8, 12.3 / 6.6 |
+| top tier split | 16×256 lanes 0.83 ms, 8×128 0.52, 16×64 0.72 | 8, 18.6 / 11.9 |
+| 3 tiers, no depth-first | 16×64 0.58 ms, 8×512 0.81, 8×128 0.47 | 8, 12.3 / 6.7 |
+
+- The split tier stays on 8 cores per card: the compiler puts two lanes on each core instead of spreading them. Each of an
+  expert's two lanes gathers and dequantizes the whole bank, so dequantize time rises 1.8× and HMX time 1.5× in the same
+  window, and the compiler moves the cold tier last, so the expert stages end about 1 ms later.
+- Without depth-first the stage order and windows are unchanged: the stages still run one after another.
+
+Neither variant is kept.
+
+## 3.32 The full ladder at 128, 256 and 512 tokens (E36)
+
+Seven 48-layer programs per chunk length, each adding one step to the one before it, KV retained, MXFP6, the held-out
+prompts of 3.25/3.26 (`scripts/run_e36.sh`, `scripts/e36_summary.py`, `ladder/e36_full_ladder.txt`,
+`full_model/e36/e36_ladder.json`), 2026-09-27. Per T two batches: steps 1–5 (static programs, 25 GB each) and steps 6–7
+(gathered weights, 88 GB each, the tile sizes of 3.26); steps 4 and 5 run in both batches, and batch B is expressed in
+batch A's terms through step 5 (the two batches agree on it within 0.13%). Rounds agree within 0.6%.
+
+| Step | T=128 | T=256 | T=512 |
+|---|---:|---:|---:|
+| 1 production | 494.6 ms | 505.3 ms | 1049.1 ms |
+| 2 + flag, head-parallel attention (naive T/T) | 267.1 ms (−46.0%) | 568.6 ms (+12.5%) | 1164.1 ms (+11.0%) |
+| 3 + stack rewrites | 158.4 ms (−40.7%) | 355.9 ms (−37.4%) | 729.1 ms (−37.4%) |
+| 4 + token-owned combine | 131.7 ms (−16.9%) | 258.9 ms (−27.3%) | 498.4 ms (−31.6%) |
+| 5 + elementwise final sum | 129.5 ms (−1.6%) | 252.1 ms (−2.6%) | 491.1 ms (−1.5%) |
+| 6 + runtime sort hot/cold | 126.3 ms (−2.5%) | 215.2 ms (−14.6%) | 421.6 ms (−14.2%) |
+| 7 + 3 tiers | 122.2 ms (−3.2%) | 206.2 ms (−4.2%) | 356.3 ms (−15.5%) |
+| Steps 3–5, reductions | 2.06× | 2.26× | 2.37× |
+| Steps 6–7, padding after the reductions | 1.06× | 1.22× | 1.38× |
+| Final vs step 2 (naive T/T) | 2.19× | 2.76× | 3.27× |
+| Final vs production | 4.05× | 2.45× | 2.94× |
+
+- **Tokens per second**, production against the final program: 259 → 1047, 507 → 1241, 488 → 1437. Per token the final
+  program falls from 0.95 to 0.70 ms between T=128 and 512; step 4 stays at 0.97–1.03 ms and step 2 rises from 2.09 to
+  2.27 ms.
+- **Accuracy**, logits relative L2 against FP32 at T = 128 / 256 / 512: production 0.188 / 0.089 / 0.095, steps 2–3
+  0.172 / 0.077 / 0.094, step 4 0.172 / 0.073 / 0.092, step 5 0.190 / 0.077 / 0.095, steps 6–7 0.170 / 0.087 / 0.088. The
+  next token matches the reference everywhere except the 256-token near tie (3.25), which production and steps 6–7 flip.
+  Step 7 is bit-identical to step 6.
+- **Capacities**: no lane exceeded its capacity; the three tiers peaked at 122/128, 20/48, 8/16 (T=128), 251/256, 36/64,
+  17/32 (T=256) and 508/512, 83/128, 37/64 (T=512).
+- At 256 and 512 tokens step 2 is slower than production: its combine grows with T until steps 3–5 replace it.
+
+Only step 4 is kept per T as an anchor (`qpc_full_naive_to_flag`, `qpc256_…`, `qpc512_…`) together with the 128-token
+production program; the others were deleted after timing.
+
+## 3.33 Reductions and padding alone and together: the 2×2 ablation (E37)
+
+The ladder adds the reductions before the padding, so it cannot say what each gives alone. E37 starts both from step 2,
+naive T/T (the export's combine, every expert at capacity T, compiled with the flag and head-parallel attention like
+every later step), and adds the missing corner: the padding work on the export's combine. 2026-09-30.
+
+**Builder.** `scripts/build_full_tiered.py --combine dense` feeds the tiers into the export's combine instead of the
+token-owned one; its input is the export itself (`native_c128`, no rewrites). The export's `CtxScatter3D` writes each
+stage into a zeroed `[64, T, 2048]` accumulator whose lane count must equal the stage's; stage 0 first reads the zeros back
+(the zero read of 3.10) and stage 1 read-modify-writes the same buffer. With tiers, consecutive tiers of equal lane count
+share one accumulator the same way, each group is summed over its lanes by the export's un-tiled `Einsum 'dpth->dth'`, the
+groups' partials are added and `Einsum_4` sums the cards. The two-tier sort (16×T + 16×T/8) is one group, the export's
+exact structure with sorted lanes; the three tiers need two accumulators (32 and 64 lanes). The default mode still
+rebuilds the timed E34 graph byte for byte.
+
+**Two layers, T=512** (`scripts/run_e37a.sh`, `full_model/e37/e37a_two_layer.txt`), one session, each program twice in
+mirrored order:
+
+| Two layers, T=512 | Reduction | Padding | Host median | vs N | rel L2 vs FP32 |
+|---|---|---|---:|---:|---:|
+| N | export | T/T | 50.35 ms | 1.00× | 0.0525 |
+| R | ours (token-owned, Einsum final) | T/T | 21.93 ms | 2.30× | 0.0525 |
+| P2 | export | rank sort 16×512 + 16×64 | 47.10 ms | 1.07× | 0.0524 |
+| P | export | 3 tiers | 58.74 ms | 0.86× | 0.0523 |
+| D | ours | 3 tiers | 15.95 ms | 3.16× | 0.0524 |
+
+Same argmax everywhere; reruns bit-identical; the programs differ from one another by 4·10⁻⁴ to 1.5·10⁻³.
+
+**Full model** (`scripts/run_e37b.sh`, `scripts/e37_summary.py`, `full_model/e37/e37b_full_model.txt`, `e37_summary.txt`,
+`e37_ablation.json`), 48 layers, KV retained. Per T one session with N, R, P and D, each timed twice in mirrored order,
+plus the kept step-4 program of E36 as a cross-session anchor (131.7 / 259.4 / 497.4 ms against 131.5–131.8 /
+258.5–259.3 / 495.8–499.6 in E36); then a second session with N, P2 and P, P2 expressed in session-1 terms through N and
+P (both within 0.2% of session 1). R is E36's step 5, D its step 7, gathered-weight programs with the E36 tile sizes.
+
+| Cell | Reduction | Padding | T=128 | T=256 | T=512 |
+|---|---|---|---:|---:|---:|
+| N, naive T/T | export | T/T | 267.3 ms | 569.9 ms | 1162.2 ms |
+| R | ours | T/T | 129.6 ms | 253.2 ms | 488.7 ms |
+| P2 | export | rank sort | 267.4 ms | 551.3 ms | 1110.3 ms |
+| P | export | rank sort + 3 tiers | 388.4 ms | 669.7 ms | 1379.3 ms |
+| D | ours | rank sort + 3 tiers | 122.6 ms | 206.8 ms | 355.8 ms |
+| Reductions alone, N/R | | | 2.06× | 2.25× | 2.38× |
+| Rank sort alone, N/P2 | | | 1.00× | 1.03× | 1.05× |
+| Rank sort and tiers alone, N/P | | | 0.69× | 0.85× | 0.84× |
+| Padding after the reductions, R/D | | | 1.06× | 1.22× | 1.37× |
+| Both, N/D | | | 2.18× | 2.76× | 3.27× |
+
+No lane exceeded its capacity in any program (P and D: the tier maxima of 3.32; P2 122/128, 8/16; 251/256, 17/32;
+508/512, 37/64). Every logits error stays at the MXFP6 level (0.077–0.193) and the next token matches the reference
+except at the 256-token near tie, which the rank-sorted programs D and P2 flip; reruns are bit-identical and the programs differ from one another by 0.9–3.8%, the fp16-order band of 3.25.
+
+- **The reductions pay on their own; the padding work does not.** The padding steps shorten only the expert stages. After
+  the reductions they save 2.8 ms per layer at T=512, 27% of a 10.2 ms layer; the same saving would be 11% of the 24.2 ms
+  naive layer, most of which is the dense combine (68% of a layer at T=512 in 3.8), which scales with lanes × T whatever
+  the capacities. The rank sort alone measures 1.00 / 1.03 / 1.05×.
+- **Tiers cost accumulators under the export's combine.** P − P2, the third tier, is +2.5 / +2.5 / +5.6 ms per layer at
+  T = 128 / 256 / 512: a second zero-filled accumulator and a second un-tiled lane reduction, which the export runs
+  through DRAM on one core per card (1.72 ms for one at T=128 in FP16, 3.2). At T=128 this is the whole penalty of P, since P2
+  equals N there. Not profiled. In the token-owned combine a tier adds one small gather per token, so the tiers pay there.
+- **So the order matters.** The padding work gives at most 1.05× alone and 1.06–1.37× after the reductions; the reductions
+  are a prerequisite for it, not a gain that stacks independently.
+
+The padding-only three-tier programs are this port of the export's combine to tiers, which is what costs the second
+accumulator; P2 keeps the export's single accumulator and is the fair padding-alone number. All E37 programs were deleted
+after timing.
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -2114,6 +2256,9 @@ after timing (88 GB each).
 - E34's tier capacities rest on the calibration chunks of E28/E29 with 1.28× headroom; a prompt that exceeds a tier's
   capacity would drop assignments. The stage order and the cores per stage are the compiler's choice. Tiers were not
   tried at T=128, where the hot stage sits at its floor. E32 is one instrumented sample of one prompt.
+- E35 measures two-layer cuts at T=512 only. E36 and E37 time one prompt per chunk length, the first chunk only. E37's
+  padding-only three-tier programs rest on one port of the export's combine to tiers (one accumulator per tier width);
+  the cost of that second accumulator is inferred from P − P2, not profiled.
 
 ## 5. Reproduction
 
@@ -2196,3 +2341,10 @@ cross-card bytes, per-SoC hot stage); E33: `scripts/headpar_graph.py <src> <out>
 --tiers <lanes>x<capacity>,... [--final ...] [--placement <npy>]`, then `headpar_graph.py` and `truncate_layers.py`;
 drivers `scripts/run_e34a.sh` (two-layer timing and the 4-tier profile), `run_e34b.sh` (48 layers at T=512 and the 3-tier
 profile), `run_e34c.sh` (48 layers at T=256). The 3-tier 48-layer programs compile in 18–20 minutes.
+E35: `scripts/build_full_tiered.py <stack dir> <out> --T 512 --tiers 8x512s2,8x128,16x64` (then `headpar_graph.py` and
+`truncate_layers.py ... 2`), `scripts/run_e35.sh` (compiles with and without `-aic-enable-depth-first`, timing, two
+profiles). E36: `scripts/run_e36.sh` (seven programs per T in two batches, capacity checks), `scripts/e36_summary.py <e36
+dir>`. E37: `scripts/build_full_tiered.py native_c128 <out> --T <T> --tiers <spec> --combine dense`, then
+`headpar_graph.py` (link `weights_hp` to `native_c128_hp/weights_hp`); `scripts/run_e37a.sh` (two-layer 2×2 at T=512,
+builds its cuts), `scripts/run_e37b.sh` (48 layers, two sessions per T; `E37_TS="512"` restricts the chunk lengths),
+`scripts/e37_summary.py <e37 dir>`. Static programs compile in 6–12 minutes, gathered-weight ones in 8–23.
