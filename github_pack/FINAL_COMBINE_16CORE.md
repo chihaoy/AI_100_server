@@ -1,27 +1,27 @@
-# Final cross-card sum on 16 cores: method, results, and comparison with the original design
+# Final cross-card sum on 16 cores: the elementwise combine (addtree) versus the original design
 
-Date 2026-09-26. Four AI 100 cards (16 cores each), SDK 1.21.6, Qwen3-30B-A3B layer-2 replay, MXFP6 expert weights,
-`-mdts-mos=1`, prompt-41 routing (synthetic routing at T=256/512), hot/cold placement with oracle capacities
+Date 2026-09-26, updated 2026-09-27. Four AI 100 cards (16 cores each), SDK 1.21.6, Qwen3-30B-A3B layer-2 replay, MXFP6 expert
+weights, `-mdts-mos=1`, prompt-41 routing (synthetic routing at T=256/512), hot/cold placement with oracle capacities
 (T=128: 92/2, T=256: 158/4, T=512: 296/32). The starting point is the token-owned combine, the final design of Section 3.13
-of the original mdts_flag README. Scripts, graphs and profiles live in `/home/chihao/testing`.
+of the original mdts_flag README. Scripts, graphs and profiles live in `/home/chihao/testing`. This note keeps only the design
+that was adopted; the variants tried on the way are in the experiment logs, not here.
 
 ## 1. Summary
 
 - The tail of the token-owned design (what card 0 still does after cards 1-3 have finished, 1.23 ms at T=512) is not the
   cross-card transfer but **compute: 16 reduction tiles executed serially on 4 cores of card 0** (1.03 ms). The 6 MiB
   transfer (0.53 ms) is hidden underneath it.
-- Rewriting the final sum as elementwise Adds split along the token axis lets the compiler spread it over all 16 cores of
-  card 0; the add drops from 1.03 ms to 8 us. Single-layer host latency at T=512 goes from 5.57 ms to 4.91 ms (**-12%**);
-  the tail from 1.23 to 0.71 ms.
+- Rewriting the final sum as elementwise Adds split along the token axis (addtree) lets the compiler spread it over all
+  16 cores of card 0; the add drops from 1.03 ms to 8 us. Single-layer host latency at T=512 goes from 5.57 ms to 4.91 ms
+  (**-12%**); the tail from 1.23 to 0.71 ms.
+- In the full model (48 layers, head-parallel attention, KV retained on device, flag, T=128 first chunk) the same rewrite in
+  every layer takes the prefill from 147.3 / 147.0 ms to 132.9 / 133.2 ms (**-9.7%**), with the logits no worse
+  (relative L2 to the reference 0.1724 -> 0.1682, same next token).
 - With the add gone, the floor of the tail is the link: 6 / 3 / 1.5 MiB take 0.53 / 0.25 / 0.125 ms (T=512/256/128),
-  about **12 GB/s**, exactly proportional to bytes. This is the only cost left in the combine; shrinking it further needs
-  fewer bytes or a different topology.
-- Side effect: card 0's hot stage becomes about 0.4 ms slower (T=512), eating roughly half of the gain. The evidence points
-  at the 6 MiB P2P landing buffer being statically resident in card 0's TCM. Four variants that reduce residency did not
-  remove it; sending the hot-stage partial early (stagesplit) does, but doubles the bytes and stalls card 0's cold stage,
-  so it is worse overall.
-
-**Update 2026-09-27 (Section 12):** every path to the hot-stage side effect was tried; only "fewer hot experts on card 0" removes it on the profile, but on the production build the effect is mostly an occasional jitter invisible on the host clock; with the elementwise final sum in all 48 layers of the full model, the T=128 first chunk goes from 147.3 / 147.0 ms to 132.9 / 133.2 ms (-9.7%) with logits no worse.
+  about **12 GB/s**, exactly proportional to bytes. This is the only cost left in the combine.
+- Side effect: under per-op tracing card 0's hot stage grows from 1.99 to 2.42 ms at T=512. On the production build this is
+  an occasional jitter of about 0.1 ms on average, and the host clock shows the full tail gain, so the adopted design needs
+  no fix for it (Section 5).
 
 ## 2. What the original tail actually does
 
@@ -59,30 +59,25 @@ out = (p0 + p1) + (p2 + p3)               # elementwise Adds
 ```
 
 The compiler partitions an elementwise Add by rows: the 16 cores of card 0 each add their own 32 rows, with no
-dependency or multicast between cores (op inventory: 48 `elementadd` ops on all 16 cores of card 0). The parallel axis
-changes from "source card" (4 -> 4 cores) to "token row" (512 -> 16 cores), which is the same form the per-card local
-reduction (green in the figures) already used.
+dependency or multicast between cores (op inventory: 48 `elementadd` ops on all 16 cores of card 0, nothing else). The
+parallel axis changes from "source card" (4 -> 4 cores) to "token row" (512 -> 16 cores), which is the same form the
+per-card local reduction (green in the figures) already used. Nothing before the final sum is touched.
 
-Other forms tried: a variadic `Sum` and `Transpose + ReduceSum` both fall back to the 4-core `aicbatchedreduceadd` plus
-a DDR reduce, so they do not help.
-
-## 4. Results
+## 4. Results, single layer
 
 ### 4.1 Latency (T=512, one session, 3 alternating rounds x 100, host median)
 
-| Build | Host ms | vs token-owned | Device ms (3 samples) | Card-0 tail |
+| Build | Host ms | vs token-owned | Device ms (3 traced samples) | Card-0 tail |
 |---|---:|---:|---|---:|
 | anchor, dense combine (README 3.8) | 9.735 | | | |
 | token-owned (README 3.13) | 5.573 | - | 4.38 / 4.36 / 4.34 | 1.23 ms |
 | **addtree (this note)** | **4.912** | **-12%** | 4.38 / 4.29 / 4.11 | 0.71 ms |
-| tileadd, 16 elementwise tiles | 5.140 | -8% | 4.31 / 4.15 / 4.21 | 0.67 ms |
-| addtree + fp16 partials | 5.192 | -7% | 4.35 / 4.32 / 4.01 | 0.71 ms |
 
-Uninstrumented, the SDK runner's per-iteration total over 40 iterations is 5.90 ms (token-owned), 5.39 (addtree),
-5.22 (tileadd), consistent with the host timing. Outputs differ from the anchor by a relative L2 of 3.5e-4 (fp16
-elementwise adds in a different association), against 1.3e-5 for token-owned.
+Uninstrumented, the SDK runner's per-iteration total over 40 iterations is 5.90 ms (token-owned) and 5.39 ms (addtree),
+consistent with the host timing. Three later sessions gave the same gain: 0.43, 0.46 and 0.45 ms. Outputs differ from the
+anchor by a relative L2 of 3.5e-4 (fp16 elementwise adds in a different association), against 1.3e-5 for token-owned.
 
-### 4.2 Tail breakdown (device, median sample)
+### 4.2 Tail breakdown (device, median traced sample)
 
 | T | Partial bytes | Idle gap before the add (link) | Add | Output write | Tail: token-owned -> addtree |
 |---:|---:|---:|---:|---:|---|
@@ -104,15 +99,17 @@ purple weight DMA, brown dequantize, pink gathers and index build, green local r
 - Top, right end of card 0: four long red bars on cores 0-3 from 3.15 to 4.16 ms; the other 12 cores wait in grey.
 - Bottom, right end of card 0: one small red dot per row (4.11 ms, 8 us). Left of the dots, 3.59-4.11 ms, all four cards
   are grey: that is the 6 MiB on the link.
-- Bottom, card 0's hot stage (blue) is about 0.4 ms longer than on top (1.99 -> 2.42 ms); the other three cards are
-  unchanged. Consequently the pink index build and the orange cold stage shift right by 0.45 ms, and cards 1-3 finish at
-  3.58 instead of 3.14.
+- Bottom, card 0's hot stage (blue) is about 0.4 ms longer than on top (1.99 -> 2.42 ms) in this traced run; the other
+  three cards are unchanged. Consequently the pink index build and the orange cold stage shift right by 0.45 ms, and
+  cards 1-3 finish at 3.58 instead of 3.14. Section 5 shows this shift is mostly an artifact of trace collection.
 
-Single figures: [T512_tokenowned_cores.png](figures/T512_tokenowned_cores.png),
-[T512_fc_addtree_cores.png](figures/T512_fc_addtree_cores.png), [T512_fc_tileadd_cores.png](figures/T512_fc_tileadd_cores.png),
-[T512_fc_stagesplit_cores.png](figures/T512_fc_stagesplit_cores.png).
+The addtree run alone, median traced sample:
 
-## 5. Side effect: card 0's hot stage slows down
+![addtree, T=512, per-core timeline](figures/T512_fc_addtree_cores.png)
+
+## 5. Side effect on card 0's hot stage, and what it costs on the production clock
+
+What the traced profile shows (T=512):
 
 | Observation | Data |
 |---|---|
@@ -120,406 +117,71 @@ Single figures: [T512_tokenowned_cores.png](figures/T512_tokenowned_cores.png),
 | Every op uniformly slower | GEMM 21.7 -> 49.8 us per event, dequantize 12.2 -> 21.6 us; HMX waits on weights double; cards 1-3 unchanged |
 | Grows with T | hot-stage end shift: T=128 about 0, T=256 about +0.1 ms, T=512 +0.3 to +0.5 ms; partials are 1.5 / 3 / 6 MiB |
 
-Variants tried to remove it (T=512, device, median sample; `scripts/fc_compare.py`):
-
-| Variant | Device | Card-0 hot end | Card-0 tail | Outcome |
-|---|---:|---:|---:|---|
-| addtree | 4.29 | 2.42 | 0.71 | baseline |
-| rev, (p3+p2)+(p1+p0) | 4.25 | 2.37 | 0.70 | compiler still roots on card 0; no change |
-| tileadd, 32 tiles | 4.39 | 2.56 | 0.66 | no change |
-| half, two halves | 4.46 | 2.57 | 0.71 | no change |
-| stagesplit, hot-stage partial sent early | 4.50 | **2.06** | 0.71 | hot stage recovers, but 12 MiB cross-card and card 0's cold stage is pushed to 3.27 ms; worse overall |
-
-Interpretation: P2P landing buffers are allocated statically; the senders write straight into fixed TCM addresses on
-card 0, so the region is reserved for the whole layer. The original design runs its 16 tiles serially and needs one
-384 KiB landing buffer reused 16 times; the elementwise forms make all tiles runnable at once, so the whole 6 MiB is
-resident and each core loses about 384 KiB of TCM, which shortens the hot stage's weight prefetch. Splitting into 32 tiles
-or two halves does not change "everything lands at once", so it does not help; stagesplit needs 12 MiB, more than the
-compiler puts in TCM, so it goes through DDR and the hot stage recovers, at the price of DDR contention during the cold
-stage. This is inferred from the traces; the compiler's allocation table is not visible.
-A testable fix: 16 elementwise tiles with an explicit data dependency between consecutive tiles, so the compiler goes
-back to one landing buffer reused 16 times while keeping the 16-core add; expected hot stage back at 1.99 ms, tail
-unchanged, layer gain from -12% to about -20%.
-
-## 6. What is left
-
-After the change, a T=512 layer (about 4.2 ms device) consists of: hot stage about 2.1 ms (including the 0.4 ms side
-effect), inter-stage index exchange about 0.5, cold stage about 0.5, per-card local reduction 0.05, **cross-card
-transfer 0.53**, add 0.01, output write 0.17. The transfer is the only item left in the combine, 12% of the layer, and
-only three things can reduce it:
-
-1. Fewer bytes: send only the rows of tokens that touched the card. With the current placements a token touches 3.8 cards
-   on average, so this saves only 7% (39% on the sorted layout, which is 0.7 ms slower under the flag); it has to be
-   designed together with placement and traded against balance.
-2. Overlap: send the hot-stage partial early. stagesplit shows the receiving card pays for the transfer during its cold
-   stage, so this only pays if the cold-stage share is sparse and small.
-3. Topology: each card receives a quarter of the tokens (reduce-scatter), 1.5 MiB and about 0.13 ms per card. Both the
-   original README (3.14) and this round saw the compiler collapse it back onto card 0; it needs compiler support.
-
-## 7. Attempts to remove the hot-stage side effect (2026-09-26, afternoon)
-
-Every untested item of the table in Section 5 was tried (T=512, device, median sample; `scripts/fc_compare.py`):
-
-| Method | Form | Card-0 hot end | Card-0 tail | Device | Outcome |
-|---|---|---:|---:|---:|---|
-| Chained 16 tiles (chain) | 16 elementwise tiles, tile k+1's input adds row 0 of tile k's output times 1e-5 x 1e-5 | 2.56 | 0.67 | 4.40 | adds run strictly at the link cadence (34 us per tile), tail as expected; hot stage still slow, so "landing-buffer reuse" is not the cause |
-| Compiler option `-vtcm-working-set-limit-ratio` 0.5 / 0.25 / 0.1 | addtree graph unchanged, option only | 2.39 / 2.46 / 2.39 | 0.71 | 4.29 / 4.33 / 4.26 | op inventory identical to no option; no effect |
-| Hierarchical tree (tree) | 16 Einsum tiles over lanes 0+1, 16 over lanes 2+3, then an elementwise add | 1.98 | 2.41 | 5.54 | compiler puts both Einsum chains on cores 0-1 of card 0, serial (1.5 ms busy each), tail doubles; hot stage normal |
-| Four-root reduce-scatter (quarters) | four independent addtrees on quarter row ranges, operands rotated per card | 2.49 | 0.68 | 4.33 | all elementadds still on card 0; operand order is ignored |
-| Send only nonzero rows | not expressible in a static graph (rows per card vary with the input); with the current hot/cold placement a token touches 3.8 cards on average, at most 7% fewer bytes | - | - | - | arithmetic only, no experiment |
-
-Pattern: Einsum-based forms (the collective-reduction template) keep the landing buffer small and reused and leave the hot
-stage alone, but the template uses 2-4 cores serially; elementwise forms run on 16 cores, but the compiler statically
-allocates every slice, partial sum and output in card 0's TCM, costing the hot stage 0.4 ms, and neither ordering
-constraints (chain), smaller pieces (32 tiles, halves) nor the compiler option change that allocation. Every attempt to
-move the root off card 0 (tree, quarters, rev, the README's reduce-scatter) is folded back onto card 0.
-
-Status: addtree remains the best usable variant (-12% host latency). Getting both the parallel add and an unaffected hot
-stage needs a compiler-side way to place reduction inputs in DDR or reuse intermediate buffers; no graph-level expression
-is left to try.
-
-Figures (T=512; rev and vtcm 0.1 show the median-device-time sample, the others sample 1): `figures/T512_fc_chain_cores.png`, `figures/T512_fc_tree_cores.png`, `figures/T512_fc_quarters_cores.png`,
-`figures/T512_fc_addtree_vtcm0.5_cores.png`, `figures/T512_fc_addtree_vtcm0.25_cores.png`, `figures/T512_fc_addtree_vtcm0.1_cores.png`,
-plus the earlier `T512_fc_rev/half/tileadd32/stagesplit_cores.png`.
-
-## 8. The five variants kept: what each optimizes and what to look for (T=512; each figure shows the sample with the median device time, matching the numbers in the table)
-
-Reading: x axis in ms, four panels are the four cards, one row per core; red is the final sum on card 0, blue the hot stage, grey waits.
-
-| Variant | Device ms | Host ms | In one line |
-|---|---:|---:|---|
-| token-owned | 4.36 | 5.57 | original, 4-core serial add |
-| addtree | 4.29 | 4.91 | elementwise add on 16 cores, best |
-| tileadd | 4.21 | 5.14 | 16 elementwise tiles, tied with addtree |
-| rev | 4.25 | - | reversed operand order, root unchanged, no effect |
-| vtcm 0.1 | 4.26 | - | compiler option, no effect |
-
-### token-owned (original design, device 4.36 ms)
-
-**What it does.** The final design of README 3.13: each core finds its tokens' eight rows with a TopK and sums them locally (green), then the four per-card partial sums travel to card 0 and are summed over the card axis by 16 Einsum tiles.
-
-**What to look at.** Card 0, right end: four long red bars on cores 0-3 from 3.15 to 4.16 ms. The compiler lowers each Einsum to the template "three cores add one share each, merge on core 0"; all 16 tiles share those 4 cores and run one after another while the other 12 cores wait in grey. The hot stage (blue) ends at 1.99 ms, unaffected. Tail 1.23 ms, of which 1.03 ms is this serial compute; the 6 MiB transfer is hidden underneath.
-
-![token-owned (original design, device 4.36 ms)](figures/T512_tokenowned_cores.png)
-
-### addtree (device 4.29 ms, host 4.91 ms, -12%)
-
-**What it does.** Rewrites the final sum from "an Einsum over the card axis" into elementwise adds: slice the four [T, 2048] partials by card, then compute (p0+p1)+(p2+p3). The compiler partitions an elementwise add by rows, so the 16 cores of card 0 each add their own 32 rows with no dependency or multicast between cores.
-
-**What to look at.** The red becomes one dot per row (4.11 ms, 8 us in total). Left of the dots, 3.59-4.11 ms, all four cards are grey with no op at all: that 0.53 ms is the 6 MiB of partial sums on the link (about 12 GB/s), previously hidden under the red bars and now the floor of the tail. Side effect: card 0's blue hot stage stretches to 2.42 ms, 0.4 ms longer, because the elementwise form makes the compiler place the slices, intermediate sums and output (about 14 MiB) statically in card 0's TCM, squeezing the hot stage's weight prefetch; the other cards are unaffected but wait for card 0, so the cold stage shifts right. Tail 0.71 ms (0.53 transfer + 0.17 output write).
-
-![addtree (device 4.29 ms, host 4.91 ms, -12%)](figures/T512_fc_addtree_cores.png)
-
-### tileadd (device 4.21 ms, host 5.14 ms, -8%)
-
-**What it does.** Same idea as addtree, but the 512 rows are cut into 16 pieces, each computing (p0+p1)+(p2+p3) on its own, followed by a Concat, hoping the smaller per-piece buffers give the compiler a chance to reuse them.
-
-**What to look at.** Almost identical to addtree: 16-core red dots, the link blank before them, the stretched hot stage (2.39 ms). Cutting into pieces does not reduce the intermediates materialized at once. Device time is slightly better than addtree over three samples, host latency slightly worse; the two are tied within the spread.
-
-![tileadd (device 4.21 ms, host 5.14 ms, -8%)](figures/T512_fc_tileadd_cores.png)
-
-### rev (device 4.25 ms)
-
-**What it does.** addtree with the operand order reversed, (p3+p2)+(p1+p0), probing whether the compiler roots the reduction on the card of the first operand (card 3) so that card 0 need not hold all the buffers.
-
-**What to look at.** No difference from addtree: the red dots are still on the 16 cores of card 0, the hot stage is still stretched (2.37 ms), the link blank is still there. The compiler ignores operand order; the root is always card 0. Its value is ruling out "change the order to move the root".
-
-![rev (device 4.25 ms)](figures/T512_fc_rev_cores.png)
-
-### vtcm 0.1 (device 4.26 ms)
-
-**What it does.** The addtree graph unchanged, compiled with `-vtcm-working-set-limit-ratio=0.1`, which limits the share of fast memory a single op may use, hoping to push the add's inputs to DDR and free the TCM the hot stage needs.
-
-**What to look at.** Same as addtree: the hot stage still ends at 2.39 ms, tail 0.71 ms. The compile-time op inventory is identical to the build without the option; the option does not govern the placement of these buffers. The values 0.5 and 0.25 are equally ineffective.
-
-![vtcm 0.1 (device 4.26 ms)](figures/T512_fc_addtree_vtcm0.1_cores.png)
-
-## 9. Every method in detail
-
-All methods start from the same point: the token-owned graph (3.13), where each card's local reduction produces `to_partials`
-of shape [4, T, 2048] with axis 0 = card. Only the step "add the four into one" is changed; everything else is untouched.
-Compiler behaviour comes from the QPC op inventory (`scripts/fc_inventory.py`), times from the instrumented profiles
-(`profile/F_T512_fc_*`, median sample) and same-session host timing (`timing/S11b_fc*.json`, `timing/S12_chain*.json`).
-
-### 9.1 token-owned (original)
-
-- Graph: `to_partials` cut into 16 token tiles, each an `Einsum('dth->th')`, then Concat to [T, 2048].
-- Compiler: each Einsum is a "sum over the card axis" and gets the cross-card collective template: the three incoming shares land
-  on cores 1, 2, 3 of card 0, each does one reduce-add, multicasts to core 0, which does two more. The template always uses these
-  4 cores; all 16 tiles share core 0 as the merge point.
-- Profile: the 16 tiles run back to back from 3.135 to 4.162 ms, 73 us each; cores 1-3 are busy only 36 us per tile and then wait
-  for core 0; the other 12 cores wait throughout. The partials are issued at 3.136 ms and fully present by 3.67 ms; the later
-  tiles run on data already there. Hot stage ends at 1.99 ms.
-- Conclusion: of the 1.23 ms tail, 1.03 ms is serial compute with the transfer hidden beneath. Device 4.36, host 5.57 ms.
-
-### 9.2 addtree (best)
-
-- Graph: `p_c = Squeeze(Slice(to_partials, c))`, `out = (p0 + p1) + (p2 + p3)`, three elementwise Adds.
-- Compiler: an elementwise Add is not a collective; it is split by rows over cores: 48 `elementadd` ops (3 Adds x 16 cores), all
-  on card 0, no multicast; the inputs arrive by three P2P sends of 2 MiB each.
-- Profile: the adds take 4.114-4.122 ms, 8 us in total. Before them, 3.59-4.11 ms, all four cards are idle: the 6 MiB transfer.
-  Card 0's hot stage ends at 2.42 ms (was 1.99): every op uniformly about twice as slow with unchanged structure, weight-DMA waits
-  doubled; cards 1-3's hot stages unchanged, but their cold stage shifts 0.45 ms later behind card 0.
-- Conclusion: tail 0.71 ms (0.53 link + 0.17 output write), hot stage pays 0.4 ms; device 4.29, host 4.91 ms (-12%).
-
-### 9.3 tileadd (16 tiles) and tileadd32 (32 tiles)
-
-- Graph: 16 (or 32) token tiles, each (p0+p1)+(p2+p3), then Concat.
-- Compiler: each tile's Adds are still row-split: 768 (or 1536) elementadds, all on card 0; with 32 tiles the sending cards
-  (1-3) gain 32 `aiccopysamevtcm2d` slice copies each, with 16 tiles none.
-- Profile: same shape as addtree: 16-core red dots, link blank, hot stage 2.39 / 2.56 ms.
-- Conclusion: tiling does not reduce the intermediates materialized at once; the side effect is unchanged. 16 tiles: device 4.21,
-  host 5.14 (-8%); 32 tiles: device 4.39.
-
-### 9.4 rev (reversed operands)
-
-- Graph: `(p3 + p2) + (p1 + p0)`.
-- Compiler: inventory identical to addtree; root still card 0.
-- Conclusion: operand order does not steer placement; device 4.25, hot stage 2.37.
-
-### 9.5 half (two halves)
-
-- Graph: rows 0-255 and 256-511 as two addtrees, Concat.
-- Compiler: 96 elementadds, all on card 0.
-- Conclusion: as addtree; device 4.46, hot stage 2.57.
-
-### 9.6 addtree16 (fp16 partials)
-
-- Graph: addtree on the 3.14 `to_fp16` graph (partials cast to fp16 first).
-- Profile: P2P still 6 MiB, so the partials are already fp16 in this compiler and the Cast is a no-op; the gap is still 0.53 ms.
-- Conclusion: same bytes, same time; host 5.19 ms.
-
-### 9.7 stagesplit (hot-stage partial sent early)
-
-- Graph: the local reduction split into hot and cold parts (`to_partials_s0`, `to_partials_s1`), each with its own addtree, then
-  one more Add. The hot part can be sent as soon as the hot stage ends.
-- Compiler: two parts of 6 MiB; 112 elementadds totalling 14 MiB (addtree: 48, 6 MiB); the DDR-to-TCM `aiccopytovtcm` ops go from
-  1 (2 MiB) in addtree to 17 (4 MiB), i.e. part of the add inputs is staged through DDR.
-- Profile: hot stage back at 2.06 ms; the hot part is sent at 2.68-3.17 ms, overlapping cards 1-3's cold stage, and added on card 0
-  at 3.21 ms; but card 0's cold stage is pushed to 3.27 ms (was 2.51), the other cards wait for card 0 in the stage-1 index exchange
-  and all end near 3.8 ms; the cold part's 6 MiB then waits another 0.53 ms.
-- Conclusion: the hot stage escapes because 12 MiB exceeds what the compiler puts in TCM and goes through DDR; the price is twice
-  the bytes and a stalled cold stage on the receiving card. Device 4.50.
-
-### 9.8 chain (tile-to-tile data dependency)
-
-- Graph: 16 elementwise tiles; tile k+1's p0 first adds "row 0 of tile k's output x 1e-5 x 1e-5" (exactly 0 in fp16), a real
-  dependency.
-- Compiler: the dependency survives (480 mulsplat, 255 multicast, 240 broadcast-add ops, all on card 0); 768 elementadds still on
-  the 16 cores of card 0.
-- Profile: the tile adds start at 3.760 ms and follow every 34 us, exactly the link time for 384 KiB, so the add is fully hidden
-  under the transfer; but the hot stage ends at 2.56 ms, later than addtree.
-- Conclusion: an ordering constraint does not change the compiler's static allocation; "landing-buffer reuse" is not the cause of
-  the side effect. Device 4.40, host 5.33 ms.
-
-### 9.9 compiler option -vtcm-working-set-limit-ratio 0.5 / 0.25 / 0.1
-
-- Graph: addtree unchanged.
-- Compiler: the inventories of all three values are op-for-op identical to the build without the option.
-- Profile: hot stage 2.39 / 2.46 / 2.39 ms, device 4.29 / 4.33 / 4.26, inside addtree's sample range.
-- Conclusion: the option does not govern the placement of these buffers.
-
-### 9.10 tree (hierarchical)
-
-- Graph: `Slice(lanes 0..1)` and `Slice(lanes 2..3)`, each in 16 `Einsum('dth->th')` tiles, then an elementwise add per tile.
-- Compiler: the 96 reduce-adds (20 MiB) and 512 multicasts (11.8 MiB) of both Einsum groups are all on card 0, plus 256 per-tile
-  elementadds; nothing lands on card 2.
-- Profile: the two chains run serially on cores 0-1 of card 0, 1.5 ms busy each in 2.2 ms windows, roughly one after the other;
-  hot stage 1.98 ms, normal.
-- Conclusion: the root never leaves card 0 and the tail doubles to 2.41 ms; device 5.54, the slowest. It shows that Einsum-based
-  forms do not squeeze the hot stage.
-
-### 9.11 quarters (four-root attempt)
-
-- Graph: four independent addtrees on quarter row ranges, the q-th starting its operands from p_q.
-- Compiler: 192 elementadds, all on card 0.
-- Conclusion: root still card 0; device 4.33, hot stage 2.49.
-
-### 9.12 sum, treduce (forms not adopted)
-
-- Graph: `Sum(p0, p1, p2, p3)`; `ReduceSum(Transpose(to_partials, [1,0,2]), axis=1)`.
-- Compiler: both have the identical inventory: 4 `aicbatchedreduceadd` ops in TCM (16 MiB) plus 1 reduce-add in DDR (2 MiB), with
-  24 MiB of DDR round-trip copies; still the 4-core template, and one more pass through DDR than the original.
-- Conclusion: same family as the original or worse; not profiled.
-
-### 9.13 send only nonzero rows (not run)
-
-- In each card's partial only the rows of tokens with an expert on that card are nonzero. A static graph cannot express an
-  input-dependent row count; with the current hot/cold placement a token touches 3.8 cards on average, so at most 7% of the bytes
-  could be dropped (39% on the sorted layout, which is 0.7 ms slower under the flag). Any gain requires co-design with placement.
-
-## 10. Reproduction
-
-```
-scripts/make_final_combine.py combine/T512_hc_296_32_tokenowned combine/T512_to_fc_addtree addtree     # or tileadd [N] | rev | half | stagesplit | sum | treduce
-scripts/compile_any.sh combine/T512_to_fc_addtree F_T512_fc_addtree_mxfp6_s0_flag mxfp6 0 flag          # s70 for the instrumented build
-scripts/timing.py timing/S11b_fc_spec.json timing/S11b_fc.json 3 100                                    # same-session timing
-scripts/profile_case.sh qpc/F_T512_fc_addtree_mxfp6_s70_flag profile/F_T512_fc_addtree_mxfp6_s70_flag F_T512_fc_addtree 512 combine/T512_to_fc_addtree/input_f16.bin
-plotvenv/bin/python scripts/detail_plot2.py profile/F_T512_fc_addtree_mxfp6_s70_flag/analysis/sample1 "title" figures/x.png 0,1,2,3
-scripts/fc_compare.py                                                                                   # variant comparison table
-```
-
-Data: `timing/S11b_fc*.json` (timing), `profile/F_T*_fc_*` (traces, per-core CSVs, analysis), `inventory/F_T512_fc_*`
-(compile-time op inventories), `combine/T*_to_fc_*` (graphs).
-
-## 11. Why concentrating the results on card 0 was harmless before and hurts now
-
-Both forms concentrate the data on card 0; the difference is how the compiler allocates buffers for them.
-
-**The original form (Einsum tiles) goes through the collective-reduction template and streams.** The compiler treats each tile as
-one cross-card reduction: the three incoming pieces (128 KiB each) land in one fixed small buffer, 4 cores add them, a 128 KiB result
-is written, and the next tile reuses the same buffer. At any moment card 0's TCM holds one tile's data, about 384 KiB in and 128 KiB
-out; the 6 MiB are never resident at once. The reuse is managed inside the template; the graph does not have to express it.
-
-**The elementwise form goes through the ordinary tensor-op path and is whole-tensor.** To the compiler Slice, Squeeze and Add are
-plain tensor ops; every intermediate (the [512, 2048] slices, the two partial sums, the output) is a complete buffer with its own TCM
-address assigned at compile time and reserved for the whole layer. Four slices (8 MiB) plus sums and output (6 MiB) must coexist.
-A tile-to-tile dependency (chain) only changes the execution order, not the "one address per intermediate" allocation, so it does not
-help; neither do smaller tiles (tileadd, 32 tiles, half) nor the compiler option.
-
-**The direct evidence is the tree variant.** It also concentrates everything on card 0, as two Einsum chains, yet its hot stage is
-completely normal (1.98 ms); only its tail is longer because it is serial. Same concentration, different form, one hot stage normal
-and one squeezed: what matters is not "concentration" but "whether the compiler materializes the intermediates whole in TCM".
-stagesplit confirms it from the other side: its 12 MiB of intermediates exceed the TCM budget, go to DDR, and its hot stage is normal too.
-
-**So "putting all results on one card pressures the VTCM" can be stated more precisely:** concentration on one card is the
-precondition; the pressure itself comes from the elementwise form making the compiler place about 14 MiB of intermediates statically
-in that card's TCM at once. The original form concentrates just as much, but its template streams through one small reused buffer.
-The two forms each hold one advantage: one saves space but is serial (4 cores, 1.03 ms), the other is parallel but occupies space
-(16 cores, 8 us, 0.4 ms lost in the hot stage). The current compiler offers no expression that is both parallel and streaming, which
-is also why a reduce-scatter (each card receives a quarter: parallel and only 1.5 MiB resident) is worth pursuing on the compiler side.
-
-## 12. Second round: every path to the hot-stage side effect tried (2026-09-27)
-
-The open problem of the first round was that addtree pushes card 0's hot stage from 1.99 to 2.42 ms. This round tried every path
-listed at the end of Section 11, and looked at the same thing through three different clocks: the per-op traced profile (used by all
-figures and tables above), the runtime's own device timer (the same stats-70 QPC, no trace collection, mean of 200 runs), and the
-host latency of the production QPC (3 alternating rounds x 100 in one session). The three clocks disagree, and that disagreement is
-the most important result of the round.
-
-### 12.1 Paths and results
-
-| Path | What was done | Compiler inventory | Traced profile (median sample) | Host ms (same session) |
-|---|---|---|---|---:|
-| 1a budget `-aic-depth-first-mem` 1 / 8 / 64 / 512 | addtree graph unchanged | op-for-op identical to addtree | 4.12 / 4.21 / 4.29 / 4.14, card 0 hot end 2.25 to 2.41 | - |
-| 1b partials as a retained-state output (`addtree_rs`) | one Identity from `to_partials` to `fc_state_RetainedState` | add inputs now read from DDR (48 `aiccopytovtcm`, 6 MiB) | 5.19; P2P doubled to 12 MiB, cards 1-3 end 4.71; hot end still 2.45 | - |
-| 1c partials as a plain output (`addtree_out`) | as 1b, but returned to the host | as 1b | 5.24; P2P 12 MiB; hot end 2.51 | 7.68 (6 MiB extra host DMA) |
-| 2 fewer hot experts on card 0 (`hc0k3` / `hc0k4`) | card 0 keeps 13 / 12 active hot experts (its empty slots hold token-less experts, skipped under the flag); the 3 / 4 smallest hot experts move to the cold stage | identical to addtree (only the placement differs) | 3.79 / 3.77; card 0 hot end 1.87 / 1.70, cards 1-3 end 3.09 / 3.06; tail 0.70 | 4.94 / 4.80 |
-| 3 `-allow-mxint8-mdp-io` (both spellings) | addtree graph unchanged | identical to addtree | 4.25; P2P still 6.0 MiB, tail 0.71 | 4.93 |
-| 4 all-reduce into the next layer's lane input | see 12.3 | the compiler replicates the whole sum on all four cards | see 12.3 | full model in 12.4 |
-| 5 custom op | not attempted | - | - | - |
-| reference: token-owned / addtree | - | - | 4.36 / 4.29 | 5.32 / 4.86 |
-
-- 1a behaves like `-vtcm-working-set-limit-ratio`: all four values give op-for-op the same inventory, device times inside addtree's sample range.
-- 1b and 1c do make the add read from DDR, but the compiler then sends every partial twice (once to the output/state buffer in DDR, once to
-  the add's landing buffer in TCM): the cross-card bytes double, cards 1-3 finish 1.1 ms later, and card 0's hot stage does not recover.
-  This also refutes the first round's inference that "add inputs staged through DDR" is what keeps stagesplit's hot stage normal; that has
-  another cause, still unexplained.
-- 3: with either spelling the compiler compresses nothing (inventory, P2P bytes and tail unchanged).
-- 2 does exactly what was predicted on the traced profile: card 0's hot stage shrinks to 1.87 ms and is no longer the last one, the cold
-  stage returns to 2.4-2.9 ms, cards 1-3 finish at 3.09, device 3.79 ms, 0.50 below addtree and 0.57 below the original. But the host
-  latency does not move (4.94 / 4.80 vs 4.86).
-
-![hc0k3: card 0 holds 13 active hot experts (device 3.79 ms)](figures/T512_hc0k3_addtree_cores.png)
-
-### 12.2 The three clocks disagree: the hot-stage side effect is mostly a trace-collection phenomenon
-
-The runtime's own device timer (same stats-70 QPC, no trace collection, 200 runs, two alternating rounds):
-
-| Variant | Mean ms (two rounds) | Min | Max | Std |
+The likely mechanism: the P2P landing buffer and the intermediates of the elementwise adds (about 14 MiB at T=512) are
+allocated statically in card 0's TCM for the whole layer, which shortens the hot stage's weight prefetch. The original
+Einsum template streams through one small reused buffer and does not have this footprint. This is inferred from the
+traces; the compiler's allocation table is not visible.
+
+What the production clock shows. The runtime's own device timer on the same QPC without trace collection (200 runs, two
+alternating rounds):
+
+| Build | Mean ms (two rounds) | Min | Max | Std |
 |---|---|---:|---:|---:|
 | token-owned | 4.26 / 4.31 | 4.08 | 4.47 | 0.07 |
 | addtree | 3.90 / 3.78 | 3.44 | 4.40 | 0.18 to 0.19 |
-| tileadd | 3.87 / 3.79 | 3.51 | 4.62 | 0.19 to 0.20 |
-| hc0k3 addtree | 3.72 / 3.71 | 3.57 | 3.90 | 0.05 |
-| hc0k4 addtree | 3.68 / 3.69 | 3.49 | 3.86 | 0.05 to 0.07 |
-| stagesplit | 4.34 / 4.32 | 3.93 | 4.68 | 0.13 |
 
-- Without tracing, addtree is 0.36 to 0.53 ms faster than token-owned, close to the whole tail gain (1.23 to 0.71); the host gains of the
-  three sessions, 0.66 / 0.43 / 0.46 ms, are the same size. Neither number is possible if the hot stage really lost a steady 0.43 ms.
-- addtree without tracing: mean 3.78 to 3.90, min 3.44, max 4.40, std 0.19. It has a slow mode in which a minority of iterations take
-  4.4 ms. The three traced samples, 4.38 / 4.29 / 4.11, all fall in the slow mode: per-op trace collection triggers it reliably.
-- hc0k3 / hc0k4 remove the slow mode (max 3.9, std 0.05) and lower the mean by 0.1 to 0.15 ms; the host clock's round-to-round jitter of
-  about 0.3 ms cannot resolve that.
-- So on the production QPC the hot-stage cost of addtree is "an occasional 0.5 ms jitter, about 0.1 ms on average", not the steady
-  0.43 ms of the profile. The mechanism described in Sections 5 and 11 (elementwise intermediates materialized whole in card 0's TCM)
-  still holds; in the production build it is hidden most of the time, and trace collection turns it into the norm. Unloading card 0 is
-  the right fix for the jitter; its gain on the host clock is inside the noise.
+- Without tracing, addtree is 0.36 to 0.53 ms faster than token-owned, close to the whole tail gain (1.23 to 0.71 ms);
+  the host gains of four sessions, 0.66 / 0.43 / 0.46 / 0.45 ms, are the same size. Neither is possible if the hot stage
+  really lost a steady 0.43 ms.
+- addtree has a slow mode: a minority of iterations take up to 4.4 ms (std 0.19 against 0.07 for token-owned). The three
+  traced samples, 4.38 / 4.29 / 4.11, all fall in the slow mode: per-op trace collection triggers it reliably.
+- So on the production build the hot-stage cost of addtree is an occasional jitter of about 0.1 ms on average, not the
+  steady 0.43 ms of the profile. Judge variants on the host clock or the runtime timer; use the traced profile for
+  structure only.
 
-### 12.3 Single-layer probes: with a lane-partitioned consumer the compiler replicates the whole sum on all four cards
+## 6. Full model: addtree in all 48 layers
 
-In the full model the MoE output feeds the residual add, RMSNorm, then an Expand to [4, T, 2048] for the head-parallel attention (one
-lane per card). That structure was appended to the layer-2 replay graph as a probe: the residual uses the hidden part of the layer input,
-followed by a per-lane [4, 2048, 1024] MatMul standing in for q_proj.
-
-| Probe | Final sum | Compiler placement | Device (runtime timer, mean) | Traced profile |
-|---|---|---|---:|---:|
-| bcast_einsum | 16 Einsum tiles, Expand to 4 lanes, MatMul | 80 reduce-adds on every card (1.2 ms serial per card, cards in parallel), P2P 24 MiB | 5.09 / 5.14 | 5.12 |
-| bcast | elementwise addtree, Expand, MatMul | 48 elementadds on every card, P2P 24 MiB | 4.38 / 4.34 | 4.66 |
-| allred | each lane writes its own (p_c + ...), Concat | compiles to exactly the same program as bcast | - | 4.66 |
-| rn_einsum | Einsum tiles + residual + RMSNorm + Expand + MatMul | sum, residual and norm all replicated on the four cards | 5.01 / 5.04 | 5.14 |
-| rn_add | addtree + residual + RMSNorm + Expand + MatMul | same, 64 elementadds per card | 4.70 / 4.71 | 4.93 |
-
-- As soon as the consumer is lane-partitioned the compiler no longer reduces to card 0 and broadcasts: every card gathers the other three
-  partials (an all-gather, 6 MiB into each card, 24 MiB in total) and computes the full sum, the residual and the norm itself. There is no
-  root card and no broadcast step; the "card 0 receives, card 0 adds" tail of Section 4 does not exist in the full model.
-- The elementwise form is still faster there: by 0.75 ms when the MatMul follows directly and by 0.3 ms through the residual and norm
-  (per layer, T=512). The Einsum form pays a serial 4-core template on every card; the elementwise form pays a TCM footprint on every
-  card (traced hot ends 2.05 to 2.51 on the four cards).
-- With the four cards symmetric, "unload card 0" has no target; only the compiler can reduce the footprint.
-
-![rn_einsum: Einsum tiles + residual + norm + 4-lane MatMul (profile 5.14 ms)](figures/T512_fc_rn_einsum_cores.png)
-
-![rn_add: elementwise addtree + residual + norm + 4-lane MatMul (profile 4.93 ms)](figures/T512_fc_rn_add_cores.png)
-
-### 12.4 Full model: the elementwise final sum in all 48 layers
-
-Every layer's final sum of `hpb_stack_tc` (rewrites + token-centric + head-parallel, KV retained on device, flag) was replaced by addtree
-(`scripts/build_full_fc.py`), nothing else changed; compile 8 min, QPC 25 GB, 4 bindings. Both models ran twice, alternating, in one
-session (3 rounds x 20 each):
+`scripts/build_full_fc.py` replaces every layer's final sum of `hpb_stack_tc` (rewrites + token-centric combine +
+head-parallel attention, KV retained on device, flag) by addtree and changes nothing else; compile 8 min, QPC 25 GB,
+4 host bindings. Both models ran twice, alternating, in one session (3 rounds x 20 each):
 
 | Full model, T=128 first chunk, MXFP6, flag | run 1 | run 2 | logits rel L2 |
 |---|---:|---:|---:|
 | hpb_stack_tc (original, Einsum tiles) | 147.3 | 147.0 | 0.1724 |
-| hpb_stack_fc (addtree in every layer) | 132.9 | 133.2 | 0.1682 |
+| **hpb_stack_fc (addtree in every layer)** | **132.9** | **133.2** | 0.1682 |
 
-### 12.5 Conclusions of this round
+The next token is the same in both. In the full model there is no root card: because the next layer's attention is
+lane-partitioned, the compiler gathers all four partials on every card and each card computes the sum itself (an
+all-gather of 4 x 1.5 MiB at T=128 instead of a reduce onto card 0). The elementwise form is still the faster one in that
+structure: in a single-layer probe with the residual add, RMSNorm and the per-lane projection appended, it saves 0.3 ms
+per layer at T=512, which matches the 14 ms over 48 layers seen here.
 
-1. Of the six paths only "fewer hot experts on card 0" removes the hot-stage side effect on the profile; the compiler options (1a, 3)
-   do nothing and forcing DDR (1b, 1c) is worse.
-2. On the production build the side effect is mostly an occasional jitter of addtree (about 0.1 ms on average), not a steady 0.43 ms;
-   the traced profile amplifies it. Variants must be judged on the host clock (or the runtime timer without tracing); the profile is
-   for structure only.
-3. In the full model the final sum is already "replicated on all four cards", without a root card; the elementwise form is 0.3 ms per
-   layer faster there (T=512 probe); the full-model result is in 12.4.
-4. Reproduction: `fc2/chain_a.sh` (compiles, inventories and profiles of 1a, 1b, 1c, 2, 3), `fc2/chain_b.sh` and `fc2/chain_c.sh`
-   (probes and runtime timing), `timing/S13_allpaths_spec.json` (host session), `fc2/chain_d.sh` (full model).
-5. Three more paths (12.6): the linear chain, `-multicast-weights` and `-mos=2`. The first two reduce card 0's traced hot-stage squeeze
-   to 2.27 and 2.11 ms, but neither the runtime timer nor the host latency differs from addtree; `-mos=2` changes nothing.
+## 7. What is left
 
-### 12.6 Addendum: chainadd, `-multicast-weights`, `-mos=2` (2026-09-27, morning)
+After the change, a T=512 layer (about 4.2 ms device, traced) consists of: hot stage about 2.0 ms, inter-stage index
+exchange about 0.5, cold stage about 0.5, per-card local reduction 0.05, **cross-card transfer 0.53**, add 0.01, output
+write 0.17. The transfer is the only item left in the combine, 12% of the layer, and only three things can reduce it:
 
-All three leave the sum and the later all-gather untouched and only try to ease the contention between the sum's buffers and the hot
-stage: the linear chain ((p0+p1)+p2)+p3 gives the compiler a chance to accumulate in place with one intermediate less;
-`-multicast-weights` loads weights shared by several cores once from DDR, reducing the hot stage's dependence on prefetch buffers;
-`-mos=2` splits weights across cores to shrink each core's resident weights. Each was built for both the token-owned and the addtree
-graph (`-mos=2`, `-multicast-weights`) or for addtree alone (chainadd), with host timing in one session and one runtime-timer sweep.
+1. Fewer bytes: send only the rows of tokens that touched the card. With the current placements a token touches 3.8 cards
+   on average, so this saves at most 7% (39% on the sorted layout, which is 0.7 ms slower under the flag); it has to be
+   designed together with placement and traded against balance.
+2. Overlap: send the hot-stage share early. Measured once: the receiving card then pays for the transfer during its cold
+   stage and the bytes double, so this only pays if the cold-stage share is sparse and small.
+3. Topology: each card receives a quarter of the tokens (reduce-scatter), 1.5 MiB and about 0.13 ms per card. Both the
+   original README (3.14) and this work saw the compiler collapse it back onto card 0; it needs compiler support.
 
-| Variant | Compiler inventory | Traced card 0 hot end / device (median) | Runtime device mean / std (two rounds) | Host ms (same session) |
-|---|---|---:|---:|---:|
-| token-owned | - | 1.99 / 4.36 | 4.26 / 0.07 | 5.72 |
-| addtree | - | 2.42 / 4.29 | 3.89 / 0.18 | 5.27 |
-| chainadd | op-for-op identical to addtree | 2.27 / 4.15 | 3.82 / 0.14 | 5.31 |
-| addtree + `-multicast-weights` | hot-stage ops unchanged (no weight-multicast op appears) | 2.11 / 3.98 | 3.87 / 0.19 | 5.31 |
-| token-owned + `-multicast-weights` | as above | 1.94 / 4.36 | 4.26 / 0.08 | 5.71 |
-| addtree + `-mos=2` | op-for-op identical | 2.45 / 4.32 | 3.87 / 0.20 | 5.27 |
-| token-owned + `-mos=2` | op-for-op identical | 1.93 / 4.31 | 4.25 / 0.07 | 5.66 |
+## 8. Reproduction
 
-- Under tracing, `-multicast-weights` halves the squeeze (2.42 to 2.11, token-owned unchanged) and chainadd removes a third of it (2.27);
-  `-mos=2` changes nothing.
-- Without tracing, all three have the same mean, the same slow mode (max 4.15 to 4.35) and the same spread as addtree; host latency
-  5.27 to 5.31, one and the same number.
-- This confirms 12.2 once more: the hot-stage squeeze exists mainly under trace collection; the production build shows no measurable cost,
-  hence no measurable gain. None of the three needs to enter the final design. This session as a whole was about 0.4 ms slower than
-  S13 (token-owned 5.72 vs 5.32); only in-session comparisons are valid.
-- Reproduction: `fc2/chain_e.sh`, `timing/S14_opts_spec.json`.
+```
+scripts/make_final_combine.py combine/T512_hc_296_32_tokenowned combine/T512_to_fc_addtree addtree
+scripts/compile_any.sh combine/T512_to_fc_addtree F_T512_fc_addtree_mxfp6_s0_flag mxfp6 0 flag          # 70 instead of 0 for the instrumented build
+scripts/timing.py timing/S11b_fc_spec.json timing/S11b_fc.json 3 100                                    # same-session host timing
+scripts/profile_case.sh qpc/F_T512_fc_addtree_mxfp6_s70_flag profile/F_T512_fc_addtree_mxfp6_s70_flag F_T512_fc_addtree 512 combine/T512_to_fc_addtree/input_f16.bin
+plotvenv/bin/python scripts/detail_plot2.py profile/F_T512_fc_addtree_mxfp6_s70_flag/analysis/sample1 "title" figures/x.png 0,1,2,3
+scripts/build_full_fc.py full_model/hpb_stack_tc full_model/hpb_stack_fc                                # full model graph
+scripts/full_compile.sh hpb_stack_fc_flag_rs full_model/hpb_stack_fc rs -mxfp6-matmul -mdts-mos=1       # full model compile; fc2/chain_d.sh runs the session
+```
+
+Data: `timing/S11b_fc*.json` and `timing/S13_allpaths*.json` (host sessions), `profile/F_T512_fc_addtree_mxfp6_s70_flag`
+and `profile/K_T512_hc_296_32_tokenowned_mxfp6_s70_flag` (traces, per-core CSVs, analysis), `fc2/runner/` (runtime timer
+logs), `combine/T512_to_fc_addtree` (graph), `full_model/hpb_stack_fc` and `full_model/run_fc*` (full model).
