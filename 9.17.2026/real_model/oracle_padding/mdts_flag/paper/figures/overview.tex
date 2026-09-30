@@ -1,0 +1,51 @@
+% Figure: one MoE layer under RankTier. Bars: sorted token counts of SoC 2 in layer 20 of the held-out 512-token chunk.
+\begin{tikzpicture}[x=1in, y=1in, font=\footnotesize, >={Stealth[length=3.6pt, width=3pt]},
+  box/.style={draw=black!70, rounded corners=2pt, align=center, inner sep=3pt, fill=white, line width=0.5pt},
+  flow/.style={->, line width=0.7pt, draw=black!75},
+  num/.style={circle, fill=black!80, text=white, inner sep=0.7pt, font=\scriptsize\bfseries},
+  head/.style={anchor=west, font=\footnotesize\bfseries, inner sep=1pt}]
+\definecolor{tierA}{RGB}{31,90,166}\definecolor{tierB}{RGB}{79,143,209}\definecolor{tierC}{RGB}{169,200,234}
+% frame for the per-SoC steps 1-3
+\draw[rounded corners=4pt, fill=black!4, draw=black!35, line width=0.5pt] (0.74,0.02) rectangle (5.12,2.02);
+\node[anchor=south east, font=\scriptsize\itshape, text=black!55, inner sep=1pt] at (5.10,0.04) {on each SoC};
+% router
+\node[box] (router) at (0.30,1.00) {router\\[-1pt]top-8\\[-1pt]of 128};
+\draw[flow] (router.east) -- (0.86,1.00);
+% ---- (1) rank the SoC's 32 experts
+\node[num] at (0.88,1.86) {1}; \node[head] at (0.96,1.86) {rank by load};
+\foreach [count=\i] \c in {176,115,80,62,56,53,52,49,39,37,32,30,26,24,15,14,13,10,9,9,8,2,2,1,1,0,0,0,0,0,0,0} {
+  \pgfmathsetmacro{\x}{0.90 + (\i-1)*0.031}
+  \pgfmathsetmacro{\h}{max(0.006, \c/176*1.05)}
+  \ifnum\i<9 \def\col{tierA}\else\ifnum\i<17 \def\col{tierB}\else\def\col{tierC}\fi\fi
+  \fill[\col] (\x,0.40) rectangle ++(0.025,\h);
+}
+\draw[black!60, line width=0.4pt] (0.89,0.40) -- (1.90,0.40);
+\node[anchor=north west, font=\scriptsize, text=black!65, inner sep=1pt] at (0.88,0.38) {rank 1};
+\node[anchor=north east, font=\scriptsize, text=black!65, inner sep=1pt] at (1.91,0.38) {32};
+\node[anchor=north, font=\scriptsize, align=center, text=black!75, inner sep=1pt] at (1.40,0.24) {tokens per expert, sorted};
+% ---- (2) tiers; weights gathered by rank
+\node[num] at (2.10,1.86) {2}; \node[head] at (2.18,1.86) {fixed-capacity tiers};
+\node[box, minimum width=1.30in, fill=black!2, font=\scriptsize] (bank) at (2.85,1.56) {weights of all 128 experts (replicated)};
+\draw[flow] (1.60,0.62) to[out=80, in=180] node[pos=0.55, left, font=\scriptsize, inner sep=2pt] {$\pi_c$} (bank.west);
+\draw[flow] (2.85,1.46) -- node[right, font=\scriptsize, inner sep=2pt] {gather by rank} (2.85,1.32);
+\def\L{0.03125}
+\fill[tierA] (2.20,1.05) rectangle (3.50,1.30);
+\fill[tierB] (2.20,0.80) rectangle (2.525,1.05);
+\fill[tierC] (2.20,0.30) rectangle (2.3625,0.80);
+\foreach \k in {1,...,31} {\draw[white, line width=0.25pt] (2.20,{0.30+\k*\L}) -- ({\k>23 ? 3.50 : (\k>15 ? 2.525 : 2.3625)},{0.30+\k*\L});}
+\draw[dashed, black!55, line width=0.5pt] (2.20,0.30) rectangle (3.50,1.30);
+\node[fill=tierA, text=white, font=\scriptsize, inner sep=1pt] at (2.85,1.175) {tier 1: 8 lanes $\times\,T$};
+\node[anchor=west, font=\scriptsize, inner sep=1pt] at (2.55,0.925) {tier 2: 8 lanes $\times\,C_2$};
+\node[anchor=west, font=\scriptsize, inner sep=1pt] at (2.39,0.68) {tier 3: 16 lanes $\times\,C_3$};
+\node[anchor=south east, font=\scriptsize\itshape, text=black!55, align=right, inner sep=1.5pt] at (3.50,0.31) {capacity-$T$ padding:\\[-2pt]32 lanes $\times\,T$};
+\node[anchor=north, font=\scriptsize, text=black!75, inner sep=1pt] at (2.85,0.24) {rows per lane (capacity)};
+% ---- (3) token-owned combine
+\node[num] at (3.72,1.86) {3}; \node[head] at (3.80,1.86) {token-owned combine};
+\node[box, text width=1.18in, font=\scriptsize] (comb) at (4.38,0.95) {each core takes $T/16$ tokens, gathers the $\le 8$ rows of each token that this SoC computed, and sums them\\[2pt] partial $P_c\in\mathbb{R}^{T\times d}$};
+\draw[flow] (3.51,0.95) -- (comb.west);
+% ---- (4) sum over SoCs
+\node[num] at (5.28,1.86) {4}; \node[head] at (5.36,1.86) {sum over SoCs};
+\node[box, text width=1.12in, font=\scriptsize] (sum) at (6.02,1.25) {{\footnotesize $(P_0{+}P_1){+}(P_2{+}P_3)$}\\[2pt] elementwise, lowered as a reduce-scatter};
+\draw[flow] (comb.east) -- (5.30,0.95) |- (sum.west);
+\draw[flow] (sum.south) -- (6.02,0.62) node[below, font=\scriptsize, inner sep=2pt] {next layer};
+\end{tikzpicture}
