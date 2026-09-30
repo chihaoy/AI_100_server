@@ -8,18 +8,32 @@ unused stage-1 subgraph is pruned. The token-owned combine is generalized to any
 routing-counts output lists the tiers' lanes in order (still 128 per layer). Lanes per card per tier should be 1, 2, 4, 8
 or 16 (even core mapping, E19) and sum to 32. Capacities come from scripts/tier_budget.py.
 Input: a build_full_stack.py output with --rewrites 1 --combine dense for the same --T.
+A tier spec <E>x<C>s<S> splits each of the tier's E experts per card over S adjacent lanes of C/S rows (E*S lanes per card):
+the token table [4E, C] is reshaped to [4E*S, C/S], each lane gets its own count, weights and routing-weight rows are
+repeated per lane; the combine's row index is unchanged because the flat layout is the same.
+--combine dense keeps the export's combine instead (the padding-only arm of the ablation): input is the export itself
+(native_c128, no rewrites); per group of consecutive tiers with equal lanes per card one zeroed [lanes, T, 2048]
+accumulator, each tier reads it at its token table (the export's zero read, or stage 1's read-modify-write), adds its
+weighted rows and scatters them back, then per group the export's un-tiled lane Einsum 'dpth->dth', the groups' partials
+added, and the export's card-rooted Einsum_4. With a single group (e.g. 16xT,16xT/8) this is the export's structure.
 Usage: build_full_tiered.py <src dir> <out dir> --T 512 --tiers 8x512,8x128,16x64 [--final einsum|addtree|tileadd]
-       [--placement <[48,128] expert-to-card npy>]"""
+       [--placement <[48,128] expert-to-card npy>] [--combine tokenowned|dense]"""
 import sys, os, re, json, heapq, argparse, collections, numpy as np, onnx
 from onnx import helper as h, numpy_helper as nh, TensorProto as TP
 ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('--T', type=int, required=True)
 ap.add_argument('--tiers', required=True, help='comma list of <lanes per card>x<capacity>, e.g. 8x512,8x128,16x64')
 ap.add_argument('--final', choices=['einsum', 'addtree', 'tileadd'], default='einsum')
 ap.add_argument('--placement', default=None, help='[48,128] expert -> card assignment (32 per card); default native e // 32')
+ap.add_argument('--combine', choices=['tokenowned', 'dense'], default='tokenowned', help='token-owned combine, or the export combine per tier group (see above)')
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
 T, DOM = a.T, 'com.qualcomm.cloud'
-TIERS = [tuple(int(v) for v in s.split('x')) for s in a.tiers.split(',')]
-assert sum(l for l, _ in TIERS) == 32 and all(l in (1, 2, 4, 8, 16) for l, _ in TIERS) and all(0 < c <= T for _, c in TIERS), TIERS
+def parse_tier(spec):
+    mt = re.fullmatch(r'(\d+)x(\d+)(?:s(\d+))?', spec); assert mt, spec
+    return int(mt.group(1)), int(mt.group(2)), int(mt.group(3) or 1)
+TIERS3 = [parse_tier(x) for x in a.tiers.split(',')]
+assert sum(e for e, _, _ in TIERS3) == 32 and all(e * sp in (1, 2, 4, 8, 16) and c % sp == 0 and 0 < c <= T for e, c, sp in TIERS3), TIERS3
+TIERS = [(e, c) for e, c, _ in TIERS3]; SPLIT = [sp for _, _, sp in TIERS3]
+assert a.combine == 'tokenowned' or all(sp == 1 for sp in SPLIT), 'split tiers need the token-owned combine'
 NT = len(TIERS); START = [sum(l for l, _ in TIERS[:i]) for i in range(NT)]; OFF = [4 * s for s in START]
 PLACE = np.load(a.placement).astype(np.int64) if a.placement else np.tile(np.arange(128) // 32, (48, 1))
 assert all((np.bincount(PLACE[L], minlength=4) == 32).all() for L in range(48))
@@ -54,7 +68,7 @@ def descendants(ts, cons):
         for n in cons.get(t, []):
             if n.name not in seen: seen.add(n.name); st.extend(n.output)
     return seen
-count_tensors = {}
+count_tensors = {}; dense_info = {}
 def resize_lane_consts(n, lanes):
     """Stage constants folded at export for 64 lanes (layer 0 has a [64, 1] zeros input to Max): repeat a row-uniform one for `lanes`."""
     for i, x in enumerate(n.input):
@@ -123,31 +137,54 @@ def tiered(L):
     orders = []
     for t in range(NT):
         new.append(h.make_node('Concat', tier_parts[t], [c_(f'tr_order{t}')], name=STEM + f'tr_order{t}', axis=0)); orders.append(c_(f'tr_order{t}'))
-    # tier 0: the original stage-0 subgraph fed by rows of the native chain in tier-0 order
+    # stage subgraph: the nodes between the stage-0 inputs and its output Where_3
     stage_in = {STEM + 'CtxScatter3DInt_output_0': nat['CtxScatter3DInt_output_0'], STEM + 'Einsum_1_output_0': nat['Einsum_1_output_0'],
                 STEM + 'Where_1_output_0': nat['Where_1_output_0'], wg[0].output[0]: c_('nat_wT'), STEM + 'Greater_output_0': nat['Greater_output_0']}
     out0 = STEM + 'Where_3_output_0'
     body = (ancestors([out0], prod) & descendants(list(stage_in) + [mm[k].input[1] for k in ('MatMul', 'MatMul_1', 'MatMul_2')], cons)) - chain0
     body_nodes = [n for n in ln if n.name in body]
-    for dst, srcname in stage_in.items():
-        new.append(h.make_node('Gather', [srcname, orders[0]], [dst], name=STEM + 'tr0_rows_' + dst.replace(STEM, ''), axis=0))
-    for s0 in ('MatMul', 'MatMul_1', 'MatMul_2'):
-        new.append(h.make_node('Gather', [banks[s0], orders[0]], [c_(f'W0_{s0}')], name=STEM + f'tr0_gather_{s0}', axis=0)); mm[s0].input[1] = c_(f'W0_{s0}')
     slice0, range0 = bn[STEM + 'Slice'], bn[STEM + 'Range_1']; assert slice0.op_type == 'Slice' and range0.op_type == 'Range' and slice0.name in body and range0.name in body
-    if TIERS[0][1] < T: slice0.input[2] = i64(P + 'tr0_end', [TIERS[0][1]]); range0.input[1] = i32(P + 'tr0_stop', TIERS[0][1])
-    datas, slots, counts = [out0], [STEM + 'Where_1_output_0'], [STEM + 'Einsum_1_output_0']
-    # tiers 1..: clones of the stage-0 subgraph
-    for t in range(1, NT):
-        tag = f'tr{t}'; rmap = {}
+    datas, slots, counts = [], [], []; tts, zreads = [], []
+    orig0 = SPLIT[0] == 1
+    if orig0:   # tier 0: the original stage-0 subgraph fed by rows of the native chain in tier-0 order
+        for dst, srcname in stage_in.items():
+            new.append(h.make_node('Gather', [srcname, orders[0]], [dst], name=STEM + 'tr0_rows_' + dst.replace(STEM, ''), axis=0))
+        for s0 in ('MatMul', 'MatMul_1', 'MatMul_2'):
+            new.append(h.make_node('Gather', [banks[s0], orders[0]], [c_(f'W0_{s0}')], name=STEM + f'tr0_gather_{s0}', axis=0)); mm[s0].input[1] = c_(f'W0_{s0}')
+        if TIERS[0][1] < T: slice0.input[2] = i64(P + 'tr0_end', [TIERS[0][1]]); range0.input[1] = i32(P + 'tr0_stop', TIERS[0][1])
+        datas.append(out0); slots.append(STEM + 'Where_1_output_0'); counts.append(STEM + 'Einsum_1_output_0')
+        tts.append(STEM + 'Slice_output_0'); zreads.append(bn.get(STEM + 'CtxGather3D_2'))
+    w_orig = {s0: mm[s0].input[1] for s0 in ('MatMul', 'MatMul_1', 'MatMul_2')}
+    # further tiers (all tiers when tier 0 is split): clones of the stage-0 subgraph
+    for t in range(1 if orig0 else 0, NT):
+        tag = f'tr{t}'; rmap = {}; E, Ccap = TIERS[t]; Sp = SPLIT[t]; lanes = 4 * E * Sp
+        order_lanes = orders[t]
+        if Sp > 1:   # lane order: each expert repeated Sp times (card-major, expert-major, half-minor)
+            new += [h.make_node('Unsqueeze', [orders[t], i64('dc_axm1', [-1])], [c_(f'{tag}_ord_u')], name=STEM + f'{tag}_ord_u'),
+                    h.make_node('Expand', [c_(f'{tag}_ord_u'), i64(f'tr_rep_shape_{4 * E}_{Sp}', [4 * E, Sp])], [c_(f'{tag}_ord_x')], name=STEM + f'{tag}_ord_x'),
+                    h.make_node('Reshape', [c_(f'{tag}_ord_x'), i64(f'tr_lanes_shape_{lanes}', [lanes])], [c_(f'{tag}_ord_lanes')], name=STEM + f'{tag}_ord_lanes')]
+            order_lanes = c_(f'{tag}_ord_lanes')
         for dst, srcname in stage_in.items():
             rmap[dst] = c_(f'{tag}_' + dst.replace(STEM, ''))
-            new.append(h.make_node('Gather', [srcname, orders[t]], [rmap[dst]], name=STEM + f'{tag}_rows_' + dst.replace(STEM, ''), axis=0))
+            per_lane = dst in (wg[0].output[0], STEM + 'Greater_output_0')     # rows needed once per lane (weights, lane count)
+            if dst == STEM + 'Einsum_1_output_0' and Sp > 1:
+                ce = c_(f'{tag}_expert_counts'); new.append(h.make_node('Gather', [srcname, orders[t]], [ce], name=STEM + f'{tag}_expert_counts', axis=0))
+                half = Ccap // Sp
+                new += [h.make_node('Unsqueeze', [ce, i64('dc_axm1', [-1])], [c_(f'{tag}_cnt_u')], name=STEM + f'{tag}_cnt_u'),
+                        h.make_node('Sub', [c_(f'{tag}_cnt_u'), i32(f'tr_split_off_{Sp}_{half}', [[j * half for j in range(Sp)]])], [c_(f'{tag}_cnt_s')], name=STEM + f'{tag}_cnt_s'),
+                        h.make_node('Max', [c_(f'{tag}_cnt_s'), i32('tr_zero_i32', 0)], [c_(f'{tag}_cnt_lo')], name=STEM + f'{tag}_cnt_lo'),
+                        h.make_node('Min', [c_(f'{tag}_cnt_lo'), i32(f'tr_half_{half}', half)], [c_(f'{tag}_cnt_hi')], name=STEM + f'{tag}_cnt_hi'),
+                        h.make_node('Reshape', [c_(f'{tag}_cnt_hi'), f'tr_lanes_shape_{lanes}'], [rmap[dst]], name=STEM + f'{tag}_lane_counts')]
+                continue
+            new.append(h.make_node('Gather', [srcname, order_lanes if per_lane else orders[t]], [rmap[dst]], name=STEM + f'{tag}_rows_' + dst.replace(STEM, ''), axis=0))
         wmap = {}
         for s0 in ('MatMul', 'MatMul_1', 'MatMul_2'):
-            wmap[c_(f'W0_{s0}')] = c_(f'W{t}_{s0}')
-            new.append(h.make_node('Gather', [banks[s0], orders[t]], [c_(f'W{t}_{s0}')], name=STEM + f'{tag}_gather_{s0}', axis=0))
+            wmap[w_orig[s0]] = c_(f'W{t}_{s0}')
+            new.append(h.make_node('Gather', [banks[s0], order_lanes], [c_(f'W{t}_{s0}')], name=STEM + f'{tag}_gather_{s0}', axis=0))
+        zr = None
         for n in body_nodes:
             c = onnx.NodeProto(); c.CopyFrom(n); c.name = STEM + f'{tag}/' + n.name.replace(STEM, '')
+            if n.name == STEM + 'CtxGather3D_2': zr = c
             if n.op_type == 'If':   # static-shape guard 'squeeze the token table if its last dim is 1': the table is [lanes, T, 1], take the then branch
                 then_g = next(x.g for x in n.attribute if x.name == 'then_branch')
                 sq = next(x for x in then_g.node if x.op_type == 'Squeeze'); ax_node = next(x for x in then_g.node if x.op_type == 'Constant' and x.output[0] == sq.input[1])
@@ -159,13 +196,19 @@ def tiered(L):
                 if x in rmap: c.input[i] = rmap[x]
                 elif x in wmap: c.input[i] = wmap[x]
             for i, o in enumerate(c.output): rmap[o] = c_(f'{tag}_' + o.replace(STEM, '')); c.output[i] = rmap[o]
-            if n.name == slice0.name: c.input[2] = i64(P + f'{tag}_end', [TIERS[t][1]])
-            if n.name == range0.name: c.input[1] = i32(P + f'{tag}_stop', TIERS[t][1])
-            resize_lane_consts(c, 4 * TIERS[t][0]); new.append(c)
-        datas.append(rmap[out0]); slots.append(rmap[STEM + 'Where_1_output_0']); counts.append(rmap[STEM + 'Einsum_1_output_0'])
-    for n in body_nodes: resize_lane_consts(n, 4 * TIERS[0][0])   # after the clones, which copy the untouched 64-lane constants
+            if n.name == slice0.name: c.input[2] = i64(P + f'{tag}_end', [Ccap])
+            if n.name == range0.name: c.input[1] = i32(P + f'{tag}_stop', Ccap // Sp)
+            resize_lane_consts(c, lanes); new.append(c)
+            if n.name == slice0.name and Sp > 1:   # [4E, C] token table -> [4E*Sp, C/Sp] lanes
+                sp_out = c_(f'{tag}_token_table_lanes')
+                new.append(h.make_node('Reshape', [c.output[0], i64(f'tr_tt_shape_{lanes}_{Ccap // Sp}', [lanes, Ccap // Sp])], [sp_out], name=STEM + f'{tag}_token_table_lanes'))
+                rmap[n.output[0]] = sp_out
+        datas.append(rmap[out0]); slots.append(rmap[STEM + 'Where_1_output_0']); tts.append(rmap[STEM + 'Slice_output_0']); zreads.append(zr)
+        counts.append(c_(f'{tag}_expert_counts') if Sp > 1 else rmap[STEM + 'Einsum_1_output_0'])
     drop = chain0 | chain1 | {rg[0].name, rg[1].name, wg[0].name, wg[1].name} | {STEM + n for n in ('Reshape_1', 'Transpose_1', 'Unsqueeze_7', 'Transpose')}
-    count_tensors[L] = counts
+    if orig0:
+        for n in body_nodes: resize_lane_consts(n, 4 * TIERS[0][0])   # after the clones, which copy the untouched 64-lane constants
+    count_tensors[L] = counts; dense_info[L] = (tts, zreads)
     return new, drop, routes_native, orders, datas, slots
 def tokenowned(L, routes_native, orders, datas, slots):
     """Token-owned combine over NT tiers: position p = OFF[tier] + card * L_tier + local, row = local * C_tier + slot."""
@@ -238,6 +281,30 @@ def tokenowned(L, routes_native, orders, datas, slots):
             outs.append(c_(f'final_red_{i}'))
         final = h.make_node('Concat', outs, list(e4.output), axis=0, name=STEM + 'final_concat')
     return new + [final], {e4.name}
+def densecombine(L, datas):
+    """The export's combine over the tiers (--combine dense); returns (nodes placed with the stages, nodes placed at Einsum_4)."""
+    STEM, P = f'/model/layers.{L}/mlp/', f'L{L}_'; c_ = lambda nm: P + nm
+    ln, bn, prod, cons = layer_view(STEM); tts, zreads = dense_info[L]
+    assert all(z is not None and z.op_type == 'CtxGather3D' for z in zreads), 'dense combine needs the export graph (zero read present, no rewrites)'
+    e4 = bn[STEM + 'Einsum_4']; assert e4.op_type == 'Einsum' and h.get_attribute_value(e4.attribute[0]) == b'dth->th'
+    zval = next(x for x in bn[STEM + 'ConstantOfShape_1'].attribute if x.name == 'value').t
+    head, tail, parts, t, grp = [], [], [], 0, 0
+    while t < NT:
+        E = TIERS[t][0]; members = [t]
+        while t + len(members) < NT and TIERS[t + len(members)][0] == E: members.append(t + len(members))
+        base = c_(f'dn_zeros{grp}')
+        head.append(h.make_node('ConstantOfShape', [i64(f'dn_shape_{4 * E}_{T}', [4 * E, T, 2048])], [base], name=STEM + f'dn_zeros{grp}', value=zval))
+        for u in members:   # first tier: the export's read of the zeroed accumulator; later tiers: stage 1's read-modify-write
+            zreads[u].input[0] = base
+            tail.append(h.make_node('CtxScatter3D', [base, tts[u], datas[u]], [c_(f'dn_acc{u}')], name=STEM + f'dn_scatter{u}', domain=DOM)); base = c_(f'dn_acc{u}')
+        tail += [h.make_node('Reshape', [base, i64(f'dn_shape4_{E}_{T}', [4, E, T, 2048])], [c_(f'dn_acc4_{grp}')], name=STEM + f'dn_acc4_{grp}'),
+                 h.make_node('Einsum', [c_(f'dn_acc4_{grp}')], [c_(f'dn_part{grp}')], equation='dpth->dth', name=STEM + f'dn_lanes{grp}')]
+        parts.append(c_(f'dn_part{grp}')); t += len(members); grp += 1
+    total = parts[0]
+    for k in range(1, len(parts)):
+        tail.append(h.make_node('Add', [total, parts[k]], [c_(f'dn_sum{k}')], name=STEM + f'dn_sum{k}')); total = c_(f'dn_sum{k}')
+    e4.input[0] = total
+    return head, tail
 # ---------------- apply to every layer
 added = []
 for L in range(48):
@@ -246,7 +313,11 @@ for L in range(48):
     new, drop, routes_native, orders, datas, slots = tiered(L)
     for j, n in enumerate(new): key[id(n)] = base + j / (len(new) + 1)
     added += new
-    new2, d2 = tokenowned(L, routes_native, orders, datas, slots); drop |= d2
+    if a.combine == 'dense':
+        head, new2 = densecombine(L, datas)
+        for j, n in enumerate(head): key[id(n)] = base - 0.5 + j / (len(head) + 1) * 0.1
+        added += head
+    else: new2, d2 = tokenowned(L, routes_native, orders, datas, slots); drop |= d2
     e4pos = key[id(next(n for n in nodes if n.name == STEM + 'Einsum_4'))]
     for j, n in enumerate(new2): key[id(n)] = e4pos + j / (len(new2) + 1)
     added += new2
@@ -285,5 +356,5 @@ for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
     p = f'{a.src}/{link}'
     if os.path.islink(p) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(p), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-json.dump(dict(src=a.src, mode='tiered', T=T, tiers=TIERS, final=a.final, placement=a.placement), open(f'{a.out}/info.json', 'w'))
-print(f'{a.out}: tiered {TIERS}, final {a.final}, placement {"native" if not a.placement else a.placement}; nodes {len(order)}; initializers {len(keep)}')
+json.dump(dict(src=a.src, mode='tiered', T=T, tiers=TIERS3, final=a.final, placement=a.placement, **({'combine': 'dense'} if a.combine == 'dense' else {})), open(f'{a.out}/info.json', 'w'))
+print(f'{a.out}: tiered {TIERS3}, {"dense combine" if a.combine == "dense" else "final " + a.final}, placement {"native" if not a.placement else a.placement}; nodes {len(order)}; initializers {len(keep)}')
