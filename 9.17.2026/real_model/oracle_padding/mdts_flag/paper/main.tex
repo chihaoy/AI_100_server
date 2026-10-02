@@ -8,6 +8,7 @@
 \usepackage{subfigure}
 \usepackage{booktabs}
 \usepackage{array}
+\usepackage{float}
 \usepackage{amsmath}
 \usepackage{amssymb}
 \usepackage{xspace}
@@ -23,6 +24,7 @@
 
 \newcommand{\sys}{RankTier\xspace}
 \newcommand{\naive}{$T/T$\xspace}
+\newcommand{\TBD}{\textcolor{red}{TBD}}
 
 \mlsystitlerunning{RankTier: MoE Prefill under Ahead-of-Time Compilation}
 
@@ -44,18 +46,20 @@
 \begin{abstract}
 Mixture-of-experts (MoE) language models choose each token's experts at run time, but server inference accelerators
 such as Qualcomm Cloud AI 100 execute ahead-of-time (AOT) compiled programs with static shapes and no data-dependent
-control flow. The number of tokens each expert processes, its capacity, is therefore fixed at compile time, and because
-some expert in some layer receives nearly every token of a prefill chunk, a program that never drops a token pads every
-expert to the chunk length. The compiler's lowering of the MoE combine adds a second cost that grows with the chunk: a
-dense accumulator reduced in serialized steps and rooted on one device. We present \sys, which keeps the program static
-and moves the decisions it cannot compile into data. Each device ranks its experts by load at run time, binds
-fixed-capacity tiers to load ranks instead of expert identities, and fetches the selected weights through an index gather
-that the compiler lowers to indirect DMA; a token-owned combine then lets each device sum only its own tokens' expert
-rows before one distributed cross-device sum. On Qwen3-30B-A3B across the four SoCs of a Cloud AI 100 Ultra card, with
-the KV cache on device, \sys prefills 128-, 256- and 512-token chunks 4.05$\times$, 2.45$\times$ and 2.94$\times$ faster
-than the production compilation, without dropping a token in any measured prompt. Against a baseline with the same
-compilation settings but the compiler's combine and every expert padded to the chunk length, the reduction redesign alone
-is 2.06--2.38$\times$ faster, while the rank-bound tiers pay only on top of it, adding 1.06--1.37$\times$.
+control flow. Each expert's capacity is therefore fixed at compile time, and because some expert in some layer receives
+nearly every token of a prefill chunk, a program that never drops a token pads every expert to the chunk length; the
+exported combine adds a second cost that grows with the chunk, a dense per-lane accumulator. We present \sys, which keeps
+the program static and moves the decisions it cannot compile into data. Each device ranks its experts by load at run
+time and binds fixed-capacity tiers to load ranks instead of expert identities, since the order statistics of per-device
+load are bounded and stable across workloads while the identities are not, and a token-owned combine sums each token's
+expert rows where they were computed; both need only a sort and index gathers. On Qwen3-30B-A3B across the four SoCs of
+a Cloud AI 100 Ultra card, with the KV cache on device, \sys prefills 128-, 256- and 512-token chunks 4.05$\times$,
+2.45$\times$ and 2.94$\times$ faster than the production compilation. With weight indirection and tile size matched,
+the rank-bound capacities make the ranked program 1.13--1.27$\times$ faster; fixed-size blocks under the same compiler
+are 1.26--1.71$\times$ slower; the calibrated capacities overflowed in none of 1872 evaluation chunks of eight workloads;
+and a program holding several capacity profiles recovers bit-exactly from a forced overflow. We separate the reasoning that
+transfers to other AOT targets from the hardware conditions under which it pays and from the compiler behavior that
+shaped our implementation.
 \end{abstract}
 ]
 
@@ -101,15 +105,14 @@ and the worst serialization rewritten, this combine path takes 51\%, 64\% and 68
 faster at $T=128$ but 11--12.5\% slower than production at 256 and 512 tokens, because the dense combine grows with $T$.
 
 We present \sys, a design for MoE prefill that keeps the program static and moves the decisions the compiler cannot make
-into data. It rests on one property of the compiler: a program cannot branch on data, but it can address by data. A
-weight gather indexed by a run-time tensor is lowered to indirect weight DMA and runs as fast as a static weight stream
-(\S\ref{sec:mot-addr}). \sys therefore fixes lanes and capacities at compile time and decides at run time which
+into data. It rests on one property that static programs share: a program cannot branch on data, but it can address by
+data. On Cloud AI 100, a weight gather indexed by a run-time tensor is lowered to indirect weight DMA and runs as fast as a
+static weight stream (\S\ref{sec:mot-addr}). \sys therefore fixes lanes and capacities at compile time and decides at run time which
 expert each lane serves. Each SoC counts the tokens routed to its 32 experts, sorts them, and gives the expert of rank
 $r$ a lane in the tier that covers $r$. Capacities bound to ranks can be small because the order statistics of per-SoC
 load are stable across workloads even when expert identities are not: over 200 held-out prompts of eight workloads, the
 16th most loaded expert of a SoC never received more than 12 of 128 tokens, while a fixed expert order needs up to
-84--127 rows at \emph{every} position (Figure~\ref{fig:rank}). Three tiers of 8, 8 and 16 lanes per SoC fit the
-compiler's even core mapping and its sequential stages. For the reduction, \sys compiles every expert whole on one SoC,
+84--127 rows at \emph{every} position (Figure~\ref{fig:rank}). For the reduction, \sys compiles every expert whole on one SoC,
 restores the on-device KV cache that this setting breaks by making attention head-parallel, and lets each SoC own its
 tokens: it gathers only the rows of each token's experts that live on the SoC, sums them locally, and leaves one
 elementwise cross-SoC sum that the compiler distributes as a reduce-scatter.
@@ -117,21 +120,30 @@ elementwise cross-SoC sum that the compiler distributes as a reduce-scatter.
 We implement \sys as graph transformations of the exported model and evaluate the full 48-layer Qwen3-30B-A3B with MXFP6
 expert weights on the four SoCs of one Cloud AI 100 Ultra card, with the KV cache retained on device. \sys prefills 128-,
 256- and 512-token chunks in 122, 206 and 356\,ms, 4.05$\times$, 2.45$\times$ and 2.94$\times$ faster than the
-production compilation. An ablation against a naive baseline that keeps the compiler's combine and capacity $T$ shows
-how the two parts interact: the reduction redesign alone gives 2.06--2.38$\times$, the padding series alone at most
-1.05$\times$, and the padding series on top of the reduction redesign another 1.06--1.37$\times$. No lane exceeded its capacity in any measured prompt, and the error against an FP32
-reference stays at the level of the production program.
+production compilation. The reduction redesign is the larger part and a prerequisite (2.06--2.38$\times$ alone). With
+weight indirection and tile size matched, the rank-bound capacities make the same ranked program 1.13, 1.13 and
+1.27$\times$ faster, and \sys is 1.06--1.17$\times$ faster than the best static program. Fixed-size blocks under the same
+compiler and combine are 1.26--1.71$\times$ slower, because every block streams its expert's weights. Capacities calibrated
+in advance overflowed in none of 1872 evaluation chunks of eight workloads, consecutive chunks through the on-device cache
+are bit-identical to the capacity-$T$ program, and one program with several capacity profiles recovers bit-exactly from a
+forced overflow. The error against FP32 stays at the level of the production program.
+
+We separate three things throughout. The algorithm needs only static shapes, a sort and gathers with run-time indices.
+Whether it pays depends on hardware, model and compiler: padded rows must cost time, and each device must hold many
+experts relative to $k$. The Cloud AI 100 compiler shaped the implementation and much of the speedup over production
+(\S\ref{sec:impl}, \S\ref{sec:transfer}).
 
 The paper makes three contributions:
 \begin{itemize}
-\item A characterization of MoE prefill on an AOT-compiled multi-SoC accelerator, which identifies compile-time capacity
-  and compiler-shaped reductions as the two costs that grow with the chunk, and establishes which run-time mechanisms the
-  compiler does and does not offer (\S\ref{sec:mot}).
-\item \sys: rank-bound tiered capacities built from run-time sorting and index-gathered weights, and a token-owned
-  reduction on expert-parallel compilation with an on-device KV cache, all expressed as static graphs that the compiler
-  maps evenly (\S\ref{sec:design}--\ref{sec:impl}).
-\item An end-to-end evaluation on the full model at three chunk lengths: a step-by-step ladder, a 2$\times$2 ablation of
-  the two optimization series, and the negative results that bound the design space (\S\ref{sec:eval}).
+\item Two techniques for MoE layers in static-shape programs whose reasoning does not depend on the accelerator:
+  capacities bound to per-device load ranks and sized from their order statistics, and a token-owned combine whose cost
+  grows with the routed rows rather than with lanes$\,\times\,T$ (\S\ref{sec:design}).
+\item A realization on Cloud AI 100, with a characterization that separates what static shapes force on any AOT target
+  from what this export and compiler add (\S\ref{sec:mot}, \S\ref{sec:impl}).
+\item An evaluation of the full model at three chunk lengths: a step-by-step ladder, an attribution of the capacity
+  series with indirection and tile size matched, a fixed-size block baseline, held-out routing from eight workloads, and
+  consecutive chunks with overflow detection and recovery (\S\ref{sec:eval}); and an account of the conditions under
+  which each technique pays elsewhere (\S\ref{sec:transfer}).
 \end{itemize}
 
 %-----------------------------------------------------------------------------------------------------------------------
@@ -158,35 +170,29 @@ when four SoCs hold 32 experts each.
 
 \subsection{MoE Systems}
 
-GPU systems handle the data-dependent shape of expert work directly. MegaBlocks expresses expert computation as
-block-sparse GEMMs and never drops tokens \citep{gale2023megablocks}; Tutel switches parallelism and pipelining at run
-time \citep{hwang2023tutel}; DeepSpeed-MoE and FasterMoE optimize expert-parallel inference and training around the
-all-to-all exchange \citep{rajbhandari2022deepspeedmoe,he2022fastermoe}; Lina schedules all-to-all traffic and expert
-resources dynamically \citep{li2023lina}. Placement studies exploit routing structure: ExFlow uses inter-layer expert
-affinity to cut all-to-all traffic \citep{yao2024exflow}, and \citet{yu2025patterns} profile data movement across
-workloads to derive a prefill-aware expert placement. \citet{huang2024toward} characterize MoE inference and replace
-static capacity with dynamic gating; Pre-gated MoE predicts the next layer's experts to overlap their loading
-\citep{hwang2024pregated}. Expert-choice routing gives every expert a fixed number of tokens by construction
-\citep{zhou2022expertchoice}, which removes the padding problem but changes the model. Closest to our setting, DynaMoE
-recompiles a static-shape program when capacities change during training \citep{kossmann2022dynamoe}. On our
-accelerator a full-model program takes 6--23 minutes to compile, so capacities cannot follow each chunk by recompilation,
-and none of the GPU mechanisms above exists in a program without data-dependent shapes.
+GPU systems handle the data-dependent shape of expert work directly: MegaBlocks computes experts as block-sparse GEMMs
+and never drops tokens \citep{gale2023megablocks}, Tutel switches parallelism at run time \citep{hwang2023tutel}, and
+DeepSpeed-MoE, FasterMoE and Lina optimize or schedule the all-to-all exchange
+\citep{rajbhandari2022deepspeedmoe,he2022fastermoe,li2023lina}. Placement studies exploit routing structure
+\citep{yao2024exflow,yu2025patterns}, \citet{huang2024toward} replace static capacity with dynamic gating, and
+expert-choice routing fixes each expert's tokens by construction but changes the model \citep{zhou2022expertchoice}. On
+Trainium, expert work is packed into fixed-size blocks whose weight loads are shared across an expert's blocks and whose
+unused blocks are skipped \citep{awsneuronmoe}; we compare against blocks in \S\ref{sec:eval-blocks}. DynaMoE recompiles a
+static-shape program when capacities change during training \citep{kossmann2022dynamoe}; our full-model programs take
+6--23 minutes to compile, so capacities cannot follow each chunk by recompilation.
 
 \subsection{AOT-Compiled Inference Accelerators}
 
-A Cloud AI 100 SoC has 16 AI cores and four 64-bit LPDDR4x channels with 136\,GB/s and up to 32\,GB
-\citep{chatha2021qualcomm,qualcomm2025arch}. Each core combines a scalar VLIW processor, a vector unit and a tensor unit
-with 4K FP16 MACs, and holds an 8\,MB software-managed vector memory and a 1\,MB L2 cache. The Ultra card used here
-carries four SoCs, 64 cores in total, under a shared 150\,W board limit.
+A Cloud AI 100 SoC has 16 AI cores and 136\,GB/s of LPDDR4x bandwidth to up to 32\,GB
+\citep{chatha2021qualcomm,qualcomm2025arch}; each core has a scalar VLIW processor, a vector unit, a tensor unit with 4K
+FP16 MACs and 8\,MB of software-managed vector memory. The Ultra card carries four SoCs under a shared 150\,W limit.
 
-The compiler takes an ONNX graph and one shape specialization per chunk length and produces a static program. It
-partitions each operator over the 16 cores of a SoC and, by multi-device tensor slicing, over the SoCs; the degree of
-weight splitting across SoCs is a compile option. Matrix weights can be stored as MXFP6 \citep{rouhani2023mx}, which the
-vector unit dequantizes while the tensor unit computes. A KV cache stays on device when the compiler can pair each cache
-input with its updated output (\emph{retained state}); otherwise the cache becomes host I/O. Control flow must be
-static: an ONNX \texttt{If} with a non-constant condition is rejected at compile time. Dynamic-shape compilers for CPUs
-and GPUs handle such workloads with shape functions and run-time dispatch \citep{shen2021nimble,zhu2021disc}; the
-accelerator programs considered here have no such runtime.
+The compiler takes an ONNX graph and one shape specialization per chunk length and produces a static program,
+partitioned over the cores of a SoC and, by multi-device tensor slicing, over the SoCs. Matrix weights can be MXFP6
+\citep{rouhani2023mx}, dequantized by the vector unit while the tensor unit computes. A KV cache stays on device when each
+cache input can be paired with its updated output (\emph{retained state}). An ONNX \texttt{If} with a non-constant
+condition is rejected; dynamic-shape compilers for CPUs and GPUs handle such workloads with run-time dispatch
+\citep{shen2021nimble,zhu2021disc}, which these programs lack.
 
 %-----------------------------------------------------------------------------------------------------------------------
 \section{Motivation}
@@ -197,7 +203,8 @@ We study the MoE layers of Qwen3-30B-A3B compiled for the four SoCs of one Cloud
 lane is one expert's gate, up and down GEMMs over a fixed number of gathered token rows, its capacity $C$. The production
 program uses $C=T$ in both stages, the only capacity that can never drop a token. Three observations motivate \sys:
 capacities attached to experts must cover the worst chunk, the compiler's combine grows with the chunk, and the compiler
-nevertheless lets a program address weights by data.
+nevertheless lets a program address weights by data. The first follows from static shapes and the model's routing and
+holds on any AOT target; the other two describe this export and compiler.
 
 \subsection{Capacities Attached to Experts Cover the Worst Chunk}
 \label{sec:mot-pad}
@@ -262,7 +269,7 @@ part scales with $T$; none scales with the number of routed rows.
 \begin{table}[t]
 \caption{Device time of one MoE layer with the dense combine, split into the combine path (the accumulator's gap
 between the stages and SoC~0's reduction tail) and everything else. MXFP6, expert-parallel compilation and the
-dense-path rewrites of \S\ref{sec:red}, one-layer replays with stage capacities fitted to the input, instrumented.}
+dense-path rewrites of \S\ref{sec:impl-comb}, one-layer replays with stage capacities fitted to the input, instrumented.}
 \label{tab:combine}
 \vskip 0.1in
 \begin{center}
@@ -282,7 +289,7 @@ $T$ & Layer, ms & Combine path, ms & Rest, ms & Share \\
 \end{table}
 
 Table~\ref{tab:combine} measures the combine path after expert-parallel compilation and after the rewrites of
-\S\ref{sec:red}, which remove its most serialized parts: it still takes 51\% of an MoE layer at $T=128$ and 68\% at 512.
+\S\ref{sec:impl-comb}, which remove its most serialized parts: it still takes 51\% of an MoE layer at $T=128$ and 68\% at 512.
 On the full model, compiling experts whole on each SoC with the KV cache kept on device (\S\ref{sec:ep}) reduces prefill
 latency from 494.6 to 267.1\,ms at $T=128$ but increases it from 505.3 to 568.6\,ms at 256 and from 1049.1 to
 1164.1\,ms at 512 (Table~\ref{tab:ladder}), because its dense combine grows with $T$.
@@ -293,26 +300,21 @@ latency from 494.6 to 267.1\,ms at $T=128$ but increases it from 505.3 to 568.6\
 What the compiler withholds is control flow; what it offers is indexing. We probed three mechanisms on one-layer replays
 and two-layer cuts of the full model.
 
-\textbf{Index-gathered weights are free.} Replacing the three weight constants of a layer's first stage by
+\textbf{Index-gathered weights are nearly free.} Replacing the three weight constants of a layer's first stage by
 \texttt{Gather(bank, idx)}, with the 64-entry index arriving at run time, leaves the layer at 2.796\,ms, the same as with
-static weights, and the output is bit-identical: the compiler lowers the gather to an indirect weight DMA that reads the
-MXFP6 bytes directly. Only this form stays fast. Per-SoC constants and batched gathers run 2.3--3.7$\times$ slower,
-because the compiler either keeps their weights in FP16 or spreads per-SoC MatMuls over all SoCs, and the one gathered
-constant is replicated on every SoC. A configuration with
-one partition per SoC stores each bank once, but the runtime then executes the SoCs one after another, 1.7$\times$ slower
-for a single inference.
+static weights, and bit-identical: the gather becomes an indirect weight DMA of the MXFP6 bytes. On the full model it
+costs 0\% at $T=256$ and 6\% at 512 once tile sizes are tuned (\S\ref{sec:eval-abl}). Only this form stays fast: per-SoC
+constants and batched gathers run 2.3--3.7$\times$ slower, and the one gathered constant is replicated on every SoC; one
+partition per SoC stores each bank once, but the runtime then runs the SoCs one after another (1.7$\times$ slower).
 
-\textbf{Lane counts must divide 16.} The compiler maps a stage onto a SoC's cores by its number of lanes per SoC. With a
-lane count that divides 16 (we tested 2, 4, 8 and 16) the mapping is balanced; with 17--19 lanes it splits the GEMMs unevenly (3 to 36
-tensor-unit operations per core), and from 20 lanes on it packs the whole stage onto four cores per SoC, which takes
-3.7--4.3\,ms for a stage that runs in 0.5\,ms on 16 cores.
+\textbf{Lane counts must divide 16.} The compiler maps a stage onto a SoC's cores by its lanes per SoC: counts that divide
+16 map evenly, while in our lane-split programs 17--19 lanes split the GEMMs unevenly and 20--32 lanes collapsed onto four
+cores per SoC (3.7--4.3\,ms for a stage that runs in 0.5\,ms on 16 cores).
 
 \textbf{Stages run one after another.} The compiler schedules a layer's expert stages sequentially, in its own order;
 in our tiered programs a stage of $L$ lanes per SoC ran one lane per core on $L$ cores. Every additional stage adds a
 window of its own.
 
-These properties define the space \sys works in: fixed lanes whose experts are chosen by index at run time, tier widths
-from $\{1,2,4,8,16\}$ lanes per SoC, and as few stages as the padding allows.
 
 %-----------------------------------------------------------------------------------------------------------------------
 \section{\sys}
@@ -320,9 +322,11 @@ from $\{1,2,4,8,16\}$ lanes per SoC, and as few stages as the padding allows.
 
 Section~\ref{sec:mot} leads to three requirements. First, capacity must follow each chunk's load without control flow,
 so the program must choose at run time which expert a lane serves and bind capacities to a quantity that is stable across
-chunks. Second, the reduction must scale with the routed rows rather than with lanes $\times\,T$, and no SoC may root it.
-Third, every mechanism must be a static graph that the compiler maps evenly: lane counts from $\{1,2,4,8,16\}$ per SoC,
-one gathered constant per weight, and few stages.
+chunks. Second, the combine must scale with the routed rows rather than with lanes$\,\times\,T$, and no device may root
+it. Third, both must be static graphs built only from operations that ahead-of-time targets provide: reductions, a sort,
+gathers with run-time indices and one cross-device sum. This section states the two techniques in those terms;
+\S\ref{sec:impl} describes how the Cloud AI 100 compiler shaped their realization, and \S\ref{sec:transfer} separates
+what transfers.
 
 \begin{figure*}[t]
 \centering
@@ -337,8 +341,60 @@ through the rank permutation $\pi_c$. The filled area is the padded work, agains
 \vskip -0.1in
 \end{figure*}
 
-Figure~\ref{fig:overview} shows one MoE layer under \sys. \S\ref{sec:ep} describes the compilation setting that makes
-experts local, \S\ref{sec:red} the reduction, \S\ref{sec:sort} the run-time ranking and \S\ref{sec:tiers} the tiers.
+Figure~\ref{fig:overview} shows one MoE layer under \sys.
+
+\subsection{Rank-Bound Capacities}
+\label{sec:sort}\label{sec:tiers}
+
+Each device owns a fixed set of $E_c$ experts, 32 of the 128 on each SoC here. After the router, \sys counts each
+expert's tokens and sorts each device's counts, which gives a per-device permutation $\pi_c$ from rank to expert. The
+device's lanes form tiers: a tier is a stage of $L_i$ lanes at capacity $C_i$ that covers ranks $a_i,\dots,a_i+L_i-1$,
+with $\sum_iL_i=E_c$, and lane $j$ of the tier serves the expert of rank $a_i+j$. The lane's weights are gathered through
+$\pi_c$, and its token table, the positions of the tokens it computes, is gathered from tables that the routing computes
+for all experts in their fixed order. Every expert keeps exactly one lane, so tiers change only the padding: the same
+experts compute the same tokens, and the output is bit-identical to any other tiering. A device computes
+$\sum_iL_iC_i$ rows per layer, against $E_cT$ with capacity-$T$ padding.
+
+\textbf{Capacities from order statistics.} The first tier has capacity $T$, since rank 1 can receive every token. For
+$i>1$, $C_i$ is the largest load observed at rank $a_i$, the tier's first rank, over calibration chunks, times a headroom
+$h$, rounded up to the target's row granularity and capped at $T$; since ranks are sorted, rank $a_i$ bounds the whole
+tier. Order statistics are predictable for a structural reason: if a device receives $n_c$ assignments in a chunk, its
+$r$-th most loaded expert holds at most $n_c/r$ of them, and $n_c$ is a sum over all of the device's experts, $2T$ on
+average here and at most 1.9$\times$ that in our 256- and 512-token captures. An expert-bound capacity must instead cover
+the worst case of one expert, which is $T$. Every lane's token count is computed anyway, so a chunk that overflows a tier
+is detectable after the fact. We calibrate with $h=1.28$ on routing captures of the eight workloads: the 128-token prompts
+of \S\ref{sec:mot-pad}, 56 chunks of 256 tokens and 20 of 512.
+
+\textbf{Choosing the tiers.} Rows alone favor many tiers: under our calibration three tiers need 65--67\% of the rows of
+a two-tier split at $T$ and $T/8$, four 52--58\% and five 48--56\%. Each tier is a stage with a fixed cost of its own, so
+the number of tiers trades padded rows against per-stage cost, and the balance depends on the target
+(\S\ref{sec:impl-cap}). On Cloud AI 100, \sys uses three tiers of 8, 8 and 16 lanes per SoC at capacities $T$, $C_2$
+and $C_3$ of 128/48/16, 256/64/32 and 512/128/64 for $T=128$, 256 and 512: 12--13$T$ rows per SoC against $18T$ for two
+tiers and $32T$ for capacity-$T$ padding.
+
+
+\subsection{Token-Owned Combine}
+\label{sec:red}
+
+The combine returns each token's $k$ weighted expert rows to the token and sums them. The exported graph formulates it
+per lane: each lane's rows are scattered into an accumulator of shape $[\mathrm{lanes},T,d]$, which is then reduced over
+lanes, so its cost grows with lanes$\,\times\,T$ whatever the routing. \sys formulates it per token
+(Algorithm~\ref{alg:combine} in Appendix~\ref{app:alg}). The router's top-$k$ output already lists each token's experts; with integer arithmetic on
+the lane layout and the per-expert slot tables that the routing computes anyway, every (token, $j$) pair maps to the tier
+and row of the device's compact expert outputs that hold its result, or to a masked entry when the expert lives on another
+device. One gather per tier fetches at most $k$ rows per token, and a sum over them gives the device's $[T,d]$ partial
+output. Each core owns a tile of tokens, so the per-device combine needs no cross-core traffic, and one elementwise sum
+over the devices' partials completes the layer. The cost grows with $kT$ rather than with the lanes per device times $T$,
+and when the last sum is split by token tiles, no device receives all partials.
+
+
+%-----------------------------------------------------------------------------------------------------------------------
+\section{Realization on Cloud AI 100}
+\label{sec:impl}
+
+The techniques of \S\ref{sec:design} need only generic operations; how we realized them was shaped by the Cloud AI 100
+compiler at each step. This section records those choices, and \S\ref{sec:transfer} summarizes which of them would change
+on another target.
 
 \subsection{Expert-Parallel Compilation with an On-Device KV Cache}
 \label{sec:ep}
@@ -355,154 +411,74 @@ the four KV-head groups of eight query heads each \citep{ainslie2023gqa} become 
 operator, with per-group weights of shapes $[4,2048,1024]$ for queries, $[4,2048,128]$ for keys and values and
 $[4,1024,2048]$ for the output projection, whose four partial outputs are summed at the end. Under expert-parallel
 compilation the batch axis lands one group per SoC, the cache operations of KV head $h$ stay on SoC $h$, and the program
-again exposes no KV buffer. On a two-layer cut the head-parallel program runs in 12.5\,ms of device time against 23.3\,ms
-for the production setting, with 30 instead of 265\,MiB of cross-SoC traffic. The regrouped output projection changes the
-FP16 summation order; on two layers the logits differ from the production program by $6.8\times10^{-4}$ relative $L_2$,
-with the same argmax.
+again exposes no KV buffer; the regrouped output projection changes only the FP16 summation order.
 
-\subsection{Token-Owned Reduction}
-\label{sec:red}
+\subsection{Lowering the Combine}
+\label{sec:impl-comb}
 
-The reduction is rebuilt in three steps. Each keeps the model's arithmetic and changes only where and in which order the
-sums run.
+\textbf{Dense-path rewrites.} Before the combine is replaced, three rewrites remove serialized work from the exported one.
+(i) The first stage's outputs were added to rows gathered from the freshly zeroed accumulator; we drop this read of
+zeros. (ii) The per-SoC sum over lanes, one einsum that the compiler ran through DRAM on one core, is cut into 16 tiles of
+$T/16$ tokens. (iii) The routing's prefix sums over tokens, which give each assignment its row in the expert's compact
+input and ran as a serial \texttt{CumSum} on one core, become Hillis--Steele scans of $\log_2 T$ shift-and-add steps
+\citep{hillis1986data}. All three leave the output bit-identical. They repair this export and this compiler's lowering
+rather than change the combine's formulation, and the evaluation keeps them as a separate step.
 
-\textbf{Dense-path rewrites.} Three rewrites remove serialized work that the export introduces. (i) The first stage's
-outputs were added to rows gathered from the freshly zeroed accumulator; we drop this read of zeros. (ii) The per-SoC sum
-over lanes, one einsum that the compiler ran through DRAM on one core, is cut into 16 tiles of $T/16$ tokens. (iii) The
-routing's prefix sums over tokens, which give each assignment its row in the expert's compact input and ran as a serial
-\texttt{CumSum} on one core, become Hillis--Steele scans of $\log_2 T$ shift-and-add steps \citep{hillis1986data}. All
-three leave the output bit-identical.
+\textbf{Token-owned combine.} The device gather does not zero-fill out-of-range indices, so a safe index and a mask are
+both required, and the per-SoC work must stay on the lane axis the compiler already splits over SoCs: written as explicit
+per-SoC slices, the combine shipped expert outputs between SoCs (3 to 78\,MiB) and doubled the layer's device time.
 
-\textbf{Token-owned combine.} The dense accumulator exists because the export combines by lane, scattering each lane's
-rows to their tokens. \sys combines by token (Algorithm~\ref{alg:combine}). The router's top-$k$ output already lists each
-token's experts; with integer arithmetic on the lane layout and the per-expert slot tables that the routing computes
-anyway, every (token, $j$) pair maps to the stage and row of the SoC's compact expert outputs that hold its result, or to
-a masked sentinel when the expert lives on another SoC. One gather per stage then fetches at most eight rows per token;
-masking, the addition of the stages and a sum over the rows give the SoC's $[T,d]$ partial output. Each core owns a tile
-of $T/16$ tokens, so the per-SoC combine needs no cross-core traffic.
+\textbf{Elementwise final sum.} Written as 16 einsum tiles, the sum over the four partials ran on four cores per SoC;
+written as the elementwise tree $(P_0+P_1)+(P_2+P_3)$ per token tile, it spreads over all cores, and the compiler lowers it
+as a reduce-scatter that the next layer's input normalization completes.
 
-\begin{algorithm}[t]
-\caption{Token-owned combine on SoC $c$}
-\label{alg:combine}
-\begin{algorithmic}[1]
-\REQUIRE top-$k$ experts $\mathcal{K}[t,1..k]$ of each token $t$; lane map $\ell(e)\mapsto(s,c',l)$ (stage or tier, SoC, lane);
-  $\mathrm{slot}[e,t]$, row of token $t$ in expert $e$'s input; weighted outputs $O_s\in\mathbb{R}^{L_sC_s\times d}$ of SoC $c$
-\FOR{all $t\le T$, $j\le k$ \textbf{in parallel}}
-  \STATE $e\leftarrow\mathcal{K}[t,j]$;\; $(s,c',l)\leftarrow\ell(e)$
-  \IF{$c'=c$}
-    \STATE $\mathit{idx}_s[t,j]\leftarrow l\,C_s+\mathrm{slot}[e,t]$;\; $m_s[t,j]\leftarrow1$
-  \ELSE
-    \STATE $\mathit{idx}_s[t,j]\leftarrow0$;\; $m_s[t,j]\leftarrow0$ \COMMENT{masked}
-  \ENDIF
-\ENDFOR
-\FOR{each core $q$, owning tokens $t\in$ tile $q$}
-  \STATE $P_c[t]\leftarrow\sum_s\sum_{j}m_s[t,j]\,O_s[\mathit{idx}_s[t,j]]$ \COMMENT{$\le k$ rows}
-\ENDFOR
-\STATE $y\leftarrow(P_0+P_1)+(P_2+P_3)$ \COMMENT{elementwise, over SoCs}
-\end{algorithmic}
-\end{algorithm}
+\subsection{Lowering the Rank Sort and the Tiers}
+\label{sec:impl-cap}
 
-Two lowering details matter. The device gather does not zero-fill out-of-range indices, so the safe index and the
-explicit mask are both required. And the per-SoC work must stay on the lane axis that the compiler already splits over
-SoCs: written as explicit per-SoC slices, the combine made the compiler distribute its tiles over SoCs and ship expert
-outputs between them, raising cross-SoC traffic from 3 to 78\,MiB and the layer's device time from 4.3 to 8.6\,ms.
+\textbf{One gathered constant.} The counts come from the routing mask, and the per-SoC sort is a \texttt{TopK} over each
+SoC's 32 counts. Each tier's three weight matrices come from \texttt{Gather(bank,$\,\pi$)} on one constant that holds all
+128 experts, the only gather form this compiler keeps fast, lowered to indirect DMA (\S\ref{sec:mot-addr}). The constant
+is replicated, so every SoC holds the weights of all 128 experts, 22.5\,GiB per SoC instead of 6.7\,GiB, within the SoC's
+32\,GB; the algorithm itself needs only each SoC's own 32 experts.
 
-\textbf{Elementwise final sum.} The remaining sum over the four partials was written as 16 einsum tiles, which the
-compiler lowers to a reduction template on four cores per SoC. Written as the elementwise tree $(P_0+P_1)+(P_2+P_3)$ per
-token tile, the additions spread over all 16 cores of each SoC. In the full model the compiler lowers this sum as a
-reduce-scatter: each SoC adds a quarter of the tokens, and the next layer's input normalization, which runs split by
-token rows, gathers the rest. No SoC receives all four partials.
+\textbf{Off the critical path.} The routing mask, the prefix scans and the slot tables are computed once over all 128
+experts in native order, independent of the sort; only a row permutation of these tables and the weight gathers wait for
+it. Sorting first and running the routing on permuted columns makes everything wait (12 layers: +2.5\,ms over
+capacity-$T$ padding, against +1.6\,ms). Gathered weights are also sensitive to the compiler's maximum tile size: with the
+default, the first expert GEMM waits 0.085\,ms for its first gathered tile, with 512\,KiB tiles 0.032\,ms. For the rank sort the best
+size is 512\,KiB for $T\le256$ and 1024\,KiB for $T=512$ (Appendix~\ref{app:tiles}); other programs differ (Table~\ref{tab:attr}).
 
-\subsection{Run-Time Rank Sort}
-\label{sec:sort}
+\textbf{Tier widths and count.} Stages map evenly only when their lanes per SoC divide 16, run one after another, and
+use $L$ cores for $L$ lanes (\S\ref{sec:mot-addr}), so tiers take widths from $\{1,2,4,8,16\}$. At $T=512$ the first tier
+is bound by the SoC's shared memory traffic: eight lanes of 512 rows finish in 0.8--1.0\,ms, sixteen in 2.2\,ms. Three
+tiers of 8, 8 and 16 lanes balance these effects (\S\ref{sec:eval-pad}).
 
-Each SoC owns a fixed quarter of the 128 experts. After the router, \sys counts each expert's tokens from the routing
-mask and sorts each SoC's 32 counts (a \texttt{TopK}), which gives a per-SoC permutation $\pi_c$ from rank to expert.
-Lane $j$ of the tier starting at rank $a_i$ serves the expert of rank $a_i+j$; its three weight matrices come from
-\texttt{Gather(bank,$\,\pi$)} on one constant that holds all 128 experts, lowered to indirect DMA (\S\ref{sec:mot-addr}).
-
-Two choices keep the sort off the critical path. First, the routing mask, the prefix scans and the slot tables are
-computed once over all 128 experts in native order, independent of the sort; only a row permutation of these tables and
-the weight gathers wait for it. Sorting first and running the routing on permuted columns makes everything wait
-(12 layers: +2.5\,ms over capacity-$T$ padding, against +1.6\,ms). Second, gathered weights are sensitive to the compiler's
-maximum tile size: with the default, the first expert GEMM waits 0.085\,ms for its first gathered tile, with 512\,KiB
-tiles 0.032\,ms. The best size is 512\,KiB for $T\le256$ and 1024\,KiB for $T=512$ (\S\ref{sec:eval-pad}).
-
-The price is memory. The gathered constant is replicated, so every SoC holds the weights of all 128 experts,
-22.5\,GiB per SoC instead of 6.7\,GiB, within the SoC's 32\,GB. The program also returns every lane's token count in
-every layer, so an overflow, a rank that received more tokens than its tier's capacity, is detectable after each chunk.
-
-\subsection{Tiered Capacities}
-\label{sec:tiers}
-
-A tier is a stage of $L_i$ lanes per SoC at capacity $C_i$ that covers ranks $a_i,\dots,a_i+L_i-1$, with
-$\sum_iL_i=32$. Every expert keeps exactly one lane, so tiers change only the padding: the same experts compute the same
-tokens, and the output is bit-identical to the two-tier sort. A SoC computes $\sum_iL_iC_i$ rows per layer, against $32T$
-with capacity-$T$ padding.
-
-\textbf{Capacities from order statistics.} The first tier has capacity $T$, since rank 1 can receive every token. For
-$i>1$, $C_i$ is the largest load observed at rank $a_i$, the tier's first rank, over calibration chunks, times a headroom
-$h=1.28$, rounded up to a multiple of 16 and capped at $T$; since ranks are sorted, rank $a_i$ bounds the whole tier. We
-calibrate on routing captures of the eight workloads: the 128-token prompts of \S\ref{sec:mot-pad}, 56 chunks of 256
-tokens and 20 of 512. Order statistics are predictable for a structural reason: if a SoC receives $n_c$ assignments in a
-chunk, its $r$-th most loaded expert holds at most $n_c/r$ of them, and $n_c$ is a sum over 32 experts, $2T$ on average and
-at most 1.9$\times$ that in our 256- and 512-token captures. An expert-bound capacity must instead cover the worst case of one expert, which
-is $T$.
-
-\textbf{Choosing the tiers.} Rows alone favor many tiers: under our calibration three stages need 65--67\% of the rows of
-a two-tier split at $T$ and $T/8$, four stages 52--58\% and five 48--56\%. But stages run sequentially and each adds a
-window of its own, so the design balances rows against stages. At $T=512$ the first tier is bound by the SoC's shared
-memory traffic rather than by per-core compute: eight lanes of 512 rows finish in 0.8--1.0\,ms, sixteen lanes in 2.2\,ms,
-although each core does the same work. \sys uses three tiers of 8, 8 and 16 lanes per SoC (Table~\ref{tab:tiers}),
-12--13$T$ rows per SoC against $18T$ for two tiers and $32T$ for capacity-$T$ padding; \S\ref{sec:eval-pad} shows that a
-fourth tier costs more than it saves.
-
-\begin{table}[t]
-\caption{Tier designs, lanes per SoC $\times$ capacity, and the padded rows each SoC computes per layer.}
-\label{tab:tiers}
-\vskip 0.1in
-\begin{center}
-\begin{small}
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{@{}rccccc@{}}
-\toprule
-$T$ & Ranks 1--8 & 9--16 & 17--32 & Rows & vs.\ two tiers / \naive \\
-\midrule
-128 & 8$\times$128 & 8$\times$48 & 16$\times$16 & 13$T$ & 72\% / 41\% \\
-256 & 8$\times$256 & 8$\times$64 & 16$\times$32 & 12$T$ & 67\% / 38\% \\
-512 & 8$\times$512 & 8$\times$128 & 16$\times$64 & 12$T$ & 67\% / 38\% \\
-\bottomrule
-\end{tabular}
-\end{small}
-\end{center}
-\vskip -0.15in
-\end{table}
-
-%-----------------------------------------------------------------------------------------------------------------------
-\section{Implementation}
-\label{sec:impl}
+\subsection{Graph Transformations}
+\label{sec:impl-graph}
 
 \sys is a set of ONNX graph transformations, about 1,100 lines of Python, applied to the Qwen3-30B-A3B graph that the
-vendor's QEfficient library exports for Cloud AI 100 \citep{qefficient}. Each step of \S\ref{sec:design} is a separate
-pass, so every intermediate program can be compiled and measured. The passes locate operators by structure rather than
+vendor's QEfficient library exports for Cloud AI 100 \citep{qefficient}. Each step of the ladder (\S\ref{sec:setup}) is a
+separate pass, so every intermediate program can be compiled and measured. The passes locate operators by structure rather than
 by name (layer 0 numbers some nodes differently and folds a 64-lane constant into its stage), regenerate the
 $T$-dependent constants of the scans and tiles for each chunk length, and clone the stage subgraph once per tier with its
 own row order, weight gathers and capacity. A static \texttt{If} in the export that squeezes the token table is replaced
 by the equivalent \texttt{Squeeze} in every clone, and the combine's map from a lane to (tier, SoC, row) becomes a set of
-small per-tier tables. For the ablation (\S\ref{sec:eval-abl}) the same pass can instead feed the export's own combine.
+small per-tier tables. The same pass builds the evaluation's variants: the export's own combine, fixed expert order
+through the gathers, fixed-size blocks, and tier capacities read from input lengths for the overflow fallback.
 
-Each chunk length is its own program, with sequence length $T$ and context $2T$. We compile with MXFP6 matrix weights,
-FP16 activations, 16 cores per SoC, depth-first scheduling, expert-parallel slicing and retained state
-(Appendix~\ref{app:flags}). Static programs compile in 6--12 minutes and occupy 25\,GB; programs with gathered weights
-compile in 12--23 minutes and occupy 88\,GB, because the program file keeps an FP16 copy of each gathered bank.
+Each chunk length is its own program, with sequence length $T$ and context $2T$, MXFP6 matrix weights, FP16
+activations, 16 cores per SoC, depth-first scheduling, expert-parallel slicing and retained state
+(Appendix~\ref{app:flags}). Static programs occupy 25\,GiB, programs with gathered weights 88\,GiB. Every program returns each lane's token count in every layer.
 
 %-----------------------------------------------------------------------------------------------------------------------
 \section{Evaluation}
 \label{sec:eval}
 
-We ask how much \sys speeds up the full model (\S\ref{sec:eval-e2e}), what each part of the reduction and of the padding
-design contributes (\S\ref{sec:eval-red}, \S\ref{sec:eval-pad}), whether the output is preserved (\S\ref{sec:eval-acc}),
-and which alternatives failed (\S\ref{sec:eval-neg}).
+We ask how much \sys speeds up the full model (\S\ref{sec:eval-e2e}), what the capacities contribute once indirection
+and tiling are matched (\S\ref{sec:eval-abl}), what each part of the reduction and of the padding design contributes
+(\S\ref{sec:eval-red}, \S\ref{sec:eval-pad}), how ranked lanes compare with fixed-size blocks (\S\ref{sec:eval-blocks}),
+whether the programs hold beyond the first chunk and under overflow (\S\ref{sec:eval-chunks}), whether the calibration
+generalizes (\S\ref{sec:eval-gen}), and whether the output is preserved (\S\ref{sec:eval-acc}).
 
 \subsection{Experimental Setup}
 \label{sec:setup}
@@ -524,7 +500,8 @@ it varied by about 1\% across 200 prompts of four workloads.
 \textbf{Protocol.} Host latency of one chunk, the median of three rounds of 20 inferences after warm-up. All programs of
 one chunk length run back to back in one session, with anchor programs repeated before and after; steps 6 and 7 ran in a
 second session and are chained to the first through step 5, which ran in both and agreed within 0.13\%. Rounds agree
-within 0.6\%. For accuracy we compare the last-position logits with an FP32 CPU run of the same chunk, check the
+within 0.6\%. The attribution programs of \S\ref{sec:eval-abl} ran in sessions of two or three, each timed twice in mirrored order,
+every session holding an anchor; a program$\,+\,$session fit of log latency combines them (largest residual 0.34\%). For accuracy we compare the last-position logits with an FP32 CPU run of the same chunk, check the
 next-token prediction, and read back every lane's token count.
 
 \subsection{End-to-End Results}
@@ -561,17 +538,7 @@ Tokens/s, 1 / 7     & \multicolumn{2}{c}{259 / 1047} & \multicolumn{2}{c}{507 / 
 \vskip -0.15in
 \end{table}
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/fig_ladder.pdf}
-\vskip -0.08in
-\caption{Prefill latency of the seven programs relative to the production compilation at the same chunk length, with
-the latency of each program and the speedup of \sys.}
-\label{fig:ladder}
-\vskip -0.1in
-\end{figure}
-
-Table~\ref{tab:ladder} and Figure~\ref{fig:ladder} give the results. \sys prefills 128-, 256- and 512-token chunks in
+Table~\ref{tab:ladder} gives the results (Figure~\ref{fig:ladder} in Appendix~\ref{app:ladder} plots them). \sys prefills 128-, 256- and 512-token chunks in
 122.2, 206.2 and 356.3\,ms, 4.05$\times$, 2.45$\times$ and 2.94$\times$ faster than the production compilation, and
 2.19$\times$, 2.76$\times$ and 3.27$\times$ faster than naive \naive. In the order of the ladder, the reduction steps
 contribute 2.06--2.37$\times$ and the padding steps after them 1.06--1.38$\times$, both growing with $T$; \S\ref{sec:eval-abl}
@@ -579,33 +546,39 @@ separates the two series. Only with both does a longer chunk pay: per-token late
 $T=128$ and 512 under \sys, stays at 0.97--1.03\,ms with the token-owned combine at capacity $T$, and rises from 2.09
 to 2.27\,ms under naive \naive.
 
-\subsection{Ablation of the Two Series}
+\subsection{Attributing the Padding Series}
 \label{sec:eval-abl}
 
+The ladder changes weight access (static per-lane constants against gathers from the replicated bank), the assignment of
+experts to lanes and the capacities between steps 5 and 7, and it compares programs at different tile sizes.
+Table~\ref{tab:attr} separates them with five programs that share the reduction series: (A) fixed order, capacity $T$,
+static weights; (B) the same order through the gathers, as run-time data; (C) the run-time rank at capacity $T$; (D) the
+two tiers of step 6; (E) \sys. All give bit-identical logits. Each is timed at the default tile size
+(\texttt{-size-split-granularity}) and at its best of three sizes on two-layer cuts.
+
 \begin{table}[t]
-\caption{The two series alone and together on the full model: prefill latency per chunk (ms) and speedups over naive
-\naive (N). One session per chunk length, each program timed twice in mirrored order; P$_2$ ran in a second session,
-chained through N and P.}
-\label{tab:ablation}
+\caption{Capacity attribution on the full model (ms per chunk). Default: every program at the default tile size; tuned:
+each at its best size (KiB, A--E: def/1024/512/512/512 at $T=128$, 512/512/512/512/1024 at 256, 512/1024/1024/1024/1024
+at 512). Rows: expert rows provisioned per SoC.}
+\label{tab:attr}
 \vskip 0.1in
 \begin{center}
 \begin{small}
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{@{}lllrrr@{}}
+\setlength{\tabcolsep}{2.4pt}
+\begin{tabular}{@{}lrrrrrr@{}}
 \toprule
- & Reduction & Padding & $T=128$ & $T=256$ & $T=512$ \\
+ & \multicolumn{2}{c}{$T=128$} & \multicolumn{2}{c}{$T=256$} & \multicolumn{2}{c}{$T=512$} \\
+ & default & tuned & default & tuned & default & tuned \\
 \midrule
-N & export & \naive & 267.3 & 569.9 & 1162.2 \\
-R & ours & \naive & 129.6 & 253.2 & 488.7 \\
-P$_2$ & export & rank sort & 267.4 & 551.3 & 1110.3 \\
-P & export & sort, tiers & 388.4 & 669.7 & 1379.3 \\
-D & ours & sort, tiers & \textbf{122.6} & \textbf{206.8} & \textbf{355.8} \\
+A static, $T$     & 130.3 & 130.3 & 256.6 & 236.0 & 497.9 & 417.6 \\
+B gather, $T$     & 130.3 & 126.2 & 249.8 & 235.1 & 492.6 & 442.3 \\
+C rank, $T$       & 147.5 & 138.1 & 270.2 & 233.6 & 505.0 & 450.8 \\
+D rank, 2 tiers   & 133.8 & 125.7 & 243.8 & 210.9 & 431.1 & 415.3 \\
+E \sys            & \textbf{128.0} & \textbf{122.5} & \textbf{208.1} & \textbf{207.1} & \textbf{376.1} & \textbf{355.8} \\
 \midrule
-\multicolumn{3}{@{}l}{Reduction alone, N/R} & 2.06$\times$ & 2.25$\times$ & 2.38$\times$ \\
-\multicolumn{3}{@{}l}{Rank sort alone, N/P$_2$} & 1.00$\times$ & 1.03$\times$ & 1.05$\times$ \\
-\multicolumn{3}{@{}l}{Sort and tiers alone, N/P} & 0.69$\times$ & 0.85$\times$ & 0.84$\times$ \\
-\multicolumn{3}{@{}l}{Padding after the reduction, R/D} & 1.06$\times$ & 1.22$\times$ & 1.37$\times$ \\
-\multicolumn{3}{@{}l}{Both (\sys), N/D} & \textbf{2.18$\times$} & \textbf{2.76$\times$} & \textbf{3.27$\times$} \\
+C/E capacities    & 1.15$\times$ & \textbf{1.13$\times$} & 1.30$\times$ & \textbf{1.13$\times$} & 1.34$\times$ & \textbf{1.27$\times$} \\
+A/E vs.\ static   & 1.02$\times$ & 1.06$\times$ & 1.23$\times$ & 1.14$\times$ & 1.32$\times$ & 1.17$\times$ \\
+Rows, A--C / E    & \multicolumn{2}{c}{4096 / 1664} & \multicolumn{2}{c}{8192 / 3072} & \multicolumn{2}{c}{16384 / 6144} \\
 \bottomrule
 \end{tabular}
 \end{small}
@@ -613,21 +586,21 @@ D & ours & sort, tiers & \textbf{122.6} & \textbf{206.8} & \textbf{355.8} \\
 \vskip -0.15in
 \end{table}
 
-The ladder adds the reduction steps before the padding steps, so it cannot show what each series gives alone.
-Table~\ref{tab:ablation} starts both from naive \naive and adds programs that apply only the padding series: the rank
-sort and the tiers feeding the export's own combine. The export's scatter writes only into an accumulator with as many
-lanes as the stage, so tiers of equal width share one accumulator, read-modify-written as the export's second stage is,
-and tiers of 8, 8 and 16 lanes per SoC need two accumulators, of 32 and 64 lanes, where the two-tier sort needs one.
+\textbf{Capacities after paying for dynamic selection.} C and E both rank and gather; only the capacities differ. \sys is
+1.13, 1.13 and 1.27$\times$ faster at $T=128$, 256 and 512 with tuned tiles (1.15--1.34$\times$ at the default), and
+1.06--1.17$\times$ faster than the best static program, which cannot follow the ranking.
 
-The reduction series alone gives 2.06--2.38$\times$. The padding series alone gives almost nothing: the rank sort
-1.00--1.05$\times$, and with the three tiers the program runs at only 0.69--0.85$\times$ the baseline's speed. The same padding series
-gives 1.06--1.37$\times$ once the reduction series is in place. Two effects explain the difference. First, padding
-shortens only the expert stages, while most of the naive layer is combine work that grows with lanes$\,\times\,T$
-(Table~\ref{tab:combine}): the 2.8\,ms per layer that padding saves at $T=512$ is 27\% of the reduced layer, and the
-same saving would be only 11\% of the 24.2\,ms naive layer. Second, under the export's combine the tiers cost
-accumulators: the second accumulator adds a zero fill and a lane reduction through DRAM, and the third tier costs 2.5,
-2.5 and 5.6\,ms per layer at $T=128$, 256 and 512 (not profiled). In the token-owned combine, a tier adds only one gather of at most eight rows per
-token. The reduction redesign is therefore a prerequisite for the padding series, not an independent gain.
+\textbf{Why the tile size matters.} At 512\,KiB tiles the static program issues as many tensor-unit operations as at the
+default, but half of its gate and up operations take under 0.5\,$\mu$s (the rest up to 32) instead of 24--138\,$\mu$s: the static GEMMs skip most padded rows
+and become weight-bound (Appendix~\ref{app:attrprof}). Gathered GEMMs do not: C's second stage holds at most 30 tokens per 512-row lane yet
+spends 4--9\,ms of tensor-unit time per SoC. That is the 6\% of A$\to$B at $T=512$, a property of this compiler rather than
+of indirection (none at $T\le256$). A ranked program needs the gather, so its capacities must recover the skipping: eight
+lanes at capacity $T$ spend 0.39\,ms of tensor-unit time per lane where sixteen spend 1.3--1.7\,ms. The sort costs 0--2\%
+at $T\ge256$ and 9\% at 128.
+
+\textbf{The order of the series.} Under the export's combine the same tiers make the program slower (0.69--0.85$\times$
+of naive \naive), since each tier width needs its own dense accumulator; the reduction series, 2.06--2.38$\times$ alone, is
+the prerequisite.
 
 \subsection{Reduction}
 \label{sec:eval-red}
@@ -637,187 +610,180 @@ production at $T=128$. At 256 and 512 tokens it is 12.5\% and 11.0\% slower, bec
 combine that remains grows with $T$ (Table~\ref{tab:combine}); the head-parallel attention in this step only restores the
 on-device cache.
 
-\textbf{The rewrites and the token-owned combine carry the reduction.} The dense-path rewrites save 37--41\% at every
-chunk length and the token-owned combine another 16.9\%, 27.3\% and 31.6\%, growing with $T$ as the accumulator it removes does.
-The mechanism is visible on one layer in isolation: with the same fitted capacities, the token-owned layer runs in 2.19,
-3.23 and 5.69\,ms at $T=128$, 256 and 512 against 2.61, 5.30 and 9.93\,ms for the dense combine; at $T=256$ the work
-after the last expert stage falls from 2.0\,ms to under 0.1\,ms per SoC plus the cross-SoC sum. The elementwise final
-sum adds 1.5--2.6\%.
+\textbf{Representation as well as lowering.} The dense-path rewrites save 37--41\% at every chunk length by repairing
+the export's lowering of the dense combine; replacing the dense representation by the token-owned combine saves another
+16.9\%, 27.3\% and 31.6\%, growing with $T$ as the accumulator it removes does. In instrumented two-layer profiles at
+$T=512$ it cuts the time after the last expert GEMM from 4.7--5.5 to 1.2--1.4\,ms per layer and the MoE's cross-SoC traffic
+from 48 to 14\,MiB. The elementwise final sum adds 1.5--2.6\%.
 
-\textbf{What remains is small.} In a two-layer profile at $T=512$, the MoE partial sums exchanged between SoCs are 6\,MiB
-and 0.30--0.34\,ms per layer, 14\% of the cross-SoC bytes, and the tail from the last expert GEMM to the completed sum
-is 0.48\,ms. Removing the exchange entirely would save about 3\% of the model. For this reason we did not pursue
-placements that make tokens SoC-local (\S\ref{sec:eval-neg}).
 
 \subsection{Padding}
 \label{sec:eval-pad}
 
-\textbf{The rank sort pays from 256 tokens on.} With two tiers at $T$ and $T/8$, step 6 saves 2.5\% at $T=128$, where the
-expert stages stream weights at their bandwidth floor and the cold stage's 112 fewer rows per lane hide under that stream,
-and 14.6\% and 14.2\% at 256 and 512. The sort adds a dependency on every layer's critical path, router to sort to weight
-gathers; with the tile sizes below it costs less than it saves even at $T=128$.
+\textbf{The sort is cheap; the capacities pay.} Step 6 of the ladder saves 2.5\%, 14.6\% and 14.2\%, but it also
+changes weight access and tile size. With both matched (Table~\ref{tab:attr}) the sort itself costs 0--2\% at $T=256$ and
+512 but 9\% at 128, where it sits on a short layer's critical path (B$\to$C), and the two tiers give 1.09--1.11$\times$ (C$\to$D). The sort adds a dependency on every layer's
+critical path, router to sort to weight gathers, which the tile sizes of \S\ref{sec:impl-cap} keep short.
 
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{figures/fig_stages.pdf}
-\vskip -0.08in
-\caption{GEMM window of each expert stage in execution order at $T=512$, two-layer profiles; segments are the per-stage
-medians over SoCs, labeled with lanes per SoC $\times$ capacity.}
-\label{fig:stages}
-\vskip -0.1in
-\end{figure}
 
-\textbf{Three tiers, not more.} Step 7 saves another 3.2\%, 4.2\% and 15.5\%. Figure~\ref{fig:stages} shows why three tiers
-are the right number at $T=512$. With two tiers, the 16 lanes at capacity 512 take 2.2\,ms per layer; split into eight
-lanes at 512 and eight at 128, the same ranks take 0.8--1.0 and 0.65--0.72\,ms, although each core of the eight-lane
-stage does the same work as before, because the stage is bound by the SoC's memory traffic. A fourth tier removes more
-rows but adds a sequential window: on two layers, four tiers are 8.6\% faster than two, three tiers 14.1\%. At $T=256$ the
-extra stage's window absorbs most of the saving (Table~\ref{tab:ladder}).
 
-\begin{table}[t]
-\caption{Rank sort on 12-layer cuts: latency change against the token-owned program at capacity $T$ (default tiles)
-for three maximum tile sizes.}
-\label{tab:tiles}
-\vskip 0.1in
-\begin{center}
-\begin{small}
-\begin{tabular}{@{}rrrr@{}}
-\toprule
-$T$ & Default tiles & 512\,KiB & 1024\,KiB \\
-\midrule
-128 & $+4.7\%$ & $\mathbf{-1.4\%}$ & -- \\
-256 & $-5.1\%$ & $\mathbf{-18.2\%}$ & $-7.9\%$ \\
-512 & $-12.7\%$ & $-9.3\%$ & $\mathbf{-15.9\%}$ \\
-\bottomrule
-\end{tabular}
-\end{small}
-\end{center}
-\vskip -0.15in
-\end{table}
+\textbf{Three tiers, not more.} Step 7 saves another 3.2\%, 4.2\% and 15.5\%. At $T=512$ the 16 lanes at capacity 512
+take 2.2\,ms per layer; as eight lanes at 512 and eight at 128, the same ranks take 0.8--1.0 and 0.65--0.72\,ms
+(Figure~\ref{fig:stages}, Appendix~\ref{app:stages}), since the stage is bound by the SoC's memory traffic. A fourth tier
+removes more rows but adds a sequential window: on two layers, four tiers are 8.6\% faster than two, three tiers 14.1\%.
+At $T=256$ the extra window absorbs most of the saving.
 
-\textbf{Tile size.} Table~\ref{tab:tiles} shows the sensitivity of gathered weights to the compiler's maximum tile size.
-With default tiles the rank sort is 4.7\% slower than the token-owned program at capacity $T$ at $T=128$; with 512\,KiB
-tiles it is 1.4\% faster. The
-best size moves with the chunk, 512\,KiB up to 256 tokens and 1024\,KiB at 512; static weights prefer the default, which
-small tiles slow by 1--2\%. Each program therefore uses its own best size.
-
-\textbf{Capacity usage.} The largest lane loads observed in the timed chunks were 122, 20 and 8 of capacities 128, 48 and
-16 at $T=128$; 251, 36 and 17 of 256, 64 and 32 at 256; and 508, 83 and 37 of 512, 128 and 64 at 512. The first tier is
-nearly full in every case, which is why its capacity stays at $T$: taking each layer's calibration maximum instead would
-remove 10--15\% of its rows but overflow in one and five layers of the held-out chunks.
-
-\subsection{Accuracy}
-\label{sec:eval-acc}
-
-\begin{table}[t]
-\caption{Relative $L_2$ error of the last-position logits against FP32, and the next token (\checkmark: matches FP32).}
-\label{tab:acc}
-\vskip 0.1in
-\begin{center}
-\begin{small}
-\setlength{\tabcolsep}{4pt}
-\begin{tabular}{@{}lccc@{}}
-\toprule
-Program & $T=128$ & $T=256$ & $T=512$ \\
-\midrule
-1 Production                 & 0.188 \checkmark & 0.089 $\times$ & 0.095 \checkmark \\
-2--3 Naive \naive, rewrites & 0.172 \checkmark & 0.077 \checkmark & 0.094 \checkmark \\
-4 Token-owned combine     & 0.172 \checkmark & 0.073 \checkmark & 0.092 \checkmark \\
-5 Elementwise sum            & 0.190 \checkmark & 0.077 \checkmark & 0.095 \checkmark \\
-6--7 Rank sort, \sys         & 0.170 \checkmark & 0.087 $\times$ & 0.088 \checkmark \\
-\bottomrule
-\end{tabular}
-\end{small}
-\end{center}
-\vskip -0.15in
-\end{table}
-
-Every program stays at the error level of the production program's MXFP6 weights (Table~\ref{tab:acc}). The programs
-differ from production, and from one another, only in FP16 summation order: head-parallel attention regroups the output
-projection, which alone moves 343 of 49,152 routing assignments at $T=128$, and the token-owned combine sums a token's
-rows in a different order; neither leaves that level. Tiers are bit-identical to the two-tier sort, since
-the same experts compute the same tokens. The next token matches FP32 in every case except the 256-token chunk, whose two
-leading FP32 logits are 0.58 apart; production and the rank-sorted programs pick the second. No lane exceeded its
-capacity in any program.
-
-\subsection{What Did Not Work}
-\label{sec:eval-neg}
-
-\begin{table}[t]
-\caption{Alternatives we built or analyzed and rejected ($T=512$ unless noted).}
-\label{tab:neg}
+\begin{table*}[t]
+\caption{What transfers. For each part of \sys: the reasoning that holds on any static-shape target, the conditions under
+which it pays, and the Cloud AI 100 compiler behavior that shaped our realization of it.}
+\label{tab:transfer}
 \vskip 0.1in
 \begin{center}
 \begin{footnotesize}
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.33\columnwidth}>{\raggedright\arraybackslash}p{0.25\columnwidth}>{\raggedright\arraybackslash}p{0.36\columnwidth}@{}}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.11\textwidth}>{\raggedright\arraybackslash}p{0.31\textwidth}>{\raggedright\arraybackslash}p{0.25\textwidth}>{\raggedright\arraybackslash}p{0.27\textwidth}@{}}
 \toprule
-Alternative & Result & Reason \\
+Part & Transferable reasoning & Pays when & Shaped here by the compiler \\
 \midrule
-Sort first, then route on permuted columns & $+$2.5 vs.\ $+$1.6\,ms (12 layers, $T{=}128$) & all routing waits for the sort \\
-Row-chunked expert GEMMs & $+$25\%, $+$66\% (one layer) & each chunk re-streams and re-dequantizes the weights \\
-One partition per SoC & 1.7$\times$ slower & the runtime runs partitions in sequence \\
-Per-layer first-tier capacity & $-$10--15\% of its rows & held-out chunks overflow in 1--5 layers \\
-Co-locate experts that fire together & 3.63$\to$2.42 SoCs per token & doubles lower-tier loads; the exchange is 3\% \\
-Split first-tier experts over two lanes & $+$6\% (two layers) & 16 lanes stay on 8 cores; 1.8$\times$ dequantization \\
-Four tiers & $-$8.6\% vs.\ $-$14.1\% & one more sequential window \\
-No depth-first scheduling & $+$1--2\% & stages still run in sequence \\
+Rank-bound capacities & a lane serves a load rank within a device's experts; the $r$-th largest of $n$ assignments is at
+most $n/r$, and per-rank maxima were stable across workloads while identities were not; blocks stream weights per block & expert
+work is fixed before routing is known; padded rows cost time and the compiler cannot skip them (static weights at tuned
+tiles partly can); many experts per device & no control flow, so a sort and gathers; one gathered constant, replicated (22.5\,GiB per SoC); tile size tuned
+per chunk length \\
+Tier sizes & first tier at $T$; lower tiers at $h$ times the calibrated maximum of their first rank; the tier count trades
+rows against per-stage cost; overflows show in the counts & a stage's fixed cost is small against the rows it removes &
+lanes per SoC must divide 16 and stages run in sequence, hence three tiers of 8, 8 and 16 \\
+Token-owned combine & sum each token's $\le k$ rows where they were computed, then one cross-device sum; cost grows with
+$kT$, not with lanes$\,\times\,T$; no root device & the baseline combine is dense in lanes (this export, GShard-style
+einsums); many lanes per device relative to $k$ & rewrites of a zero read, a serial lane reduction and serial prefix sums
+(1.60--1.69$\times$); gather without zero fill; work kept on the lane axis; elementwise final sum \\
 \bottomrule
 \end{tabular}
 \end{footnotesize}
 \end{center}
 \vskip -0.15in
-\end{table}
+\end{table*}
 
-Table~\ref{tab:neg} lists the alternatives we rejected. Two are instructive. Splitting a heavily loaded expert over
-several lanes, each with a chunk of its rows, halves the first tier's GEMM time in isolation, but the compiler maps the
-resulting 16-lane stage onto the eight cores of the unsplit one and raises its dequantization 1.8$\times$, so the program
-gets slower. Co-locating experts that fire together cuts the SoCs a token touches from 3.63 to 2.42 and puts 12\% of the tokens
-on a single SoC, but it concentrates load, doubles the order statistics the lower tiers must cover (at $T=512$ from 50 to
-85 rows at rank 17), and targets an exchange that is only 3\% of the model; spreading such experts over SoCs instead
-lowers those statistics.
+\subsection{Fixed-Size Blocks Instead of Ranked Lanes}
+\label{sec:eval-blocks}
+
+Block scheduling packs assignments into blocks of $B$ rows, one expert per block, and provisions
+$\lceil kT/B\rceil + E - 1$ blocks to drop nothing \citep{awsneuronmoe}. We built it from \sys's own stage body, routing,
+gathers and combine: each SoC computes in the graph the blocks per expert, the expert and rows of every block slot, and
+the combine reads an assignment at row $M_e B + s$. Budgets per SoC: dropless for the worst local load of $8T$
+assignments, $\min(\lceil 8T/B\rceil + 31, 32\lceil T/B\rceil)$; calibrated by \sys's rule; and, as a non-deployable
+diagnostic, the timed prompt's active blocks. Outputs are bit-identical to \sys.
+
+
+
+The first block programs were 2.0--4.8$\times$ slower because the reused stage body materialized the hidden states once per
+lane (192\,MiB per SoC and layer at 96 lanes); a plain gather of the rows removed that (Table~\ref{tab:blocks} in Appendix~\ref{app:blocks}) but does
+not help \sys (16.4 against 16.0\,ms). What remains is weight traffic: every block slot streams its expert's MXFP6 weights (3.52\,MiB), used or
+not, so the 64-row dropless program reads 337.5\,MiB per SoC and layer against 95--106\,MiB for \sys, whose empty experts
+skip their reads. One weight load cannot serve consecutive blocks of an expert in this compiler; merging them into one
+lane with a static row count is a capacity, i.e.\ \sys. At $T=512$ the best calibrated block program is 1.26$\times$ slower than
+\sys, the best dropless one 1.51$\times$, and even the trace-specialized one 1.12$\times$, as its single stage runs four
+lanes per core on 12 of the 16 cores and spills; at $T=256$ these are 1.39, 1.59 and 1.13$\times$, at 128 1.69, 1.71 and 1.31$\times$. Blocks
+lose on weight traffic, not rows: at $T=512$ the trace-specialized programs and the calibrated ones with $B\le64$ provision fewer rows than \sys.
+
+\subsection{Beyond the First Chunk, and Overflow}
+\label{sec:eval-chunks}
+
+The programs keep the cache for $2T$ positions. A second chunk attends to the cache the first wrote: \sys and the static
+capacity-$T$ program give bit-identical logits for both chunks at $T=128$, 256 and 512, matching the FP32 reference's top
+five at positions $T-1$ and $2T-1$ and its next token except at two near-ties at $T=128$ (0.38 and 0.58 logits apart),
+and the second chunk costs what the first does.
+
+The lower tiers are calibrated, not dropless, so a deployment must detect overflow and recover. One program can hold
+several capacity profiles: tier capacities come from the lengths of two small row inputs, and the compiler specializes the
+program per profile over the same weights and on-device cache. After every chunk the host compares each lane's routed count
+with its capacity; on overflow it discards the outputs and reruns the chunk with the capacity-$T$ profile at the same
+positions, which rewrites every cache entry the failed attempt wrote. With an undersized profile forced on the second of
+four chunks of the full model, the overflow was detected in 45 (layer, lane) pairs from layer 0 on, the rejected logits were 0.04 relative
+$L_2$ off, and after the rerun all four chunks were bit-identical to runs without overflow, at full capacity and on the
+static program; the same holds for an overflow in the first chunk. Capacity inputs and extra profiles make the tiered
+program 18\% slower, however, so a static capacity-$T$ program kept resident beside \sys for replays may be the cheaper
+fallback.
+
+\subsection{Do Calibrated Capacities Generalize?}
+\label{sec:eval-gen}
+
+We split each of eight workloads into calibration and evaluation documents before cutting chunks and measured the routing
+of every chunk on the device. Calibrated without headroom, the rank rule reproduces \sys's capacities exactly at $T=256$
+(at 512 it gives a 112-row middle tier where \sys uses 128, which overflows in 2 of 449 chunks; at 128 a 32-row one where
+\sys uses 48). \sys's capacities overflowed in none of the 805, 618 and 449 evaluation chunks at $T=128$, 256 and 512 and in
+no workload (30 chunks hold documents they were calibrated on), nor did leave-one-workload-out calibration. The same tiers bound to a fixed expert order need capacity $T$ everywhere, and even
+calibrated per workload they need 1.4--2.7$\times$ the rows and still overflow in up to 30\% of chunks: at $T=512$ the
+busiest expert at a SoC's positions 9--16 or 17--32 exceeds 128 tokens in 30 or 23\% of (chunk, layer, SoC) cases, because which experts are
+busy moves from chunk to chunk, while ranks 1, 9 and 17 never exceeded 509, 119 and 52 tokens. The bound $n_{(r)}\le N/r$
+holds with room (at most 0.97 of it).
+
+\subsection{Accuracy}
+\label{sec:eval-acc}
+
+
+
+Every program stays at the error level of the production program's MXFP6 weights: the relative $L_2$ error of the
+last-position logits against FP32 is 0.170, 0.087 and 0.088 for \sys at $T=128$, 256 and 512, against 0.188, 0.089 and
+0.095 for production (Appendix~\ref{app:acc}). The programs differ from production only in FP16 summation order
+(head-parallel attention regroups the output projection; the token-owned combine reorders a token's rows), and the
+attribution and block programs are bit-identical to \sys. The next token matches FP32 except at 256 tokens, whose two
+leading FP32 logits are 0.58 apart. No lane exceeded its capacity.
+
+
 
 \subsection{Discussion and Limitations}
 \label{sec:limits}
 
-\textbf{Memory.} Replicating every expert's weights on every SoC costs 22.5 instead of 6.7\,GiB per SoC, which limits the
-room for KV cache and batching. The replication is a property of the compiler's fast path (\S\ref{sec:mot-addr}), not of
-the design: each SoC reads only its own 32 experts, and a per-operator device placement would store each bank once.
+\textbf{Scope.} The lower tiers are calibrated, not dropless: no evaluation chunk overflowed, but the deployed rate depends
+on model and workload. One model at batch 1; two consecutive chunks at every $T$ and four at $T{=}128$, but no decode,
+which needs a decode graph that our $T$-specific rewrites do not provide; blocks under this compiler only. The SoCs share a
+150\,W limit under which most padded programs throttle at times (\sys never does), so we compare programs within a session
+or across sessions through repeated anchors.
 
-\textbf{Statistical capacities.} Tiers 2 and 3 rely on order statistics calibrated with 1.28$\times$ headroom. The
-held-out chunks fit, and the program reports every lane's load, so an overflow is detectable after the chunk; a deployment
-could then re-run the chunk with a capacity-$T$ program, which we have not implemented.
+%-----------------------------------------------------------------------------------------------------------------------
+\section{What Transfers}
+\label{sec:transfer}
 
-\textbf{Scope.} We evaluate one model at batch 1 and three chunk lengths, and only the first prefill chunk: correctness
-of a second chunk against a filled cache, and decode, are untested for the expert-parallel programs. End-to-end latencies
-come from one prompt per chunk length, which is representative because latency depends on the routing only weakly.
+The speedups of \S\ref{sec:eval} combine an algorithm, conditions of hardware and model that decide how much it pays,
+and compiler behavior that decided how we built it; we call a part transferable when the same reasoning applies on another
+target, even if the transformation and the speedup differ (Table~\ref{tab:transfer}).
 
-\textbf{Power.} The four SoCs share one 150\,W limit. During a 512-token run the board peaks at 154--164\,W, SoCs 0 and 3
-drop from 1100 to 941\,MHz, and their expert stages finish up to 0.5\,ms later than those of the other SoCs; the effect
-follows the physical SoC and adds run-to-run variation, which is why we compare programs only within a session.
 
-\textbf{Beyond Cloud AI 100.} \sys needs two things from a static-shape stack: a sort, and a gather with run-time
-indices that the compiler lowers to efficient weight DMA. Other AOT stacks such as XLA offer both operators, so rank-bound
-capacities should carry over, but whether their gathers of weights are as cheap as here is untested.
 
-\textbf{What remains.} After \sys, the largest item of a 512-token layer is attention's sum over its four head groups,
-which the compiler lowers to batched reductions on four cores per SoC, partly through DRAM; it lies outside the MoE layer
-studied here.
+\textbf{The algorithm.} Capacities fixed before routing is known should follow load ranks, the combine should be owned
+by tokens, and it must be fixed before the padding (\S\ref{sec:eval-abl}). All three need only static shapes, a sort and
+gathers with run-time indices. The order-statistics bound holds for any routing; its stability across workloads is a
+property of the model, measured here for one.
+
+\textbf{When it pays.} The techniques target programs that fix an expert's work before routing is known; kernels that
+size expert work at run time have no padding to remove \citep{gale2023megablocks}. Padded rows must cost time, which
+depends on the hardware and on the compiler: a 16-lane stage of ours streams its MXFP6 weights in about 0.6\,ms, stays at
+that floor with 92 rows per lane and is bound by its tensor-unit time with 296, and static-weight GEMMs at a tuned tile
+size skip most padded rows while gathered ones do not, so the capacities gain 1.13--1.27$\times$ over the ranked program
+and 1.06--1.17$\times$ over the best static one. Blocks need what whole-expert lanes do not, a weight load shared by an
+expert's consecutive blocks or skipped for unused ones; where a stack provides both \citep{awsneuronmoe} they may close
+the 1.12--1.71$\times$ gap we measured. Both techniques need many experts per device relative to $k$ (32 per SoC against
+$k=8$ here; 8 experts with $k=2$ on four devices would leave little to rank), gathers that cost about as much as a static
+weight stream, and, for the combine, a lane-dense baseline such as this export's or GShard's einsums
+\citep{lepikhin2021gshard}.
+
+\textbf{What the compiler shaped.} The dense-path rewrites (1.60--1.69$\times$) repair this export and compiler; the
+token-owned combine and the elementwise final sum add 1.22--1.48$\times$ after them. The production baseline reflects the
+default partitioning: 1.85$\times$ slower than naive \naive at $T=128$ but 1.11--1.13$\times$ faster at 256 and 512, so our
+speedups over production do not transfer, while the reasoning does. A scheduler that overlaps independent stages would
+favor four or five tiers.
 
 %-----------------------------------------------------------------------------------------------------------------------
 \section{Conclusion}
 \label{sec:conclusion}
 
-Ahead-of-time compilation fixes two things that MoE prefill would rather decide per chunk: how many rows each expert
-computes, and how expert outputs return to their tokens. \sys keeps the program static and moves both decisions into
-data. Capacities are bound to per-SoC load ranks, whose order statistics are stable across workloads when expert
-identities are not, and the experts that fill each rank are gathered by index at run time, which the compiler supports at
-no cost. The combine is organized by token ownership, so it scales with routed rows and needs no root SoC, and an ablation
-shows that the padding series pays only once this combine is in place. On
-Qwen3-30B-A3B across the four SoCs of a Cloud AI 100 Ultra card, \sys prefills 128-, 256- and 512-token chunks
-4.05$\times$, 2.45$\times$ and 2.94$\times$ faster than the production compilation with the KV cache on device. The
-broader lesson for static-shape accelerators is that the order statistics of expert load are far more predictable than
-expert identities, which makes them the quantity to compile.
+Ahead-of-time compilation fixes how many rows each expert computes and how its outputs return to their tokens before
+routing is known. \sys moves both decisions into data: capacities follow per-device load ranks, whose order statistics are
+bounded and stable when expert identities are not, and the combine is owned by tokens. On Qwen3-30B-A3B across four Cloud
+AI 100 SoCs, \sys prefills 128-, 256- and 512-token chunks 4.05$\times$, 2.45$\times$ and 2.94$\times$ faster than the
+production compilation; with indirection and tiling matched, its capacities give 1.13--1.27$\times$ and beat fixed-size
+blocks by 1.26--1.71$\times$.
 
 \bibliography{references}
 \bibliographystyle{mlsys2025}
@@ -845,7 +811,7 @@ qaic-compile -aic-hw -aic-hw-version=ai100
 \end{verbatim}}
 \noindent Table~\ref{tab:sizes} lists the program sizes.
 
-\begin{table}[h]
+\begin{table}[H]
 \caption{Program file, device memory per SoC and compile time.}
 \label{tab:sizes}
 \vskip 0.1in
@@ -856,8 +822,8 @@ qaic-compile -aic-hw -aic-hw-version=ai100
 \toprule
 Programs & File & Memory/SoC & Compile \\
 \midrule
-Steps 1--5, static weights & 25\,GB & 6.6--7.1\,GiB & 6--12\,min \\
-Steps 6--7, gathered & 88\,GB & 22.4--22.5\,GiB & 12--23\,min \\
+Steps 1--5, static weights & 25\,GiB & 6.6--7.1\,GiB & 6--12\,min \\
+Steps 6--7, gathered & 88\,GiB & 22.4--22.5\,GiB & 12--23\,min \\
 \bottomrule
 \end{tabular}
 \end{small}
@@ -873,7 +839,7 @@ calibration set holds 16 GSM8K chunks and both halves of each 512-token chunk (5
 the evaluation use test questions 1000--1003 (256 tokens) and 1004--1011 (512 tokens), outside the calibration range.
 Table~\ref{tab:ranks} gives the largest per-SoC load at selected ranks, the input to the tier rule of \S\ref{sec:tiers}.
 
-\begin{table}[h]
+\begin{table}[H]
 \caption{Largest load of the rank-$r$ expert of a SoC over all calibration chunks, layers and SoCs.}
 \label{tab:ranks}
 \vskip 0.1in
@@ -906,4 +872,207 @@ On a one-layer replay (layer 2, MXFP6, expert-parallel), the combine and the cap
 both stages, a token-centric predecessor of the token-owned combine saves 12\%, 29\% and 23\% at $T=128$, 256 and 512;
 fitted capacities save 6\%, 14\% and 13\% with the dense combine but 9\%, 15\% and 25\% once the combine is fixed, since
 the padded compute is then exposed. Both together are 20\%, 40\% and 42\% faster than the naive layer.
+
+\section{Tile Size of Gathered Weights}
+\label{app:tiles}
+
+\begin{table}[H]
+\caption{Rank sort on 12-layer cuts: latency change against the token-owned program at capacity $T$ (default tiles)
+for three maximum tile sizes.}
+\label{tab:tiles}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$T$ & Default tiles & 512\,KiB & 1024\,KiB \\
+\midrule
+128 & $+4.7\%$ & $\mathbf{-1.4\%}$ & -- \\
+256 & $-5.1\%$ & $\mathbf{-18.2\%}$ & $-7.9\%$ \\
+512 & $-12.7\%$ & $-9.3\%$ & $\mathbf{-15.9\%}$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+\textbf{Tile size.} Table~\ref{tab:tiles} shows the sensitivity of gathered weights to the compiler's maximum tile size.
+With default tiles the rank sort is 4.7\% slower than the token-owned program at capacity $T$ at $T=128$; with 512\,KiB
+tiles it is 1.4\% faster. The
+best size moves with the chunk, 512\,KiB up to 256 tokens and 1024\,KiB at 512; static weights prefer the default only
+at $T=128$ (small tiles slow them by 1--2\%), while at 256 and 512 tokens 512\,KiB tiles make the static program 8\% and 16\%
+faster (Table~\ref{tab:attr}). Each program therefore uses its own best size.
+
+\section{Ladder Chart}
+\label{app:ladder}
+
+Figure~\ref{fig:ladder} plots Table~\ref{tab:ladder} relative to the production compilation.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_ladder.pdf}
+\vskip -0.08in
+\caption{Prefill latency of the seven programs relative to the production compilation at the same chunk length, with
+the latency of each program and the speedup of \sys.}
+\label{fig:ladder}
+\vskip -0.1in
+\end{figure}
+
+\section{Profiles of the Attribution Programs}
+\label{app:attrprof}
+
+\begin{table}[H]
+\caption{Layer 1 of instrumented two-layer cuts at $T=512$: MoE layer time, tensor-unit busy time summed over a SoC's
+cores (busiest SoC) and MXFP6 weight bytes read per SoC, per stage in execution order.}
+\label{tab:attrprof}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrll@{}}
+\toprule
+Program & MoE & HMX busy (ms) & Weights (MiB) \\
+\midrule
+A, default tiles & 6.87 & 26.0 / 21.1 & 53 / 56 \\
+A, 512\,KiB      & 4.12 & 5.1 / 3.1 & 56 / 56 \\
+B, 1024\,KiB     & 5.23 & 18.5 / 10.7 & 56 / 56 \\
+C, 1024\,KiB     & 5.74 & 24.3 / 8.9 & 56 / 56 \\
+D, 1024\,KiB     & 5.07 & 27.3 / 0.6 & 56 / 49 \\
+E (\sys)         & 3.65 & 0.8 / 3.3 / 0.35 & 49 / 28 / 28 \\
+Blocks, 64, dropless & 12.6 & 31.4 & 337.5 \\
+Blocks, 64, trace-specialized & 8.5 & 9.9 & 168.8 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+\section{Block Scheduling by Block Size}
+\label{app:blocks}
+
+\begin{table}[H]
+\caption{Block scheduling against \sys on two-layer cuts at $T=512$ (ms; \sys 15.9). Blocks per SoC in parentheses.}
+\label{tab:blocks}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$B$ & dropless & calibrated & trace-specialized \\
+\midrule
+16  & 38.3 (288) & 28.0 (176) & 19.7 (96) \\
+32  & 30.3 (160) & 21.2 (96)  & 18.1 (64) \\
+64  & 24.6 (96)  & 20.1 (64)  & \textbf{17.9} (48) \\
+128 & \textbf{24.0} (64) & = dropless & 18.1 (32) \\
+\midrule
+vs.\ \sys & 1.51$\times$ & 1.26$\times$ & 1.12$\times$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+\section{The Token-Owned Combine}
+\label{app:alg}
+
+\begin{algorithm}[H]
+\caption{Token-owned combine on SoC $c$}
+\label{alg:combine}
+\begin{algorithmic}[1]
+\REQUIRE top-$k$ experts $\mathcal{K}[t,1..k]$ of each token $t$; lane map $\ell(e)\mapsto(s,c',l)$ (stage or tier, SoC, lane);
+  $\mathrm{slot}[e,t]$, row of token $t$ in expert $e$'s input; weighted outputs $O_s\in\mathbb{R}^{L_sC_s\times d}$ of SoC $c$
+\FOR{all $t\le T$, $j\le k$ \textbf{in parallel}}
+  \STATE $e\leftarrow\mathcal{K}[t,j]$;\; $(s,c',l)\leftarrow\ell(e)$
+  \STATE $\mathit{idx}_{s'}[t,j]\leftarrow0$;\; $m_{s'}[t,j]\leftarrow0$ for every $s'$ \COMMENT{masked}
+  \IF{$c'=c$}
+    \STATE $\mathit{idx}_s[t,j]\leftarrow l\,C_s+\mathrm{slot}[e,t]$;\; $m_s[t,j]\leftarrow1$
+  \ENDIF
+\ENDFOR
+\FOR{each core $q$, owning tokens $t\in$ tile $q$}
+  \STATE $P_c[t]\leftarrow\sum_s\sum_{j}m_s[t,j]\,O_s[\mathit{idx}_s[t,j]]$ \COMMENT{$\le k$ rows}
+\ENDFOR
+\STATE $y\leftarrow(P_0+P_1)+(P_2+P_3)$ \COMMENT{elementwise, over SoCs}
+\end{algorithmic}
+\end{algorithm}
+
+\section{Rejected Alternatives}
+\label{app:neg}
+\label{sec:eval-neg}
+
+Table~\ref{tab:neg} lists the alternatives we rejected. Splitting a loaded expert over two
+lanes halves the first tier's GEMM time in isolation, but the compiler keeps the 16 lanes on eight cores per SoC and
+dequantizes each expert twice, so the program gets 6\% slower. Co-locating experts that fire together cuts the SoCs a
+token touches from 3.63 to 2.42, but it doubles the order statistics the lower tiers must cover (at $T=512$ from 50 to 85
+rows at rank 17) and targets an exchange that is only 3\% of the model.
+
+
+\begin{table}[H]
+\caption{Alternatives we built or analyzed and rejected ($T=512$ unless noted).}
+\label{tab:neg}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.33\columnwidth}>{\raggedright\arraybackslash}p{0.25\columnwidth}>{\raggedright\arraybackslash}p{0.36\columnwidth}@{}}
+\toprule
+Alternative & Result & Reason \\
+\midrule
+Sort first, then route on permuted columns & $+$2.5 vs.\ $+$1.6\,ms (12 layers, $T{=}128$) & all routing waits for the sort \\
+Row-chunked expert GEMMs & $+$25\%, $+$66\% (one layer) & each chunk re-streams and re-dequantizes the weights \\
+One partition per SoC & 1.7$\times$ slower & the runtime runs partitions in sequence \\
+Per-layer first-tier capacity & $-$10--15\% of its rows & held-out chunks overflow in 1--5 layers \\
+Co-locate experts that fire together & 3.63$\to$2.42 SoCs per token & doubles lower-tier loads; the exchange is 3\% \\
+Split first-tier experts over two lanes & $+$6\% (two layers) & 16 lanes stay on 8 cores; 1.8$\times$ dequantization \\
+Four tiers & $-$8.6\% vs.\ $-$14.1\% & one more sequential window \\
+No depth-first scheduling & $+$1--2\% & stages still run in sequence \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+
+\section{Stage Windows}
+\label{app:stages}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{figures/fig_stages.pdf}
+\vskip -0.08in
+\caption{GEMM window of each expert stage in execution order at $T=512$, two-layer profiles; segments are the per-stage
+medians over SoCs, labeled with lanes per SoC $\times$ capacity.}
+\label{fig:stages}
+\vskip -0.1in
+\end{figure}
+
+
+\section{Accuracy per Program}
+\label{app:acc}
+
+\begin{table}[H]
+\caption{Relative $L_2$ error of the last-position logits against FP32, and the next token (\checkmark: matches FP32).}
+\label{tab:acc}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Program & $T=128$ & $T=256$ & $T=512$ \\
+\midrule
+1 Production                 & 0.188 \checkmark & 0.089 $\times$ & 0.095 \checkmark \\
+2--3 Naive \naive, rewrites & 0.172 \checkmark & 0.077 \checkmark & 0.094 \checkmark \\
+4 Token-owned combine     & 0.172 \checkmark & 0.073 \checkmark & 0.092 \checkmark \\
+5 Elementwise sum            & 0.190 \checkmark & 0.077 \checkmark & 0.095 \checkmark \\
+6--7 Rank sort, \sys         & 0.170 \checkmark & 0.087 $\times$ & 0.088 \checkmark \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.15in
+\end{table}
+
 \end{document}
