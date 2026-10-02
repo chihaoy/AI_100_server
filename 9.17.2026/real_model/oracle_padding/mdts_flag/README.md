@@ -85,7 +85,15 @@ stages still run one after another (+1%). The full ladder (E36) takes the 48-lay
 2.06–2.37× and the padding work after them 1.06–1.38×. Against a naive T/T baseline with the same compile (E37: the flag,
 head-parallel attention, the export's own combine, every expert at capacity T), the reductions alone give 2.06–2.38×, the
 padding work alone at most 1.05× (0.69–0.85× with three tiers, which need one dense accumulator per tier width), and both
-together 2.18–3.27×: the padding work pays only after the reductions.
+together 2.18–3.27×: the padding work pays only after the reductions. Matched for weight indirection and tile size (E38), the rank-bound capacities make the run-time-ranked program 1.13 / 1.13 /
+1.27× faster at T = 128 / 256 / 512 and RankTier is 1.06–1.17× faster than the best static program: the static GEMMs at a
+tuned tile size skip most padded rows, the gathered ones do not, so the earlier 1.06–1.37× mixed a tile effect into the
+padding series. Fixed-size block scheduling built from the same stage body (E39) is 1.26× (calibrated) to 1.51× (dropless)
+slower than RankTier at T=512 and still 1.12× slower with a trace-specialized schedule, because every block slot streams its
+expert's weights. Consecutive chunks through the retained cache are bit-identical to the capacity-T program, and one
+program with capacity profiles detects a forced overflow and reruns the chunk bit-exactly (E40). Evaluated on held-out
+documents of eight workloads, the deployed ranked capacities overflow in none of 1872 chunks while a fixed expert order
+needs capacity T (E41), and with the dense path already repaired the token-owned combine still gives 1.46× (E42).
 
 ## 1. What the flag does
 
@@ -2200,6 +2208,357 @@ The padding-only three-tier programs are this port of the export's combine to ti
 accumulator; P2 keeps the export's single accumulator and is the fair padding-alone number. All E37 programs were deleted
 after timing.
 
+## 3.34 Capacity attribution with matched indirection and tile tuning (E38)
+
+The ladder of 3.32 and the ablation of 3.33 change three things between naive T/T and RankTier at once: the weight access
+(static per-lane constants against a runtime gather from the replicated bank), the expert-to-lane assignment (fixed order
+against the per-card sort), and the capacities, and they compare programs at different tile sizes. Experiment 1 of
+`RANKTIER_EXPERIMENT_PLAN.md` separates them with five programs that share expert/head parallelism, the token-owned
+combine, the elementwise final sum, MXFP6 and the retained KV cache:
+
+| ID | Expert-to-lane assignment | Capacity | Weight access | Graph |
+|---|---|---|---|---|
+| A | fixed (card-major: card c computes experts 32c..32c+31) | T for every expert | static per-lane constants | `build_full_stack.py --regroup cardmajor` + dyncard naive |
+| B | fixed, as runtime data (`min(position_ids, 0)` added to the identity index) | T | gather from the bank | `build_full_tiered.py --order identity --tiers 16xT,16xT` |
+| C | per-card runtime rank | T | gather | `--tiers 16xT,16xT` |
+| D | per-card runtime rank | 16 x T + 16 x T/8 (the runtime sort of 3.20) | gather | `--tiers 16xT,16xT/8` |
+| E | per-card runtime rank | 8 x T + 8 x C2 + 16 x C3 (RankTier) | gather | `--tiers 8xT,8xC2,16xC3` |
+
+All five give bit-identical logits at every chunk length and tile size (two-layer and full model). The tile size
+(`-size-split-granularity`, default / 512 / 1024 KiB) was first swept on two-layer cuts for every program (`run_e38a.sh`),
+then the full model was timed in the plan's two settings: every program at the default tile size (common setting), and
+each program at its best two-layer tile size (tuned setting). Full-model sessions `run_e38b.sh` (two or three programs per
+session, each timed twice in mirrored order, 3 rounds x 20, telemetry about every 3 s, program hashes recorded; the T=512
+sessions S1–S4 started by hand, the rest queued by `run_e38c.sh`);
+every session holds an anchor, and `e38_summary.py` fits log latency as program + session effects over all passes.
+
+**Full model, all three chunk lengths** (`full_model/e38/e38_summary.txt`; T=128: 4 sessions, 24 timed passes, largest
+residual of the program + session fit 0.34%; T=256: 5 sessions, 28 passes, 0.22%; T=512: 8 sessions, 46 passes, 0.32%; all
+logits bit-identical at each chunk length; no lane over capacity):
+
+| Program | T=128 default | tuned (tile) | T=256 default | tuned (tile) | T=512 default | tuned (tile) | Rows per card, T=128 / 256 / 512 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| A static, fixed order, T | 130.3 | 130.3 (def) | 256.6 | 236.0 (512) | 497.9 | 417.6 (512) | 4096 / 8192 / 16384 |
+| B gather, fixed order, T | 130.3 | 126.2 (1024) | 249.8 | 235.1 (512) | 492.6 | 442.3 (1024) | 4096 / 8192 / 16384 |
+| C gather, rank, T | 147.5 | 138.1 (512) | 270.2 | 233.6 (512) | 505.0 | 450.8 (1024) | 4096 / 8192 / 16384 |
+| D gather, rank, 16xT + 16xT/8 | 133.8 | 125.7 (512) | 243.8 | 210.9 (512) | 431.1 | 415.3 (1024) | 2304 / 4608 / 9216 |
+| E RankTier, 8xT + 8xC2 + 16xC3 | 128.0 | 122.5 (512) | 208.1 | 207.1 (1024) | 376.1 | 355.8 (1024) | 1664 / 3072 / 6144 |
+
+Milliseconds per chunk; "tuned" is each program at its best two-layer tile size (E38a). At T=512 the other candidates were
+also timed on the full model (S6–S8), and the two-layer choice held for every program: A 497.9 / 417.6 / 459.0 ms at the
+default / 512 / 1024 KiB, B 492.6 / 529.2 / 442.3, C 505.0 / 539.9 / 450.8, D 431.1 / 451.4 / 415.3, E 376.1 / 381.6 /
+355.8. At T=512 the gathered programs are slower at 512 KiB than at the default tile size. Memory per SoC is 6.6–6.9 GiB for A
+and 22.4–22.6 GiB for B–E (the replicated bank); program files are 26.4–26.6 GB and 94.3–94.6 GB.
+
+| Step | T=128 default / tuned | T=256 default / tuned | T=512 default / tuned |
+|---|---|---|---|
+| A to B: weight indirection | 1.000x / 1.033x | 1.027x / 1.004x | 1.011x / 0.944x |
+| B to C: run-time sort | 0.883x / 0.914x | 0.925x / 1.007x | 0.976x / 0.981x |
+| C to D: two tiers | 1.103x / 1.099x | 1.108x / 1.107x | 1.171x / 1.085x |
+| D to E: three tiers | 1.045x / 1.026x | 1.172x / 1.018x | 1.146x / 1.167x |
+| **C to E: rank-bound capacities after paying for dynamic selection** | **1.152x / 1.128x** | **1.298x / 1.128x** | **1.343x / 1.267x** |
+| A to E: RankTier against the static naive program | 1.018x / 1.064x | 1.233x / 1.140x | 1.324x / 1.174x |
+
+- The plan's primary result, C against E, is 1.13x, 1.13x and 1.27x at T = 128, 256 and 512 with every program at its best
+  tile size, and 1.15–1.34x at the default. Against the best static program RankTier is 1.06–1.17x faster.
+- The previous ablation's "padding after the reductions" (1.06–1.37x, 3.33) compared the static program at the default tile
+  size with RankTier at its tuned size, so it mixed the capacity effect with a tile effect.
+- Weight indirection is free once tiles are tuned at T=128 and 256 and costs 6% at T=512; the run-time sort is free at
+  T=256–512 but costs 9% (13% at the default tiles) at T=128, where it sits on a short layer's critical path (3.23). The two
+  tiers give 1.09–1.11x at every chunk length; the third tier adds 2–3% at T=128–256 and 17% at T=512.
+- RankTier never throttles: its SoCs stay at 1100 MHz in every active sample at all three chunk lengths, with board peaks
+  of 113–135 W (all four readings of a sample), while some padded programs at default tiles dip to 825–940 MHz on SoC 0 or 3 (peaks up to 161 W).
+
+**Why the tile size matters, and why indirection costs 6% when tuned** (instrumented two-layer profiles, `run_e38p.sh`,
+`stage_profile.py`, layer 1 at T=512; `full_model/e39/e38p_T512_profiles.txt`, weight bytes recomputed by the corrected `stage_profile.py` in
+`full_model/e39/stage_profiles_T512.txt`: bank-gather reads, or a static stage's weight reads without activation spills). Per stage: tensor-unit (HMX) busy time
+summed over a card's cores (largest card), MXFP6 weight bytes read from DDR per card:
+
+| Program | MoE layer | Stage windows (in execution order) | HMX busy per card | Weights per card |
+|---|---:|---|---|---|
+| A, default tiles | 6.87 ms | 16xT 1.24–2.25, 16xT 1.28–1.82 ms | 26.0 / 21.1 ms | 53 / 56 MiB |
+| A, 512 KiB | 4.12 ms | 16xT 0.86–1.09, 16xT 0.69–0.87 ms | 5.1 / 3.1 ms | 56 / 56 MiB |
+| B, 1024 KiB | 5.23 ms | 16xT 1.51–1.67, 16xT 0.96–1.49 ms | 18.5 / 10.7 ms | 56 / 56 MiB |
+| C, 1024 KiB | 5.74 ms | 16xT 1.52–1.91, 16xT 1.03–1.55 ms | 24.3 / 8.9 ms | 56 / 56 MiB |
+| D, 1024 KiB | 5.07 ms | 16xT 1.77–2.20, 16xT/8 0.60–0.85 ms | 27.3 / 0.6 ms | 56 / 49 MiB |
+| E, 1024 KiB | 3.65 ms | 16x64 0.45–0.55, 8xT 0.70–0.88, 8x128 0.48–0.51 ms | 0.8 / 3.3 / 0.35 ms | 49 / 28 / 28 MiB |
+
+The static program's 512 KiB tiling issues the same number of HMX operations as its default tiling (168 per gate MatMul on
+card 0), but most take under 0.5 µs (median 0.3 µs; about a third take 5–27 µs) instead of 24–138 µs (median 34 µs): at that
+tile size the gate and up GEMMs with static weights skip most of the padded rows on the tensor unit (the down projections, at
+8–80 µs per operation, do not), and the stage becomes weight-bound (56 MiB in about 0.9 ms). The runtime-gathered GEMMs do not: C's second
+stage holds at most 30 tokens per 512-row lane in this layer (37 in any layer) and still costs 4–9 ms of HMX time per card, and the gathered programs are
+slower at 512 KiB than at 1024. That is the 6% of A to B, and it is a compiler behavior, not a property of indirection: a static
+program cannot follow the run-time ranking, so the ranked programs need the gather and lose the row skipping, and RankTier's
+capacities give back what the skipping would have saved and more (8 lanes at capacity T instead of 16 run at 0.39 ms of HMX per
+lane instead of 1.3–1.7 ms, the shared-traffic effect of 3.30). Lanes whose expert receives no tokens skip their weight reads
+only in some programs: the static program at the default tile size (3.5 MiB less per empty lane, 45.7–52.7 MiB per stage) and
+the 64-row tiers of D and E (E's 16-lane tier reads 39 MiB instead of 56 on cards 2 and 3); A at 512 KiB and B and C at 1024 KiB
+read all 56 MiB per stage with up to five empty lanes per stage and card.
+
+## 3.35 Fixed-size block scheduling as the alternative organization (E39)
+
+Experiment 2 of the plan: instead of one lane per expert with ranked capacities, pack every card's local assignments into
+blocks of B rows, one expert per block (the block provisioning of the AWS Neuron MoE guide). `build_full_tiered.py --blocks B`
+builds it from the same retained-state stack and reuses RankTier's stage body, so routing, the native token tables, the
+weight gathers from the replicated bank, MXFP6, the token-owned combine and the elementwise final sum are the same; only the
+organization of the expert work differs. Per card, in the graph: blocks per expert m_e = ceil(n_e / B), first block
+M_e = exclusive prefix sum (a [4, 32] x [32, 32] triangular MatMul), and for each of the N block slots its expert (the number
+of experts whose blocks end at or before the slot), chunk j = b - M_e and row count clip(n_e - jB, 0, B); unused slots fall
+on the last expert with count 0. Each block gathers its expert's weights by that runtime index and B rows of its token
+table; the combine reads an assignment at row M_e * B + slot. Outputs are bit-identical to RankTier.
+
+Budgets per card (`scripts/e39_block_budget.py`, rounded up to 16 lanes for the core mapping):
+- **dropless**: min(ceil(8T/B) + 31, 32 ceil(T/B)): a card can receive up to 8T local assignments (all of a token's eight
+  experts on one card), the per-SoC worst case the plan asks for; 96 blocks of 64 at T=512.
+- **calibrated**: 1.28 x the largest active-block count of any card, layer and calibration chunk (RankTier's headroom rule),
+  capped at the dropless budget; not dropless, like RankTier.
+- **trace-specialized** (oracle, not deployable): per layer the largest active-block count over the cards for the timed
+  prompt (device routing of the static program; at T=128 and 256 the budgets of the timed layers 0–1 were computed from the
+FP32 reference routing, which gives the same budgets there).
+
+**T=512, two-layer cuts, three sessions** (`run_e39.sh`; `full_model/e39/e39_T512_P{1,2,3}.txt`; table by
+`scripts/e39_summary.py`; RankTier 15.88–15.96 ms in every session; all logits bit-identical to RankTier). The first
+session swept the four block sizes with the dropless budget over the three tile sizes; the tile hardly matters for blocks
+(within 3%), so the second session uses each block size's fastest tile (1024 KiB for B=32, otherwise the default) and the
+third the default:
+
+| Block size | Dropless | Dropless, direct gather | Calibrated, direct gather | Trace-specialized, direct gather |
+|---:|---:|---:|---:|---:|
+| 16 | 288 per card: 76.2 ms (4.80x) | 38.3 ms (2.41x) | 176: 28.0 ms (1.77x) | 96: 19.7 ms (1.24x) |
+| 32 | 160: 50.7 ms (3.19x) | 30.3 ms (1.91x) | 96: 21.2 ms (1.34x) | 64: 18.1 ms (1.14x) |
+| 64 | 96: 36.6 ms (2.30x) | 24.6 ms (1.55x) | 64: 20.1 ms (1.26x) | 48: 17.9 ms (1.12x) |
+| 128 | 64: 31.7 ms (2.00x) | 24.0 ms (1.51x) | = dropless | 32: 18.1 ms (1.14x) |
+
+(For reference in the same sessions: static naive T/T at 512 KiB 16.9 ms, the rank sort at capacity T 19.2 ms.)
+
+**What the profiles show** (instrumented two-layer cuts, layer 1; `e38p_T512_profiles.txt`, `e38p_T512_fix_profiles.txt`;
+weight and spill bytes from the corrected `stage_profile.py`, `stage_profiles_T512.txt`):
+- The first block programs paid for a lowering artifact of the reused stage body: the activation read is
+  `CtxGather3D(Expand(hidden, [lanes, T, 2048]), tokens)`, and with 96 lanes per card the compiler materializes the expanded
+  hidden states (192 MiB of DDR writes per card per layer, 6.3 ms of vector time). `--direct-gather` reads the rows with a
+  plain Gather from [T, 2048] instead; it cuts the 64-row dropless program from 36.6 to 24.6 ms but makes RankTier 3% slower
+  (16.4 against 16.0 ms), so RankTier keeps the export's read. Every block result above with direct gather uses it.
+- Every block slot reads its expert's weights, used or not: the weight gathers move exactly the MXFP6 bytes of one expert per
+  slot (3.52 MiB), so the 64-row dropless program reads 337.5 MiB per card per layer against 95–106 MiB for RankTier (whose
+  empty experts in the low-capacity tiers skip their reads). Pointing the unused slots and the padded rows at the export's
+  empty-position marker (INT32_MAX, `--block-pad invalid`) does not change that (37.1 ms, 337.5 MiB). There is no way to
+  express reuse of one weight load across consecutive blocks of the same expert in this compiler: each block's weights are an
+  independent indirect DMA, and merging the blocks of an expert into one lane with a larger, static row count is exactly a
+  capacity, i.e. RankTier.
+- With 48–96 lanes per card the single block stage runs 4–8 lanes per core in sequence (48 lanes as 4 per core on 12 of the 16
+  cores, 96 as 8 per core on half of the cores and 4 on the other half), its intermediate activations spill to DDR (82–436 MiB
+  per card and layer), and the block metadata takes 0.5–0.9 ms per layer in the instrumented runs (2.2 ms in the direct-gather
+  dropless program, where it overlaps the GEMMs, and 7.9 ms with invalid padding). Even the trace-specialized schedule (only the
+  prompt's active blocks, not deployable) has one 2.6–2.9 ms GEMM window against RankTier's three windows totalling 1.75 ms.
+
+So under this compiler the organization matters: RankTier is 1.26x faster than the best calibrated block program (same
+guarantee class: both calibrated, not dropless; only RankTier's overflow check was built, 3.36) and 1.51x faster than the best dropless one, and 1.12x faster than the
+non-deployable trace-specialized block schedule, at the same routing, weights, precision and combine. The block baseline
+loses on weight traffic (one load per block), not on padded rows: its rows per card are as few as RankTier's or fewer except with 128-row blocks (8192 against 6144).
+
+**T=256, direct gather** (one session, `e39_T256_P1dg.txt`; RankTier 9.41 ms, static naive T/T and the rank sort at
+capacity T 10.5 ms each, 1.12x):
+
+| Block size | Dropless | Calibrated | Trace-specialized |
+|---:|---:|---:|---:|
+| 16 | 160 per card: 22.39 ms (2.38x) | 112: 16.22 ms (1.72x) | 64: 12.46 ms (1.32x) |
+| 32 | 96: 16.54 ms (1.76x) | 64: 13.14 ms (1.40x) | 48: 12.86 ms (1.37x) |
+| 64 | 64: 15.00 ms (1.59x) | 48: 13.05 ms (1.39x) | 32: 10.65 ms (1.13x) |
+| 128 | 48: 16.38 ms (1.74x) | = dropless | 32: 13.13 ms (1.39x) |
+
+The 64-row dropless program without direct gather takes 18.86 ms (2.00x). As at T=512 every block program is bit-identical
+to RankTier, and the best block programs are 1.39x (calibrated), 1.59x (dropless) and 1.13x (trace-specialized) slower.
+
+**T=128, direct gather** (one session, `e39_T128_P1dg.txt`; RankTier 5.98 ms, static naive T/T 6.44 ms (1.08x), the rank sort
+at capacity T 6.75 ms (1.13x)): dropless 12.23 / 10.32 / 10.25 / 10.30 ms for B = 16 / 32 / 64 / 128 (best 1.71x), calibrated
+11.12 ms (B=16, 80 per card) and 10.14 ms (B=32, 48 per card; best 1.69x; B=64 and 128 calibrate to the dropless budget),
+trace-specialized 9.19 / 8.87 / 7.82 ms for B = 16 / 32 / 64 (best 1.31x); the 64-row dropless program without direct gather
+11.47 ms. All bit-identical to RankTier.
+
+| Best block program against RankTier (two-layer cuts) | T=128 | T=256 | T=512 |
+|---|---:|---:|---:|
+| Calibrated budget (same guarantee class as RankTier) | 1.69x | 1.39x | 1.26x |
+| Dropless budget | 1.71x | 1.59x | 1.51x |
+| Trace-specialized (not deployable) | 1.31x | 1.13x | 1.12x |
+
+The gap grows at shorter chunks, presumably because RankTier's stages run near the weight-streaming floor there while the
+block programs still stream one expert's weights per block slot (there are no block profiles at T=128 or 256).
+
+## 3.36 Beyond the first chunk: two consecutive chunks, forced overflow and recovery (E40)
+
+Every program so far was timed on one chunk at positions 0..T-1. The programs hold the KV cache for 2T positions
+(ctx_len = 2T), so a second chunk at positions T..2T-1 attends to the cache written by the first. New host tool
+`scripts/moe_qwen3_multichunk_host.cpp`: one load and activation, consecutive chunks at their positions, the whole
+sequence repeated (the accepted logits must repeat exactly), and after every attempt the per-lane routing counts are
+checked against the capacities of the profile in use (`scripts/e40_plan.py` writes the plan).
+
+**Overflow fallback in one program.** `build_full_tiered.py --capacity-inputs` takes the capacities of tiers 1 and 2
+from the lengths of two int32 inputs (`cap_rows1`, `cap_rows2`, values 0..C-1 that replace the tiers' row Range) plus a
+zero tag whose length names the profile, the mechanism of `9.17.2026/runtime_constraints/README.md`. One compile then
+holds several capacity profiles over the same weights and the same retained KV cache, selected per call by the buffer
+dimensions. On overflow the host rejects the attempt (its logits are discarded) and reruns the chunk with the
+full-capacity profile at the same positions, which rewrites every KV entry the failed attempt wrote; later chunks see only
+the rerun's cache.
+
+**Two-layer mechanism check** (`scripts/run_e40a.sh`, `full_model/e40/e40a.txt`): RankTier at T=128 with capacity inputs and
+three specializations in one QPC (tiered 8x128 + 8x48 + 16x16, full 8x128 + 8x128 + 16x128, and an undersized tight profile
+with the last tier at 4 rows), ctx_len 512; four consecutive 128-token chunks of the 512-token held-out prompt; every
+schedule repeated five times:
+
+| Schedule | Chunk latency (two layers) | Overflow detected | Accepted logits |
+|---|---|---|---|
+| R: every chunk tiered | 6.92–7.00 ms | none | reference |
+| F: chunk 1 forced to the tight profile | chunk 1: 7.30 ms rejected (28 (layer, lane) pairs over capacity, 26 lanes in both layers, from layer 0, max excess 5), rerun full 8.45 ms | yes | every chunk bit-identical to R |
+| U: every chunk full | 8.27–8.44 ms | none | every chunk bit-identical to R |
+
+The rejected attempt's logits differ from the accepted ones by 0.187 relative L2, so overflow does corrupt the result and the
+check is needed; chunks 2 and 3 after the rerun are bit-identical to R, so the rerun rewrote all the KV state the failed
+attempt touched. A chunk right after a profile switch runs within 3% of the same profile without one (two layers; within 0.8% on the full model, E40b, about the 0.7% spread of chunks without a switch).
+
+**Full model, two chunks** (`scripts/run_e40c.sh`, programs of the E38 sessions with ctx_len 2T; held-out prompts with an
+FP32 reference at every position: T=512 uses the 1024-token `heldout_T1024_ids.npy`, GSM8K test questions 1004–1016 in one
+chat turn, whose first 512 tokens are the timing prompt; FP32 reference `full_model/ref1024/`):
+
+| T | Program | Chunk 1 | Chunk 2 (attends to 2T) | vs FP32: chunk 1 / chunk 2 | Bit-identical to A |
+|---:|---|---:|---:|---|---|
+| 512 | A (static naive T/T, default tiles) | 496.0 ms | 495.3 ms | rel L2 0.0883 / 0.1082, argmax and top-5 match | — |
+| 512 | E (RankTier, default tiles) | 375.5 ms | 376.2 ms | same | both chunks |
+| 256 | A (512 KiB) | 239.2 ms | 236.9 ms | rel L2 0.0459 / 0.0916, argmax and top-5 match | — |
+| 256 | E (1024 KiB) | 207.9 ms | 206.2 ms | same | both chunks |
+| 128 | A (default tiles) | 130.0 ms | 128.4 ms | rel L2 0.214 / 0.085, top-5 match, argmax swapped at both near-ties | — |
+| 128 | E (512 KiB) | 122.8 ms | 121.2 ms | same | both chunks |
+
+At T=128 the chunk ends fall on two near-ties of the FP32 reference (positions 127 and 255 of the 256-token held-out
+prompt: top two logits 0.38 and 0.58 apart, the second the known near-tie of 3.25); every program swaps the top two there,
+with the same top-3 set, so this is the MXFP6 error level, not the tiers (A and E are bit-identical).
+
+At T=512, chunk 1 of the two-chunk run is bit-identical to the single-chunk E38 run of the same program (the 1024-token prompt
+starts with the 512-token timing prompt; at T=128 and 256 the two-chunk prompts differ from the timing prompts), and no lane
+exceeded its capacity in either chunk.
+
+**Full model, four chunks, forced overflow and recovery** (`scripts/run_e40b.sh`, `full_model/e40/e40b.txt`): RankTier at
+T=128 with capacity inputs and the three profiles of the two-layer check, ctx_len 512, 512 KiB tiles (one 48-minute compile,
+94.8 GB against 94.4 GB for the single-profile program: the profiles share the weights); the static program A with ctx_len 512
+as the full-capacity reference; four 128-token chunks of the 512-token held-out prompt; every schedule five times:
+
+| Schedule | Chunk latency (full model) | Overflow detected | Accepted logits vs schedule R |
+|---|---|---|---|
+| A: static, capacity T | 127.7–130.1 ms | – | bit-identical, every chunk |
+| R: every chunk tiered | 144.6–145.0 ms | none | reference |
+| F: chunk 1 forced tight | chunk 1: 146.6 ms rejected (45 (layer, lane) pairs over capacity, 27 lanes in 11 layers, from layer 0), rerun full 171.5 ms | yes | bit-identical, every chunk |
+| G: chunk 0 forced tight | chunk 0: 147.8 ms rejected (61 pairs, 24 lanes in 23 layers, from layer 0), rerun full 172.4 ms | yes | bit-identical, every chunk |
+| U: every chunk full | 170.3–171.1 ms | none | bit-identical, every chunk |
+
+Against the FP32 reference at positions 127/255/383/511 the accepted logits are 0.123 / 0.046 / 0.105 / 0.091 relative L2
+with the FP32 next token at all four; the rejected attempts differ from the accepted ones by 0.040. So recovery is exact on
+the full model too, including the cache state the failed attempt wrote, and including an overflow on the very first chunk.
+
+The cost: this program's tiered profile runs at 144.8 ms per chunk, 18% slower than the single-profile RankTier program at the
+same chunk length and tile size (122.5 ms) and slower than the static program; its activation takes 7.6 s instead of 2.9 s.
+A recovered chunk costs the rejected attempt plus a full-profile rerun (318–320 ms). With no overflow in the 1872 evaluation
+chunks of 3.37, the steady-state cost dominates, so on this compiler the cheaper deployment keeps the single-profile RankTier
+program and a static capacity-T program resident together (22.4 + 6.6 GiB per SoC at T=128; loading both was not tested) and, on overflow, rebuilds
+the cache by re-prefilling the prompt's chunks up to the overflowing one on the static program; that path was not timed.
+
+**Where the 18% comes from** (`scripts/run_e40d.sh`, `full_model/e40/e40d.txt`): the same capacity-input graph compiled with
+only the tiered specialization runs the four chunks at 138.5–139.1 ms (activation 3.0 s), bit-identical to E40b's schedule R.
+So reading the capacities from input lengths costs 13% by itself, presumably because the slice ends, row ranges, the combine's
+capacity table and the data shapes become run-time values the compiler cannot fold (not profiled; the comparison also has
+ctx_len 512 against 256, which costs program A nothing: 127.7–130.1 against 130.3 ms), and the two extra specializations add 4.5% and the
+longer activation.
+
+## 3.37 Do calibrated capacities generalize? Held-out chunks from eight workloads (E41)
+
+The capacities so far came from 400 128-token prompts of eight workloads (T=128) and from 56 and 20 calibration chunks of
+four workloads (T=256, 512), and were checked on one held-out prompt per chunk length. This round follows the plan's protocol (experiment 4b): each workload's items are split into a calibration
+half and an evaluation half by item index **before** chunking (`scripts/e41_make_chunks.py`; consecutive items joined into
+one chat turn until it reaches T tokens, each item used once), for eight workloads (GSM8K, HumanEval, MMLU, SWE-bench Lite,
+Alpaca, CNN/DailyMail, Chinese (XNLI sentence pairs), HumanEval in JavaScript), at most 200 chunks per half (MMLU at every
+chunk length, GSM8K at T=128). The routing counts are measured
+on the device (`scripts/run_e41.sh`: the static full-capacity program runs every chunk as an independent prefill through
+the multi-chunk host's capture mode, 0.55 s per 512-token chunk), so they are the deployed MXFP6 routing, not the FP32
+model's. The static program reports them in its card-major lane order, which `scripts/e41_analysis.py` maps back to experts
+(a first version of this section grouped the lanes as if they were in expert order, which pairs the experts of two cards; the
+numbers below are the corrected ones). The E41 split is by document, but 30 of the 1872 evaluation chunks contain a document
+that the deployed capacities were calibrated on earlier (T=128: 21 Alpaca, 1 MMLU; T=256: 4 HumanEval, 1 MMLU; T=512: 2
+HumanEval, 1 MMLU); none of them overflows, so the zero below also holds for the other 1842.
+
+Two designs with RankTier's lane structure (8, 8 and 16 lanes per card): **ranked**, the lanes take the card's experts by
+run-time rank, tier capacity = h x the largest count at the tier's first rank over the calibration chunks (the
+tier_budget.py rule); **fixed**, the lanes take the card's experts in a fixed order (per layer and card, by calibration
+mean count), tier capacity = h x the largest count of any expert at the tier's positions. A chunk overflows if any lane of
+any layer on any card exceeds its capacity.
+
+**Summary** (device routing; `full_model/e41/e41_analysis.txt`):
+
+| T | Calibration / evaluation chunks | Ranked, h = 1.0 | Deployed RankTier: rows, chunks overflowing | Fixed order: rows needed |
+|---:|---|---|---|---:|
+| 128 | 782 / 805 | 128/32/16, no chunk overflows | 1664, 0 of 805 | 4096 |
+| 256 | 608 / 618 | 256/64/32 = deployed | 3072, 0 of 618 | 8192 |
+| 512 | 441 / 449 | 512/112/64, 2 chunks overflow | 6144, 0 of 449 | 16384 |
+
+**T=512** (441 calibration and 449 evaluation chunks: GSM8K 75/77, HumanEval 16/21, MMLU 200/200, SWE-bench 66/71, Alpaca 7/6,
+CNN/DailyMail 46/38, Chinese 14/14, code 17/22; `full_model/e41/e41_analysis.txt`):
+
+| Headroom h | Ranked capacities | Rows per card | Evaluation chunks with any overflow | Fixed-order capacities | Rows | Overflow |
+|---:|---|---:|---:|---|---:|---:|
+| 1.0 | 512 / 112 / 64 | 6016 | 2 of 449 | 512 / 512 / 512 | 16384 | 0 |
+| 1.15 | 512 / 128 / 64 | 6144 | 0 | 512 / 512 / 512 | 16384 | 0 |
+| 1.28 | 512 / 144 / 80 | 6528 | 0 | 512 / 512 / 512 | 16384 | 0 |
+| 1.5 | 512 / 176 / 80 | 6784 | 0 | 512 / 512 / 512 | 16384 | 0 |
+
+- Calibrated on the new chunks without headroom, the ranked rule gives 512/112/64, one 16-row step below the deployed middle
+  tier, which overflows in 2 of the 449 evaluation chunks (by at most 7 assignments); h = 1.15 gives the deployed 512/128/64,
+  which overflows in none of the 449 and in no workload, and leave-one-workload-out calibration at h = 1.28 (each held-out
+  workload's capacities from the other seven) overflows in no held-out workload.
+- A fixed expert order cannot be calibrated below naive T/T: under the pooled calibration order, the busiest expert at a
+  card's positions 9–16 receives more than 128 tokens in 30% of the evaluation chunks' (chunk, layer, card) cases and the
+  busiest at positions 17–32 in 23%, up to 509 and 499 tokens; within a single workload positions 17–32 still reach 265
+  (GSM8K) to 499 (Chinese). Which experts are busy moves from chunk to chunk across the 48 layers, while the sorted profile
+  does not: rank 1/9/17 carry at most 509/119/52 tokens (median 182/40/11).
+- The order-statistics bound holds with room: max over chunks, layers and cards of r * n_(r) / N is 0.95.
+
+**T=256** (608 calibration and 618 evaluation chunks): the same picture. Ranked at h = 1.0 gives exactly the deployed
+256/64/32 (3072 rows per card), which overflows in none of the 618 evaluation chunks and no workload, and no
+leave-one-workload-out calibration at h = 1.28 overflows; h = 1.28 gives 256/80/48. A fixed order needs 256/256/256 (naive T/T, 8192 rows) at every headroom. Sorted load:
+rank 1/9/17 at most 254/62/25 (median 95/20/5); max r * n_(r) / N = 0.94.
+
+**T=128** (782 calibration and 805 evaluation chunks): ranked at h = 1.0 gives 128/32/16 (1536 rows), which overflows in
+none of the 805 evaluation chunks. The deployed 128/48/16 (1664 rows, the h = 1.15 result), which carries headroom in the middle
+tier, overflows in none of the 805 either, and h ≥ 1.28 gives 128/48/32. A fixed order needs 128/128/128 (4096 rows, naive
+T/T); calibrated per workload it needs 3584–4096 (and SWE-bench still overflows in 1%). Sorted load: rank 1/9/17 at most
+127/30/12; max r * n_(r) / N = 0.97.
+
+**Per-workload calibration does not rescue a fixed order.** Calibrated on a workload's own calibration documents and
+evaluated on its own evaluation documents (h = 1.28), the ranked tiers need 6016–6528 rows per card at T=512 and 3072–3456
+at T=256 with no overflow in any workload; the fixed order needs 8704–16384 and 5376–8192 rows and still overflows in 9%
+(code), 1% (GSM8K), 10% (HumanEval) and 30% (SWE-bench) of the evaluation chunks at T=512 and 16% (SWE-bench) at T=256.
+
+## 3.38 Combine design against reduction lowering (E42)
+
+Experiment 3 of the plan separates the representation of the combine from the lowering repairs, at capacity T with the
+expert GEMMs unchanged. The four variants are the reduction steps of the ladder (3.32), all naive T/T with the flag and
+head-parallel attention: **R0** the export's dense combine (`native_c128_hp`), **R1** the dense combine after the dense-path
+rewrites (`stack512_native_rw_ret_dense_hp`: no read-back of the zeroed accumulator, tiled lane reduction, tree prefix sums, 3.10), **R2** the token-owned
+combine (`full512_naive_hp`, 3.13), **R3** R2 with the elementwise final sum (`full512_naive_tileadd_hp`, 3.27/3.28).
+Uninstrumented full-model latencies are the ladder's (3.32); this round adds instrumented two-layer profiles of the same graphs
+at T=512 (`run_e38p.sh 512 e42R0:def ... e42R3:def`, `full_model/e39/e42_T512_combine_profiles.txt`, layer 1):
+
+| Variant | Full model, T=512 (3.32) | MoE layer (instrumented) | After the last expert GEMM | Cross-SoC bytes in the MoE |
+|---|---:|---:|---:|---:|
+| R0 export dense combine | 1164.1 ms | 20.2 ms | 11.1–11.8 ms | 48.1 MiB |
+| R1 dense, lowering repaired | 729.1 ms | 10.2 ms | 4.7–5.5 ms | 48.1 MiB |
+| R2 token-owned | 498.4 ms | 6.4 ms | 1.2–1.4 ms | 14.0 MiB |
+| R3 token-owned + elementwise final sum | 491.1 ms | 7.0 ms | 1.0–1.5 ms | 14.0 MiB |
+
+The primary comparison is R1 against R2: with the dense path already repaired, removing the dense representation still takes
+the full model from 729 to 498 ms (1.46x), the time after the last expert GEMM from about 5 ms to 1.3 ms, and the cross-SoC
+traffic of the MoE from 48 to 14 MiB per layer. R0 to R1 (1.60x) is lowering: the same dense accumulator without the
+read-back of its zeros, with a tiled lane reduction and with tree scans instead of the serial prefix sums. R2 to R3 is 1.5% on
+the full model and reversed in the instrumented two-layer cut (MoE layer 7.0 against 6.4 ms). The dense accumulator holds every (lane, token) row, [64, T, 2048] per stage (128 MiB per stage
+per layer in fp16 at T=512); the token-owned combine gathers only the 8T assigned rows, [4, 8T, 2048] (64 MiB).
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -2215,9 +2574,9 @@ after timing.
   the historical MXFP6 logits, which validates the reconstruction. The E9–E12 flag builds
   are prefill-only (zero KV cache) because retained state did not pair under the
   flag, about 50 ms against a retained-state program; E17 (3.15) restores the retained
-  cache with a head-parallel attention block, measured on the first 128-token chunk
-  only (multi-chunk and decode correctness of the retained cache are not yet tested;
-  prompt 41 has 140 tokens, so a second chunk needs another prompt). The FP32
+  cache with a head-parallel attention block, measured on the first 128-token chunk;
+  E40 (3.36) later checks two consecutive chunks on the full model at every chunk length, four
+  at T=128 and four on two-layer cuts, bit-identical across programs and schedules; decode is still untested. The FP32
   reference tree (`/home/chihao/mllm/9.17.2026/e2e/ref`) was deleted before E17; it
   was regenerated into `full_model/ref/` with `scripts/e2e_cpu_ref_local.py` (the
   repo's `tools/moe_e2e_cpu_ref.py` minus two validation loads into the deleted tree):
@@ -2232,10 +2591,12 @@ after timing.
   the checkpoint into `full_model/` (see the previous item); the partition config,
   specialization file and KV-only custom IO list are in `full_model/configs/` and
   `scripts/mdp_ts_4.json`.
-- The zero-GEMM stage seen once in `layer_profile` (layer 31, a stage with no
-  assignments) is not evidence of a runtime skip: the compiler rejects data-dependent
-  control flow (3.18), and in every profile here each lane of a compiled stage streams
-  its bank whether or not it receives tokens (3.17). Its cause was not established.
+- Empty experts and weight reads. The compiler has no data-dependent control flow (3.18), yet in the instrumented
+  profiles of E38 (T=512, layer 1) lanes whose expert receives no tokens skip their weight reads in the 64-row stages of D
+  and E (2–5 lanes per card, 39 instead of 56 MiB on cards 2 and 3) and in the static program at the default tile size, while
+  every lane of the 512-row stages of A at 512 KiB and of B and C, and every block slot of E39, reads its weights. The trigger
+  was not established (for A it depends on the tile size); the earlier statement here that every lane
+  streams its bank in every profile was too strong.
 - E20–E22 are single-layer replays of layer 2 with routing and MoE inputs from the FP32
   CPU stack, 50 prompts per workload at T=128 and far fewer at T=256 (16, GSM8K only)
   and T=512 (20). The dynamic split has not been ported to the full model; its DDR cost
@@ -2252,13 +2613,24 @@ after timing.
 - E30 is offline analysis of the calibration routing: the run-time lane split, the placements and the row-budget
   combine were not built; the time estimates rest on the 3.16 hot-stage measurements. E31 measures two-layer cuts only.
 - The "four cards" are four SoCs on one AI 100 Ultra board with a shared 150 W cap (E31); per-SoC clocks dip under
-  load, so absolute timings carry run-to-run variation and only same-session back-to-back comparisons are used.
-- E34's tier capacities rest on the calibration chunks of E28/E29 with 1.28× headroom; a prompt that exceeds a tier's
-  capacity would drop assignments. The stage order and the cores per stage are the compiler's choice. Tiers were not
+  load, so absolute timings carry run-to-run variation; comparisons are made within a session or, from E36 on, across sessions
+  through repeated anchor programs (E38: a program + session fit, session factors 0.997–1.003).
+- E34's tier capacities rest on the calibration chunks of E28/E29 with 1.28× headroom; E41 (3.37) finds no overflow in
+  1872 evaluation chunks of eight workloads (1842 without documents of the capacities' calibration data), and E40 (3.36) detects an overflow and reruns the chunk at capacity T in the
+  same program. The stage order and the cores per stage are the compiler's choice. Tiers were not
   tried at T=128, where the hot stage sits at its floor. E32 is one instrumented sample of one prompt.
 - E35 measures two-layer cuts at T=512 only. E36 and E37 time one prompt per chunk length, the first chunk only. E37's
   padding-only three-tier programs rest on one port of the export's combine to tiers (one accumulator per tier width);
   the cost of that second accumulator is inferred from P − P2, not profiled.
+
+- E38 picks each program's tuned tile size on two-layer cuts (E38a) and times that size and the default on the full model
+  (S6–S8 add the remaining candidates at T=512). E39 is two-layer cuts only; its block programs reuse RankTier's stage
+  body, and the trace-specialized budgets round up to 16 blocks per card. E40 has no decode step and forces overflow with an
+  undersized profile, not with a naturally overflowing prompt. E41's routing comes from the static program on the device;
+  MMLU (every T) and GSM8K at T=128 are capped at 200 chunks per half, Alpaca and Chinese have 6–58 chunks per half, and 30
+  of the 1872 evaluation chunks contain documents the deployed capacities were calibrated on. E40's 13% is not profiled, and
+  RankTier and the static program were not loaded together. E42's combine numbers are
+  instrumented two-layer profiles; uninstrumented latencies are E36's.
 
 ## 5. Reproduction
 
@@ -2348,3 +2720,22 @@ dir>`. E37: `scripts/build_full_tiered.py native_c128 <out> --T <T> --tiers <spe
 `headpar_graph.py` (link `weights_hp` to `native_c128_hp/weights_hp`); `scripts/run_e37a.sh` (two-layer 2×2 at T=512,
 builds its cuts), `scripts/run_e37b.sh` (48 layers, two sessions per T; `E37_TS="512"` restricts the chunk lengths),
 `scripts/e37_summary.py <e37 dir>`. Static programs compile in 6–12 minutes, gathered-weight ones in 8–23.
+E38: graphs `build_full_stack.py native_c128 <stack> <counts> --regroup cardmajor --caps 128 --rewrites 1 --combine dense
+--T <T> --banks <dir>` then `build_full_dyncard.py <stack> <out> --mode naive --final tileadd --T <T>` (A);
+`build_full_tiered.py stack<T>_native_rw_ret_dense <out> --T <T> --final tileadd` with `--order identity --tiers 16xT,16xT`
+(B), `--tiers 16xT,16xT` (C), `--tiers 16xT,16x(T/8)` (D), `--tiers 8xT,8xC2,16xC3` (E); each through `headpar_graph.py`; `scripts/run_e38a.sh`
+(two-layer tile sweep, `E38_T`), `run_e38b.sh <T> <session> <ID:tile>...` (full-model sessions with telemetry and capacity
+checks), `run_e38c.sh` (the device queue, restartable), `e38_summary.py <e38 dir>`; profiles `run_e38p.sh <T> <label:tile>...`
+and `stage_profile.py <analysis dir> <label> [layer]`. E39: `e39_block_budget.py <mdts_flag dir>`, `build_e39_graphs.sh <T>`
+(`E39_DG=1` for the direct-gather variants; `build_full_tiered.py --blocks B [--block-budget N|npy] [--direct-gather]`);
+the invalid-padding graphs by hand (`build_full_tiered.py stack512_native_rw_ret_dense full512_blk<B>[orc]iv --T 512 --tiers
+32x<B> --final tileadd --blocks <B> [--block-budget e39/budget_T512_B<B>_oracle.npy] --block-pad invalid`) and RankTier's
+direct-gather graph (`... full512_tier3dg --T 512 --tiers 8x512,8x128,16x64 --final tileadd --direct-gather`, cut
+`trunc2_512_e38Edg`), each through `headpar_graph.py` and `truncate_layers.py ... 2`; `run_e39.sh <T> <session> <label:tile>...`, `e39_next.py`, `e39_dg_programs.py`, `e39_summary.py`.
+E40: host `moe_qwen3_multichunk_host.cpp` (plans from `e40_plan.py`), `run_e40a.sh` (two-layer, three profiles),
+`run_e40b.sh` (full model, four chunks, forced overflow), `run_e40c.sh <T> <programs>` (two chunks), `run_e40d.sh` (the
+capacity-input graph with only the tiered specialization);
+`build_full_tiered.py --capacity-inputs`, `truncate_layers.py ... --keep-counts`; the 1024-token reference
+`e2e_cpu_ref_local.py --ids full_model/heldout_T1024_ids.npy --T 1024 --out full_model/ref1024`. E41:
+`e41_make_chunks.py <mdts_flag dir>`, `run_e41.sh <T> <static program>`, `e41_analysis.py <mdts_flag dir>`. E42: the two-layer
+cuts `trunc2_512_e42R{0..3}` of the ladder graphs and `run_e38p.sh 512 e42R0:def ...`.
