@@ -208,6 +208,9 @@ for L in range(48):
     STEM = f'/model/layers.{L}/mlp/'
     anchor = next(n for n in nodes if n.name == STEM + 'Transpose'); base = key[id(anchor)]
     drop = set(); routes = STEM + 'ScatterElements_output_0'
+    if a.mode == 'naive' and any(n.name == f'stack_L{L}_routing_gather' for n in nodes):
+        assert STEM + 'ScatterElements_output_0' in next(n for n in nodes if n.name == f'stack_L{L}_routing_gather').input
+        routes = f'stack_L{L}_routing'   # a regrouped stack (build_full_stack.py --regroup): the combine reads routes in lane order
     if a.mode in ('dyncard', 'sortfirst'):
         new, d, routes = dyncard(L, sortfirst=(a.mode == 'sortfirst')); drop |= d
         for j, n in enumerate(new): key[id(n)] = base + j / (len(new) + 1)
@@ -243,7 +246,7 @@ del g.node[:]; g.node.extend(order)
 used = {x for n in order for x in n.input}
 keep = [t for t in list(g.initializer) + new_inits if t.name in used]; seen = set(); keep = [t for t in keep if not (t.name in seen or seen.add(t.name))]
 del g.initializer[:]; g.initializer.extend(keep); del g.value_info[:]
-for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
+for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'weights_cardmajor_fp16'):
     p = f'{a.src}/{link}'
     if os.path.islink(p) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(p), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)

@@ -119,7 +119,7 @@ keep.reverse(); del g.node[:]; g.node.extend(keep)
 used = {x for n in g.node for x in n.input}
 for t in [t for t in g.initializer if t.name not in used]: g.initializer.remove(t)
 del g.value_info[:]
-for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
+for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'weights_cardmajor_fp16'):
     p = f'{src}/{link}'
     if os.path.islink(p) and not os.path.exists(f'{out}/{link}'): os.symlink(os.path.realpath(p), f'{out}/{link}')
 if os.path.exists(f'{src}/custom_io.yaml') and not os.path.exists(f'{out}/custom_io.yaml'): os.symlink(os.path.realpath(f'{src}/custom_io.yaml'), f'{out}/custom_io.yaml')

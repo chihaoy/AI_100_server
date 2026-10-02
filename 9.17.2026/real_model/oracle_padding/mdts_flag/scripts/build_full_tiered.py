@@ -16,8 +16,22 @@ repeated per lane; the combine's row index is unchanged because the flat layout 
 accumulator, each tier reads it at its token table (the export's zero read, or stage 1's read-modify-write), adds its
 weighted rows and scatters them back, then per group the export's un-tiled lane Einsum 'dpth->dth', the groups' partials
 added, and the export's card-rooted Einsum_4. With a single group (e.g. 16xT,16xT/8) this is the export's structure.
+--blocks B replaces the tiers by fixed-size block scheduling (experiment 2 of RANKTIER_EXPERIMENT_PLAN.md): each card
+packs its local assignments into N blocks of B rows, one expert per block, in native expert order; block metadata (expert
+of each block slot, block offsets) is computed in the graph from the routing counts, each block gathers its expert's
+weights from the bank by that runtime index, and the token-owned combine reads an assignment at row M_e * B + slot
+(M_e the expert's first block on its card). The default budget N per card is the dropless bound for the worst local load:
+min(ceil(8T/B) + 31, 32 * ceil(T/B)), rounded up to a multiple of 16 (even core mapping); --block-budget overrides it with
+one integer or a [48] npy of per-layer budgets (calibrated or trace-specialized budgets).
+--capacity-inputs makes the capacities of tiers 1.. run-time selectable (experiment 4a, overflow fallback): each such tier
+t reads its capacity from the length of an int32 input cap_rows<t> [cap<t>] (values 0..cap-1, which replace the tier's row
+Range), and an int32 input cap_tag [ptag] of zeros (its length identifies the profile, as in runtime_constraints/) enters
+as a zero offset; a network-specialization file then lists one entry per capacity profile, so one program holds e.g. the
+RankTier, a full-capacity and an undersized profile over the same weights and the same retained KV cache.
+--direct-gather replaces each stage's activation read, CtxGather3D(Expand(hidden [1, T, 2048]) to [lanes, T, 2048], tokens),
+by Gather(hidden [T, 2048], min(tokens, T - 1)) on axis 0 (padded rows read a valid token and stay masked).
 Usage: build_full_tiered.py <src dir> <out dir> --T 512 --tiers 8x512,8x128,16x64 [--final einsum|addtree|tileadd]
-       [--placement <[48,128] expert-to-card npy>] [--combine tokenowned|dense]"""
+       [--placement <[48,128] expert-to-card npy>] [--combine tokenowned|dense] [--blocks B [--block-budget N|npy]]"""
 import sys, os, re, json, heapq, argparse, collections, numpy as np, onnx
 from onnx import helper as h, numpy_helper as nh, TensorProto as TP
 ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('--T', type=int, required=True)
@@ -25,13 +39,32 @@ ap.add_argument('--tiers', required=True, help='comma list of <lanes per card>x<
 ap.add_argument('--final', choices=['einsum', 'addtree', 'tileadd'], default='einsum')
 ap.add_argument('--placement', default=None, help='[48,128] expert -> card assignment (32 per card); default native e // 32')
 ap.add_argument('--combine', choices=['tokenowned', 'dense'], default='tokenowned', help='token-owned combine, or the export combine per tier group (see above)')
+ap.add_argument('--order', choices=['rank', 'identity'], default='rank', help='rank: per-card sort by load (TopK); identity: each card keeps its experts in '
+                'fixed order through the same gathers, the index made runtime data (min(position_ids, 0)) so the gathers are not folded')
+ap.add_argument('--direct-gather', action='store_true', help='stage activations by Gather from [T, 2048] instead of CtxGather3D on the expanded hidden states')
+ap.add_argument('--capacity-inputs', action='store_true', help='capacities of tiers 1.. from input lengths (see above)')
+ap.add_argument('--blocks', type=int, default=None, help='fixed-size block scheduling with blocks of this many rows (see above)')
+ap.add_argument('--block-pad', choices=['clamp', 'invalid'], default='clamp', help='rows past a block\'s count: clamp (the next tokens of the expert\'s list, masked) '
+                'or invalid (an appended INT32_MAX token-table entry, the export\'s marker for an empty position, as in RankTier\'s padded rows)')
+ap.add_argument('--block-budget', default=None, help='blocks per card: an integer, or a [48] npy of per-layer budgets; default the dropless bound')
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
 T, DOM = a.T, 'com.qualcomm.cloud'
 def parse_tier(spec):
     mt = re.fullmatch(r'(\d+)x(\d+)(?:s(\d+))?', spec); assert mt, spec
     return int(mt.group(1)), int(mt.group(2)), int(mt.group(3) or 1)
+BLOCK = a.blocks
+if BLOCK:   # one tier over all 32 experts of a card, in native order through the identity-order gathers
+    assert T % BLOCK == 0 and a.combine == 'tokenowned' and a.placement is None, 'blocks need B | T, the token-owned combine and native placement'
+    a.tiers, a.order = f'32x{BLOCK}', 'identity'
+    if a.block_budget is None: BUDGET = [-(-min(-(-8 * T // BLOCK) + 31, 32 * (T // BLOCK)) // 16) * 16] * 48
+    elif a.block_budget.endswith('.npy'): BUDGET = [int(v) for v in np.load(a.block_budget)]
+    else: BUDGET = [int(a.block_budget)] * 48
+    assert len(BUDGET) == 48 and all(v >= 1 for v in BUDGET), BUDGET
+    block_info = {}
 TIERS3 = [parse_tier(x) for x in a.tiers.split(',')]
-assert sum(e for e, _, _ in TIERS3) == 32 and all(e * sp in (1, 2, 4, 8, 16) and c % sp == 0 and 0 < c <= T for e, c, sp in TIERS3), TIERS3
+CAPIN = a.capacity_inputs
+assert not CAPIN or (not BLOCK and a.combine == 'tokenowned' and all(sp == 1 for _, _, sp in TIERS3) and TIERS3[0][1] == T), 'capacity inputs: token-owned, unsplit tiers, tier 0 at T'
+assert sum(e for e, _, _ in TIERS3) == 32 and (BLOCK or all(e * sp in (1, 2, 4, 8, 16) and c % sp == 0 and 0 < c <= T for e, c, sp in TIERS3)), TIERS3
 TIERS = [(e, c) for e, c, _ in TIERS3]; SPLIT = [sp for _, _, sp in TIERS3]
 assert a.combine == 'tokenowned' or all(sp == 1 for sp in SPLIT), 'split tiers need the token-owned combine'
 NT = len(TIERS); START = [sum(l for l, _ in TIERS[:i]) for i in range(NT)]; OFF = [4 * s for s in START]
@@ -79,6 +112,50 @@ def resize_lane_consts(n, lanes):
         if v.ndim >= 1 and v.shape[0] == 64 and lanes != 64:
             assert (v == v[:1]).all(), (n.name, x, 'lane constant is not row-uniform')
             n.input[i] = add_init(nh.from_array(np.repeat(v[:1], lanes, axis=0), f'tr_l{lanes}_' + re.sub(r'[^A-Za-z0-9_]', '_', x)))
+def block_meta(L, P, STEM, c_, counts128):
+    """Per card: blocks per expert m = ceil(n / B), first block M = exclusive prefix sum of m, and for every block slot b < N
+    its expert e (the number of experts whose blocks end at or before b, capped at 31), chunk j = b - M_e and row count
+    clip(n_e - j * B, 0, B); unused slots fall on the last expert with count 0. Returns (nodes, global expert id per lane
+    [4N], lane counts [4N], token-table row index [4N, B] into the flat [128 * T] native table, M as [128])."""
+    B, N = BLOCK, BUDGET[L]; nd = []
+    f32 = lambda nm, v: add_init(nh.from_array(np.array(v, np.float32), nm))
+    upper = np.triu(np.ones((32, 32), np.float32), 1)                    # upper[i, j] = 1 for i < j: M_j = sum_{i<j} m_i
+    nd += [h.make_node('Reshape', [counts128, i64('bk_shape_4_32', [4, 32])], [c_('bk_cnt')], name=STEM + 'bk_cnt'),
+           h.make_node('Add', [c_('bk_cnt'), i32(f'bk_bm1_{B}', B - 1)], [c_('bk_cntp')], name=STEM + 'bk_cntp'),
+           h.make_node('Div', [c_('bk_cntp'), i32(f'bk_b_{B}', B)], [c_('bk_m')], name=STEM + 'bk_m'),
+           h.make_node('Cast', [c_('bk_m')], [c_('bk_mf')], to=TP.FLOAT, name=STEM + 'bk_mf'),
+           h.make_node('MatMul', [c_('bk_mf'), f32('bk_upper32', upper)], [c_('bk_Mf')], name=STEM + 'bk_Mf'),
+           h.make_node('Cast', [c_('bk_Mf')], [c_('bk_M')], to=TP.INT32, name=STEM + 'bk_M'),
+           h.make_node('Add', [c_('bk_M'), c_('bk_m')], [c_('bk_end')], name=STEM + 'bk_end'),
+           h.make_node('Unsqueeze', [c_('bk_end'), i64('bk_ax1', [1])], [c_('bk_end_u')], name=STEM + 'bk_end_u'),
+           h.make_node('Less', [c_('bk_end_u'), i32(f'bk_slots_p1_{N}', np.arange(1, N + 1).reshape(1, N, 1))], [c_('bk_done')], name=STEM + 'bk_done'),   # [4, N, 32]: expert e's blocks end at or before slot b
+           h.make_node('Cast', [c_('bk_done')], [c_('bk_done_f')], to=TP.FLOAT, name=STEM + 'bk_done_f'),
+           h.make_node('ReduceSum', [c_('bk_done_f'), i64('bk_ax2', [2])], [c_('bk_ef')], keepdims=0, name=STEM + 'bk_ef'),
+           h.make_node('Cast', [c_('bk_ef')], [c_('bk_e_raw')], to=TP.INT32, name=STEM + 'bk_e_raw'),
+           h.make_node('Min', [c_('bk_e_raw'), i32('bk_31', 31)], [c_('bk_e')], name=STEM + 'bk_e'),
+           h.make_node('GatherElements', [c_('bk_M'), c_('bk_e')], [c_('bk_Mb')], axis=1, name=STEM + 'bk_Mb'),
+           h.make_node('Sub', [i32(f'bk_slots2_{N}', np.arange(N).reshape(1, N)), c_('bk_Mb')], [c_('bk_j')], name=STEM + 'bk_j'),
+           h.make_node('GatherElements', [c_('bk_cnt'), c_('bk_e')], [c_('bk_nb')], axis=1, name=STEM + 'bk_nb'),
+           h.make_node('Mul', [c_('bk_j'), f'bk_b_{B}'], [c_('bk_jB')], name=STEM + 'bk_jB'),
+           h.make_node('Sub', [c_('bk_nb'), c_('bk_jB')], [c_('bk_rem')], name=STEM + 'bk_rem'),
+           h.make_node('Max', [c_('bk_rem'), i32('bk_zero', 0)], [c_('bk_rem0')], name=STEM + 'bk_rem0'),
+           h.make_node('Min', [c_('bk_rem0'), f'bk_b_{B}'], [c_('bk_count4')], name=STEM + 'bk_count4'),
+           h.make_node('Reshape', [c_('bk_count4'), i64(f'bk_shape_{4 * N}', [4 * N])], [c_('bk_count')], name=STEM + 'bk_count'),
+           h.make_node('Add', [c_('bk_e'), i32('bk_card_base', np.array([[0], [32], [64], [96]]))], [c_('bk_g4')], name=STEM + 'bk_g4'),
+           h.make_node('Reshape', [c_('bk_g4'), f'bk_shape_{4 * N}'], [c_('bk_gid')], name=STEM + 'bk_gid'),
+           h.make_node('Mul', [c_('bk_g4'), i32(f'bk_T_{T}', T)], [c_('bk_gT')], name=STEM + 'bk_gT'),
+           h.make_node('Unsqueeze', [c_('bk_gT'), i64('bk_axm1', [-1])], [c_('bk_gT_u')], name=STEM + 'bk_gT_u'),
+           h.make_node('Unsqueeze', [c_('bk_jB'), 'bk_axm1'], [c_('bk_jB_u')], name=STEM + 'bk_jB_u'),
+           h.make_node('Add', [c_('bk_jB_u'), i32(f'bk_rows_{B}', np.arange(B).reshape(1, 1, B))], [c_('bk_pos')], name=STEM + 'bk_pos'),
+           h.make_node('Min', [c_('bk_pos'), i32(f'bk_Tm1_{T}', T - 1)], [c_('bk_pos_c')], name=STEM + 'bk_pos_c'),
+           *([h.make_node('Add', [c_('bk_gT_u'), c_('bk_pos_c')], [c_('bk_tidx4')], name=STEM + 'bk_tidx4')] if a.block_pad == 'clamp' else
+             [h.make_node('Add', [c_('bk_gT_u'), c_('bk_pos_c')], [c_('bk_tidx4v')], name=STEM + 'bk_tidx4v'),
+              h.make_node('Unsqueeze', [c_('bk_count4'), 'bk_axm1'], [c_('bk_count4_u')], name=STEM + 'bk_count4_u'),
+              h.make_node('Less', [f'bk_rows_{B}', c_('bk_count4_u')], [c_('bk_rowvalid')], name=STEM + 'bk_rowvalid'),     # [4, N, B]
+              h.make_node('Where', [c_('bk_rowvalid'), c_('bk_tidx4v'), i32(f'bk_invalid_row_{T}', 128 * T)], [c_('bk_tidx4')], name=STEM + 'bk_tidx4')]),
+           h.make_node('Reshape', [c_('bk_tidx4'), i64(f'bk_shape_{4 * N}_{B}', [4 * N, B])], [c_('bk_tidx')], name=STEM + 'bk_tidx'),
+           h.make_node('Reshape', [c_('bk_M'), i64('bk_shape_128', [128])], [c_('bk_Mflat')], name=STEM + 'bk_Mflat')]
+    return nd, c_('bk_gid'), c_('bk_count'), c_('bk_tidx'), c_('bk_Mflat')
 def tiered(L):
     """Per-card runtime sort with tiered capacities on layer L; returns (new nodes, dropped names, tiers' data/slot/count tensors)."""
     STEM, P = f'/model/layers.{L}/mlp/', f'L{L}_'; c_ = lambda nm: P + nm
@@ -123,10 +200,13 @@ def tiered(L):
         new.append(h.make_node('Gather', [c_('dc_counts'), i32(P + 'tr_perm', perm)], [c_('tr_counts_perm')], name=STEM + 'tr_counts_perm', axis=0)); counts_in = c_('tr_counts_perm')
     tier_parts = collections.defaultdict(list)
     for k in range(4):
-        new += [h.make_node('Slice', [counts_in, i64(f'dc_lo{k}', [32 * k]), i64(f'dc_hi{k}', [32 * k + 32]), i64('dc_ax0', [0])], [c_(f'dc_cnt{k}')], name=STEM + f'dc_cnt{k}'),
-                h.make_node('TopK', [c_(f'dc_cnt{k}'), i64('dc_k32', [32])], [c_(f'dc_sorted{k}'), c_(f'dc_loc64_{k}')], name=STEM + f'dc_topk{k}', axis=0, largest=1, sorted=1),
-                h.make_node('Cast', [c_(f'dc_loc64_{k}')], [c_(f'dc_loc{k}')], name=STEM + f'dc_loc{k}', to=TP.INT32),
-                h.make_node('Add', [c_(f'dc_loc{k}'), i32(f'dc_base{k}', 32 * k)], [c_(f'dc_gloc{k}')], name=STEM + f'dc_gloc{k}')]
+        if a.order == 'identity':   # the card's experts in fixed order, as runtime data
+            new.append(h.make_node('Add', [i32(f'id_arange{k}', np.arange(32 * k, 32 * k + 32)), 'id_runtime_zero'], [c_(f'dc_gloc{k}')], name=STEM + f'dc_gloc{k}'))
+        else:
+            new += [h.make_node('Slice', [counts_in, i64(f'dc_lo{k}', [32 * k]), i64(f'dc_hi{k}', [32 * k + 32]), i64('dc_ax0', [0])], [c_(f'dc_cnt{k}')], name=STEM + f'dc_cnt{k}'),
+                    h.make_node('TopK', [c_(f'dc_cnt{k}'), i64('dc_k32', [32])], [c_(f'dc_sorted{k}'), c_(f'dc_loc64_{k}')], name=STEM + f'dc_topk{k}', axis=0, largest=1, sorted=1),
+                    h.make_node('Cast', [c_(f'dc_loc64_{k}')], [c_(f'dc_loc{k}')], name=STEM + f'dc_loc{k}', to=TP.INT32),
+                    h.make_node('Add', [c_(f'dc_loc{k}'), i32(f'dc_base{k}', 32 * k)], [c_(f'dc_gloc{k}')], name=STEM + f'dc_gloc{k}')]
         glob_k = c_(f'dc_gloc{k}')
         if not native:
             new.append(h.make_node('Gather', [P + 'tr_perm', c_(f'dc_gloc{k}')], [c_(f'tr_gid{k}')], name=STEM + f'tr_gid{k}', axis=0)); glob_k = c_(f'tr_gid{k}')
@@ -145,7 +225,14 @@ def tiered(L):
     body_nodes = [n for n in ln if n.name in body]
     slice0, range0 = bn[STEM + 'Slice'], bn[STEM + 'Range_1']; assert slice0.op_type == 'Slice' and range0.op_type == 'Range' and slice0.name in body and range0.name in body
     datas, slots, counts = [], [], []; tts, zreads = [], []
-    orig0 = SPLIT[0] == 1
+    if a.direct_gather:
+        dg_hidden = c_('dg_hidden'); x_in = bn[STEM + 'Expand_2'].input[0]
+        new.append(h.make_node('Squeeze', [x_in, i64('dg_ax0', [0])], [dg_hidden], name=STEM + 'dg_hidden'))
+    orig0 = SPLIT[0] == 1 and not BLOCK
+    if orig0 and a.direct_gather:   # tier 0 keeps the export's nodes: turn its CtxGather3D into the Gather in place
+        g0 = bn[STEM + 'CtxGather3D']; idx0 = c_('tr0_dg_idx')
+        new.append(h.make_node('Min', [STEM + 'Slice_output_0', i32(f'dg_Tm1_{T}', T - 1)], [idx0], name=STEM + 'tr0_dg_idx'))
+        g0.op_type = 'Gather'; g0.domain = ''; del g0.input[:]; g0.input.extend([dg_hidden, idx0]); del g0.attribute[:]; g0.attribute.extend([h.make_attribute('axis', 0)])
     if orig0:   # tier 0: the original stage-0 subgraph fed by rows of the native chain in tier-0 order
         for dst, srcname in stage_in.items():
             new.append(h.make_node('Gather', [srcname, orders[0]], [dst], name=STEM + 'tr0_rows_' + dst.replace(STEM, ''), axis=0))
@@ -159,6 +246,12 @@ def tiered(L):
     for t in range(1 if orig0 else 0, NT):
         tag = f'tr{t}'; rmap = {}; E, Ccap = TIERS[t]; Sp = SPLIT[t]; lanes = 4 * E * Sp
         order_lanes = orders[t]
+        if BLOCK:
+            bnodes, order_lanes, bk_count, bk_tidx, bk_Mflat = block_meta(L, P, STEM, c_, nat['Einsum_1_output_0']); new += bnodes; lanes = 4 * BUDGET[L]
+            block_info[L] = (bk_Mflat, BUDGET[L])
+            new += [h.make_node('Reshape', [nat['CtxScatter3DInt_output_0'], i64(f'bk_shape_flat_{T}', [128 * T, 1])], [c_('bk_tt_flat0' if a.block_pad == 'invalid' else 'bk_tt_flat')], name=STEM + 'bk_tt_flat'),
+                    *([h.make_node('Concat', [c_('bk_tt_flat0'), i32('bk_int32max', np.array([[2147483647]]))], [c_('bk_tt_flat')], name=STEM + 'bk_tt_flat_inv', axis=0)] if a.block_pad == 'invalid' else []),
+                    h.make_node('Gather', [nat['Einsum_1_output_0'], orders[t]], [c_('bk_expert_counts')], name=STEM + 'bk_expert_counts', axis=0)]
         if Sp > 1:   # lane order: each expert repeated Sp times (card-major, expert-major, half-minor)
             new += [h.make_node('Unsqueeze', [orders[t], i64('dc_axm1', [-1])], [c_(f'{tag}_ord_u')], name=STEM + f'{tag}_ord_u'),
                     h.make_node('Expand', [c_(f'{tag}_ord_u'), i64(f'tr_rep_shape_{4 * E}_{Sp}', [4 * E, Sp])], [c_(f'{tag}_ord_x')], name=STEM + f'{tag}_ord_x'),
@@ -167,6 +260,9 @@ def tiered(L):
         for dst, srcname in stage_in.items():
             rmap[dst] = c_(f'{tag}_' + dst.replace(STEM, ''))
             per_lane = dst in (wg[0].output[0], STEM + 'Greater_output_0')     # rows needed once per lane (weights, lane count)
+            if BLOCK and dst == STEM + 'CtxScatter3DInt_output_0':
+                new.append(h.make_node('Gather', [c_('bk_tt_flat'), bk_tidx], [rmap[dst]], name=STEM + f'{tag}_block_tokens', axis=0)); continue
+            if BLOCK and dst == STEM + 'Einsum_1_output_0': rmap[dst] = bk_count; continue
             if dst == STEM + 'Einsum_1_output_0' and Sp > 1:
                 ce = c_(f'{tag}_expert_counts'); new.append(h.make_node('Gather', [srcname, orders[t]], [ce], name=STEM + f'{tag}_expert_counts', axis=0))
                 half = Ccap // Sp
@@ -183,6 +279,11 @@ def tiered(L):
             new.append(h.make_node('Gather', [banks[s0], order_lanes], [c_(f'W{t}_{s0}')], name=STEM + f'{tag}_gather_{s0}', axis=0))
         zr = None
         for n in body_nodes:
+            if a.direct_gather and n.name == STEM + 'CtxGather3D':   # activation read: plain Gather from the hidden states
+                idx = c_(f'{tag}_dg_idx'); rmap[n.output[0]] = c_(f'{tag}_dg_x')
+                new += [h.make_node('Min', [rmap[STEM + 'Slice_output_0'], i32(f'dg_Tm1_{T}', T - 1)], [idx], name=STEM + f'{tag}_dg_idx'),
+                        h.make_node('Gather', [dg_hidden, idx], [rmap[n.output[0]]], name=STEM + f'{tag}_dg_x', axis=0)]
+                continue
             c = onnx.NodeProto(); c.CopyFrom(n); c.name = STEM + f'{tag}/' + n.name.replace(STEM, '')
             if n.name == STEM + 'CtxGather3D_2': zr = c
             if n.op_type == 'If':   # static-shape guard 'squeeze the token table if its last dim is 1': the table is [lanes, T, 1], take the then branch
@@ -196,15 +297,17 @@ def tiered(L):
                 if x in rmap: c.input[i] = rmap[x]
                 elif x in wmap: c.input[i] = wmap[x]
             for i, o in enumerate(c.output): rmap[o] = c_(f'{tag}_' + o.replace(STEM, '')); c.output[i] = rmap[o]
-            if n.name == slice0.name: c.input[2] = i64(P + f'{tag}_end', [Ccap])
-            if n.name == range0.name: c.input[1] = i32(P + f'{tag}_stop', Ccap // Sp)
+            if n.name == slice0.name: c.input[2] = f'cap{t}_len64' if CAPIN else i64(P + f'{tag}_end', [Ccap])
+            if n.name == range0.name:
+                c.input[1] = i32(P + f'{tag}_stop', Ccap // Sp)
+                if CAPIN: rmap[n.output[0]] = f'cap{t}_rows'   # consumers read the capacity input's rows instead
             resize_lane_consts(c, lanes); new.append(c)
             if n.name == slice0.name and Sp > 1:   # [4E, C] token table -> [4E*Sp, C/Sp] lanes
                 sp_out = c_(f'{tag}_token_table_lanes')
                 new.append(h.make_node('Reshape', [c.output[0], i64(f'tr_tt_shape_{lanes}_{Ccap // Sp}', [lanes, Ccap // Sp])], [sp_out], name=STEM + f'{tag}_token_table_lanes'))
                 rmap[n.output[0]] = sp_out
         datas.append(rmap[out0]); slots.append(rmap[STEM + 'Where_1_output_0']); tts.append(rmap[STEM + 'Slice_output_0']); zreads.append(zr)
-        counts.append(c_(f'{tag}_expert_counts') if Sp > 1 else rmap[STEM + 'Einsum_1_output_0'])
+        counts.append(c_(f'{tag}_expert_counts') if Sp > 1 else c_('bk_expert_counts') if BLOCK else rmap[STEM + 'Einsum_1_output_0'])
     drop = chain0 | chain1 | {rg[0].name, rg[1].name, wg[0].name, wg[1].name} | {STEM + n for n in ('Reshape_1', 'Transpose_1', 'Unsqueeze_7', 'Transpose')}
     if orig0:
         for n in body_nodes: resize_lane_consts(n, 4 * TIERS[0][0])   # after the clones, which copy the untouched 64-lane constants
@@ -229,7 +332,7 @@ def tokenowned(L, routes_native, orders, datas, slots):
     tabs = ('offs', 'lanes', 'caps'); vals = (OFF, [l for l, _ in TIERS], [c for _, c in TIERS])
     tabn = '_'.join(f'{l}x{c}' for l, c in TIERS)
     for nm, v in zip(tabs, vals):
-        new.append(h.make_node('Gather', [i32(f'to_tab_{nm}_{tabn}', v), tier], [c_(f'to_{nm}')], name=STEM + f'to_{nm}', axis=0))
+        new.append(h.make_node('Gather', ['cap_table' if CAPIN and nm == 'caps' else i32(f'to_tab_{nm}_{tabn}', v), tier], [c_(f'to_{nm}')], name=STEM + f'to_{nm}', axis=0))
     new += [h.make_node('Sub', [c_('to_pos'), c_('to_offs')], [c_('to_lane')], name=STEM + 'to_lane'),
             h.make_node('Div', [c_('to_lane'), c_('to_lanes')], [c_('to_card')], name=STEM + 'to_card'),
             h.make_node('Mul', [c_('to_card'), c_('to_lanes')], [c_('to_cardL')], name=STEM + 'to_cardL'),
@@ -237,12 +340,15 @@ def tokenowned(L, routes_native, orders, datas, slots):
             h.make_node('Concat', slots, [c_('to_slot_all')], name=STEM + 'to_slot_all', axis=0),                  # [128, T] in position order
             h.make_node('Transpose', [c_('to_slot_all')], [c_('to_slotT')], perm=[1, 0], name=STEM + 'to_slotT'),
             h.make_node('GatherElements', [c_('to_slotT'), c_('to_pos')], [c_('to_slot')], axis=1, name=STEM + 'to_slot'),
+            h.make_node('Gather', [block_info[L][0], c_('to_pos')], [c_('to_blk')], name=STEM + 'to_blk', axis=0) if BLOCK else
             h.make_node('Mul', [c_('to_local'), c_('to_caps')], [c_('to_localrow')], name=STEM + 'to_localrow'),
+            *([h.make_node('Mul', [c_('to_blk'), c_('to_caps')], [c_('to_localrow')], name=STEM + 'to_localrow')] if BLOCK else []),
             h.make_node('Add', [c_('to_localrow'), c_('to_slot')], [c_('to_row')], name=STEM + 'to_row')]
     gathered = []
     for t, (lanes, cap) in enumerate(TIERS):
         new += [h.make_node('Equal', [tier, i32(f'to_t{t}', t)], [c_(f'to_in{t}')], name=STEM + f'to_in{t}'),
-                h.make_node('Reshape', [datas[t], i64(f'to_shape_d_{lanes}_{cap}', [4, lanes * cap, 2048])], [c_(f'to_data{t}')], name=STEM + f'to_data{t}')]
+                h.make_node('Reshape', [datas[t], f'cap{t}_dshape' if CAPIN and t > 0 else i64(f'to_shape_d_{lanes}_{cap}', [4, lanes * cap, 2048]) if not BLOCK else
+                                        i64(f'to_shape_d_blk{block_info[L][1]}_{cap}', [4, block_info[L][1] * cap, 2048])], [c_(f'to_data{t}')], name=STEM + f'to_data{t}')]
         idx_parts, mask_parts = [], []
         for k in range(4):
             new += [h.make_node('Equal', [c_('to_card'), i32(f'to_card{k}', k)], [c_(f'to_on{k}_t{t}')], name=STEM + f'to_on{k}_t{t}'),
@@ -307,6 +413,27 @@ def densecombine(L, datas):
     return head, tail
 # ---------------- apply to every layer
 added = []
+if a.order == 'identity':   # a zero the compiler cannot fold: position ids are non-negative, but only at run time
+    zero_nodes = [h.make_node('ReduceMin', ['position_ids'], ['id_pos_min'], name='id_pos_min', keepdims=0),
+                  h.make_node('Min', ['id_pos_min', add_init(nh.from_array(np.array(0, np.int64), 'id_zero_i64'))], ['id_zero64'], name='id_zero64'),
+                  h.make_node('Cast', ['id_zero64'], ['id_runtime_zero'], name='id_runtime_zero', to=TP.INT32)]
+    for j, n in enumerate(zero_nodes): key[id(n)] = -10 + j
+    added += zero_nodes
+if CAPIN:   # capacity inputs: cap_rows<t> [cap<t>] int32 for tiers 1.., cap_tag [ptag] int32 zeros
+    g.input.append(h.make_tensor_value_info('cap_tag', TP.INT32, ['ptag']))
+    cap_nodes = [h.make_node('Gather', ['cap_tag', add_init(nh.from_array(np.array(0, np.int64), 'cap_idx0'))], ['cap_zero'], name='cap_zero', axis=0)]
+    lens32 = [i32('cap_T_i32', [T])]
+    for t in range(1, NT):
+        g.input.append(h.make_tensor_value_info(f'cap_rows{t}', TP.INT32, [f'cap{t}']))
+        cap_nodes += [h.make_node('Add', [f'cap_rows{t}', 'cap_zero'], [f'cap{t}_rows'], name=f'cap{t}_rows'),
+                      h.make_node('Shape', [f'cap_rows{t}'], [f'cap{t}_len64'], name=f'cap{t}_len64'),
+                      h.make_node('Cast', [f'cap{t}_len64'], [f'cap{t}_len32'], name=f'cap{t}_len32', to=TP.INT32),
+                      h.make_node('Mul', [f'cap{t}_len64', i64(f'cap_lanes{t}', [TIERS[t][0]])], [f'cap{t}_lanerows'], name=f'cap{t}_lanerows'),
+                      h.make_node('Concat', [i64('cap_four', [4]), f'cap{t}_lanerows', i64('cap_hidden', [2048])], [f'cap{t}_dshape'], name=f'cap{t}_dshape', axis=0)]
+        lens32.append(f'cap{t}_len32')
+    cap_nodes.append(h.make_node('Concat', lens32, ['cap_table'], name='cap_table', axis=0))
+    for j, n in enumerate(cap_nodes): key[id(n)] = -5 + j / (len(cap_nodes) + 1)
+    added += cap_nodes
 for L in range(48):
     STEM = f'/model/layers.{L}/mlp/'
     anchor = next(n for n in nodes if n.name == STEM + 'Transpose'); base = key[id(anchor)]
@@ -352,9 +479,10 @@ del g.node[:]; g.node.extend(order)
 used = {x for n in order for x in n.input}
 keep = [t for t in list(g.initializer) + new_inits if t.name in used]; seen = set(); keep = [t for t in keep if not (t.name in seen or seen.add(t.name))]
 del g.initializer[:]; g.initializer.extend(keep); del g.value_info[:]
-for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
+for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'weights_cardmajor_fp16'):
     p = f'{a.src}/{link}'
     if os.path.islink(p) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(p), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-json.dump(dict(src=a.src, mode='tiered', T=T, tiers=TIERS3, final=a.final, placement=a.placement, **({'combine': 'dense'} if a.combine == 'dense' else {})), open(f'{a.out}/info.json', 'w'))
-print(f'{a.out}: tiered {TIERS3}, {"dense combine" if a.combine == "dense" else "final " + a.final}, placement {"native" if not a.placement else a.placement}; nodes {len(order)}; initializers {len(keep)}')
+json.dump(dict(src=a.src, mode='tiered', T=T, tiers=TIERS3, final=a.final, placement=a.placement, **({'combine': 'dense'} if a.combine == 'dense' else {}),
+               **({'order': 'identity'} if a.order == 'identity' else {}), **({'blocks': BLOCK, 'block_budget': BUDGET, 'block_pad': a.block_pad} if BLOCK else {}), **({'capacity_inputs': True} if CAPIN else {}), **({'direct_gather': True} if a.direct_gather else {})), open(f'{a.out}/info.json', 'w'))
+print(f'{a.out}: ' + (f'blocks of {BLOCK} rows, budget per card {sorted(set(BUDGET))}; ' if BLOCK else '') + f'tiered {TIERS3}, {"dense combine" if a.combine == "dense" else "final " + a.final}, placement {"native" if not a.placement else a.placement}; nodes {len(order)}; initializers {len(keep)}')

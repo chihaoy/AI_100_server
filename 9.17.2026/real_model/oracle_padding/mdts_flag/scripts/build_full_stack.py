@@ -2,6 +2,8 @@
 """Port of the layer-2 replay stack to all 48 layers of the full prefill graph.
 Usage: build_full_stack.py <src dir> <out dir> <counts_i32.bin> --regroup native|hc --caps 128|oracle --rewrites 0|1 [--banks <dir>]
   src dir     : a rebuilt full-model graph dir (model.onnx + weights symlinks), e.g. native_c128_kvfree
+  regroup cardmajor : card c computes experts 32c..32c+31 (stage 0: 32c..32c+15, stage 1: 32c+16..32c+31), the layout of the
+                runtime-sort programs with static weights; banks materialized under <banks> like hc
   regroup hc  : per layer, stage 0 = 64 largest-count experts round-robin over cards, stage 1 = rest (active ones
                 round-robin from card 3); routing Gather before the Transpose, banks materialized under <banks>/weights.bin
   caps oracle : per-stage capacity = largest count in the stage (>=1); edits Slice/Slice_1 end and Range_1/Range_3 stop
@@ -30,7 +32,10 @@ def hc_order(cnt):
     for c in range(4): need = 16 - len(s1[c]); s1[c] += emp[:need]; emp = emp[need:]
     return sum(s0, []) + sum(s1, [])
 for L in range(48):
-    cnt = counts[L]; order = hc_order(cnt) if a.regroup == 'hc' else list(range(128)); assert sorted(order) == list(range(128))
+    cnt = counts[L]
+    order = hc_order(cnt) if a.regroup == 'hc' else ([32 * c + j for c in range(4) for j in range(16)] + [32 * c + 16 + j for c in range(4) for j in range(16)]
+                                                     if a.regroup == 'cardmajor' else list(range(128)))
+    assert sorted(order) == list(range(128))
     if a.caps == '128': caps = [a.T, a.T]
     elif poscounts is not None: caps = [max(1, int(poscounts[L][:64].max())), max(1, int(poscounts[L][64:].max()))]
     else: caps = [max(1, int(cnt[order[:64]].max())), max(1, int(cnt[order[64:]].max()))]
@@ -41,8 +46,8 @@ bank_names = {}
 for L in range(48):
     p = f'/model/layers.{L}/mlp/'; bn = by_name()
     bank_names[L] = [[i for i in bn[p + ('MatMul' if k == 0 else f'MatMul_{k}')].input if i in native_idx][0] for k in range(6)]
-if a.regroup == 'hc':
-    assert a.banks, '--banks required for hc'; os.makedirs(a.banks, exist_ok=True)
+if a.regroup in ('hc', 'cardmajor'):
+    assert a.banks, '--banks required for hc and cardmajor'; os.makedirs(a.banks, exist_ok=True)
     src_bin = np.memmap(f'{F}/weights_native_fp16/weights.bin', np.float16, 'r'); total = sum(b['length'] for b in native_idx.values())
     if not os.path.exists(f'{a.banks}/index.json'):
         dst = np.memmap(f'{a.banks}/weights.bin', np.float16, 'w+', shape=(total // 2,))
@@ -181,7 +186,7 @@ if a.combine == 'tokencentric':
     print('pruned dead accumulator nodes:', len(g.node) - len(keep)); keep.reverse(); del g.node[:]; g.node.extend(keep)
     inits = [t for t in g.initializer if t.name in needed]; del g.initializer[:]; g.initializer.extend(inits)
 del g.value_info[:]
-for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped'):
+for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'weights_cardmajor_fp16'):
     ps = f'{a.src}/{link}'
     if os.path.islink(ps) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(ps), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
