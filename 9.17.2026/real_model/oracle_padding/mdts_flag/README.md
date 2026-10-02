@@ -86,14 +86,16 @@ stages still run one after another (+1%). The full ladder (E36) takes the 48-lay
 head-parallel attention, the export's own combine, every expert at capacity T), the reductions alone give 2.06–2.38×, the
 padding work alone at most 1.05× (0.69–0.85× with three tiers, which need one dense accumulator per tier width), and both
 together 2.18–3.27×: the padding work pays only after the reductions. Matched for weight indirection and tile size (E38), the rank-bound capacities make the run-time-ranked program 1.13 / 1.13 /
-1.27× faster at T = 128 / 256 / 512 and RankTier is 1.06–1.17× faster than the best static program: the static GEMMs at a
-tuned tile size skip most padded rows, the gathered ones do not, so the earlier 1.06–1.37× mixed a tile effect into the
-padding series. Fixed-size block scheduling built from the same stage body (E39) is 1.26× (calibrated) to 1.51× (dropless)
+1.27× faster at T = 128 / 256 / 512 and RankTier is 1.06–1.17× faster than the best static program: the compiler skips padded rows in
+whole row tiles whose size follows the tile size, and only the static program can use the finest tiles without spilling
+(E43), so the earlier 1.06–1.37× mixed a tile effect into the padding series. Fixed-size block scheduling built from the same stage body (E39) is 1.26× (calibrated) to 1.51× (dropless)
 slower than RankTier at T=512 and still 1.12× slower with a trace-specialized schedule, because every block slot streams its
 expert's weights. Consecutive chunks through the retained cache are bit-identical to the capacity-T program, and one
 program with capacity profiles detects a forced overflow and reruns the chunk bit-exactly (E40). Evaluated on held-out
 documents of eight workloads, the deployed ranked capacities overflow in none of 1872 chunks while a fixed expert order
-needs capacity T (E41), and with the dense path already repaired the token-owned combine still gives 1.46× (E42).
+needs capacity T (E41), and with the dense path already repaired the token-owned combine still gives 1.46× (E42). The compiled programs do skip
+work at run time without control flow: every row tile of an expert lane is gated by a predicate derived from the export's
+mask, and an empty expert's weights are skipped only when its lane is a single tile (E43).
 
 ## 1. What the flag does
 
@@ -2283,18 +2285,21 @@ summed over a card's cores (largest card), MXFP6 weight bytes read from DDR per 
 | D, 1024 KiB | 5.07 ms | 16xT 1.77–2.20, 16xT/8 0.60–0.85 ms | 27.3 / 0.6 ms | 56 / 49 MiB |
 | E, 1024 KiB | 3.65 ms | 16x64 0.45–0.55, 8xT 0.70–0.88, 8x128 0.48–0.51 ms | 0.8 / 3.3 / 0.35 ms | 49 / 28 / 28 MiB |
 
-The static program's 512 KiB tiling issues the same number of HMX operations as its default tiling (168 per gate MatMul on
-card 0), but most take under 0.5 µs (median 0.3 µs; about a third take 5–27 µs) instead of 24–138 µs (median 34 µs): at that
-tile size the gate and up GEMMs with static weights skip most of the padded rows on the tensor unit (the down projections, at
-8–80 µs per operation, do not), and the stage becomes weight-bound (56 MiB in about 0.9 ms). The runtime-gathered GEMMs do not: C's second
-stage holds at most 30 tokens per 512-row lane in this layer (37 in any layer) and still costs 4–9 ms of HMX time per card, and the gathered programs are
-slower at 512 KiB than at 1024. That is the 6% of A to B, and it is a compiler behavior, not a property of indirection: a static
-program cannot follow the run-time ranking, so the ranked programs need the gather and lose the row skipping, and RankTier's
-capacities give back what the skipping would have saved and more (8 lanes at capacity T instead of 16 run at 0.39 ms of HMX per
-lane instead of 1.3–1.7 ms, the shared-traffic effect of 3.30). Lanes whose expert receives no tokens skip their weight reads
-only in some programs: the static program at the default tile size (3.5 MiB less per empty lane, 45.7–52.7 MiB per stage) and
-the 64-row tiers of D and E (E's 16-lane tier reads 39 MiB instead of 56 on cards 2 and 3); A at 512 KiB and B and C at 1024 KiB
-read all 56 MiB per stage with up to five empty lanes per stage and card.
+The tile size sets the granularity at which the compiler skips padded rows (3.39, E43): it cuts every lane's rows into tiles
+and runs a tile only if it holds a routed token, so a 512-row lane computes all 512 rows at the default tile size whenever it
+has a token, 256 ceil(n/256) at 1024 KiB and 128 ceil(n/128) at 512 KiB. The static program at 512 KiB therefore computes
+3456–3840 of its 16384 rows per card in this layer instead of 13824–15360, with the same operation count (168 per gate MatMul
+on card 0, most now under 0.5 µs instead of 24–138 µs), and its stages become weight-bound (56 MiB in about 0.9 ms). The
+gathered programs skip in the same way, in 256-row tiles at 1024 KiB (an earlier version of this paragraph said they do not
+skip); at 512 KiB they would skip in 128-row tiles too, but the compiler then spills their GEMMs' activations to DRAM and
+the stages get longer (3.39), so they run best at 1024 KiB and compute twice the static program's rows. That is the 6% of A
+to B at T=512, a compiler behavior, not a property of indirection. RankTier's capacities make the tile follow the load rank:
+its 8 lanes at capacity T compute 256-row tiles at about 0.4 ms of HMX per lane against 1.3–1.7 ms for the 16 of C and D (the
+shared-traffic effect of 3.30), and its 64-row lanes are single tiles. Lanes whose expert receives no tokens skip their
+weight reads exactly where a lane is a single tile: the static program at the default tile size (3.5 MiB less per empty
+lane, 45.7–52.7 MiB per stage) and the 64-row tiers of D and E (E's 16-lane tier reads 39 MiB instead of 56 on cards 2 and
+3); with several tiles per lane (A at 512 KiB, B and C at 1024 KiB) all 56 MiB per stage are read, with up to five empty
+lanes per stage and card.
 
 ## 3.35 Fixed-size block scheduling as the alternative organization (E39)
 
@@ -2559,6 +2564,64 @@ read-back of its zeros, with a tiled lane reduction and with tree scans instead 
 the full model and reversed in the instrumented two-layer cut (MoE layer 7.0 against 6.4 ms). The dense accumulator holds every (lane, token) row, [64, T, 2048] per stage (128 MiB per stage
 per layer in fp16 at T=512); the token-owned combine gathers only the 8T assigned rows, [4, 8T, 2048] (64 MiB).
 
+## 3.39 How the tile size changes the work: tile predication (E43)
+
+The compiler has no data-dependent control flow (3.18), yet the E38 profiles show lanes that skip work: empty experts skip
+their weight reads in some programs, and at 512 KiB tiles the static program runs its GEMMs at a fraction of the default's
+tensor-unit time. Both follow from one compiler behavior, read off the layer-1 work tables of the instrumented two-layer cuts
+at T=512 (`full_model/kvtest/prof_e38_512_*`, kept from E38/E39) and one new profile, C at 512 KiB (`run_e38p.sh 512
+e38C:512`, `full_model/e39/e43_C512_profile.txt`). `scripts/tile_predication.py` compares, per stage and card, the rows each
+lane's SiLU processed with the routing counts of the same prompt (`full_model/e39/e43_tile_predication.txt`).
+
+**The mechanism.** The export ends every expert lane with `Where(row < n_e, y, 0)`: n_e, the expert's token count, comes
+from the routing at run time, and the rows of empty slots become zero. The compiler lowers this as a range select that
+writes the zero rows directly (`aicselectsplatrange`) and gates the work that produces the others. It cuts the lane's rows
+into tiles, evaluates per tile at run time whether the tile holds a row below n_e (`elementsub`, `elementcmplte`,
+`aicreducebooltoscalar`, then a multicast to the cores), and runs the tile's activation gather, GEMMs, SiLU and multiply
+only if it does. `-size-split-granularity` sets the tile: a 512-row lane holds 2 MiB of activations (512 x 2048 x 2 bytes)
+and stays one tile at the default, becomes two tiles of 256 rows at 1024 KiB and four of 128 rows at 512 KiB; a lane spread
+over two cores is cut per core (RankTier's 128-row lanes: two tiles of 64 rows).
+
+| Program, tile size | Lane rows | Row tile | Predicates per lane | Rows computed, n tokens | Rows per card (provisioned) | Empty expert's weights |
+|---|---:|---:|---:|---|---|---|
+| A, default | 512 | 512 | 1 | 512 if n > 0 | 13824–15360 (16384) | skipped |
+| A, 512 KiB | 512 | 128 | 4 | 128 ceil(n/128) | 3456–3840 (16384) | read and dequantized |
+| B and C, 1024 KiB | 512 | 256 | 2 | 256 ceil(n/256) | 6912–7680 (16384) | read |
+| C, 512 KiB | 512 | 128 | 4 | 128 ceil(n/128) | 3456–3840 (16384) | read |
+| D, 1024 KiB | 512 / 64 | 256 / 64 | 2 / 1 | per tier, as above | 4800–4992 (9216) | (never empty) / skipped |
+| E (RankTier), 1024 KiB | 512 / 128 / 64 | 256 / 64 / 64 | 2 / 2 / 1 | per tier, as above | 3264–3456 (6144) | (never empty) / (never empty) / skipped |
+
+The rule holds exactly on every lane of every stage and card; at 512 KiB the two lanes with 139 and 142 tokens run two
+128-row tiles.
+
+**Why an empty expert's weights are skipped only with large tiles.** On card 0 (A, stage 0, experts 10 and 12 empty), at the
+default tile size each core evaluates one predicate, and the weight DMA and the activation gather start right after it,
+only where it is true: cores 10 and 12 then only write their zero rows. At 512 KiB each core evaluates four predicates and
+then issues the weight DMA on every core, the empty experts' included; their gathers, GEMMs and SiLU stay off. The weight
+load and its MXFP6 dequantize produce one operand that all of a lane's tiles share. With one tile per lane it falls under
+that tile's predicate; with several it runs unconditionally, as the compiler does not combine the tiles' predicates. That
+last step is an inference from the traces, but it matches every program profiled: the weights of empty experts are skipped
+exactly where a lane is a single tile.
+
+**Consequences.**
+- The static program computes all 512 rows of every non-empty lane at the default tile size and 128-row tiles at 512 KiB:
+  tensor-unit time 26.0 / 21.1 -> 5.1 / 3.1 ms per card, MoE layer 6.87 -> 4.12 ms, full model 497.9 -> 417.6 ms, against
+  about 12% more weight reads (the weights of the 0–3 empty experts per stage and card are now read). The rule also predicts the static program's
+  tile choices in E38: at T=128 a lane holds 512 KiB and stays one tile at every setting (the default is best), at T=256 512
+  KiB tiles give two tiles (8% faster), at T=512 four (16% faster).
+- The gathered programs skip in the same way. At 512 KiB C computes 128-row tiles too, and its first stage's tensor-unit
+  time falls from 24.3 to 4.2 ms (busiest card), but the compiler then spills the activations of all three GEMMs to DRAM,
+  95–97 MiB written and read back per card and layer (1.7–3.9 MiB at 1024 KiB; none for A at 512 KiB), plus a 64 MiB
+  write in the routing chain (`nat/Where_1`). The first stage's window grows from 1.52–1.91 to 2.15–2.25 ms and the MoE layer from
+  5.74 to 6.45 ms (full model 450.8 -> 539.9 ms), so the gathered programs run at 1024 KiB and compute twice the static
+  program's rows: the 6% between A and B at T=512.
+- RankTier's capacities set the tile per rank: its 8 lanes at capacity T compute 256-row tiles, its 128-row lanes 64-row
+  tiles, and its 64-row lanes are single tiles that skip the weights of empty experts. It computes the fewest rows (3264–3456
+  per card) at 3.8–4.2 ms of tensor-unit time per card, the most even of all seven programs.
+- Not explained: why only the gathered program spills at 512 KiB, and why the tensor-unit time per computed row depends on the
+  tile (busiest card: 1.6–2.1 µs per row with 128-row tiles, 3.1–4.3 µs with 256- or 512-row tiles), part of which is stall
+  time inside the operations.
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -2591,12 +2654,15 @@ per layer in fp16 at T=512); the token-owned combine gathers only the 8T assigne
   the checkpoint into `full_model/` (see the previous item); the partition config,
   specialization file and KV-only custom IO list are in `full_model/configs/` and
   `scripts/mdp_ts_4.json`.
-- Empty experts and weight reads. The compiler has no data-dependent control flow (3.18), yet in the instrumented
-  profiles of E38 (T=512, layer 1) lanes whose expert receives no tokens skip their weight reads in the 64-row stages of D
-  and E (2–5 lanes per card, 39 instead of 56 MiB on cards 2 and 3) and in the static program at the default tile size, while
-  every lane of the 512-row stages of A at 512 KiB and of B and C, and every block slot of E39, reads its weights. The trigger
-  was not established (for A it depends on the tile size); the earlier statement here that every lane
-  streams its bank in every profile was too strong.
+- Run-time skipping without control flow. The compiler has no data-dependent control flow (3.18), but it gates every row
+  tile of an expert lane on a run-time predicate derived from the export's mask (3.39, E43): padded rows are skipped in whole
+  tiles, and an empty expert's weights only when its lane is a single tile. This rests on the layer-1 work tables of
+  instrumented two-layer cuts at T=512 (seven programs, every card and stage). How the compiler cuts a lane (by the size cap,
+  and per core for lanes spread over two cores) and that it never puts a multi-tile lane's weight load under a predicate are
+  inferences from these traces, not documented behavior. Why only the gathered programs spill at 512 KiB, and why the
+  tensor-unit time per computed row depends on the tile (busiest card: 1.6–2.1 µs per row with 128-row tiles, 3.1–4.3 µs
+  with 256- or 512-row tiles), is not established. Earlier statements here and in 3.34 that every lane streams its bank and
+  that gathered GEMMs do not skip padded rows were wrong.
 - E20–E22 are single-layer replays of layer 2 with routing and MoE inputs from the FP32
   CPU stack, 50 prompts per workload at T=128 and far fewer at T=256 (16, GSM8K only)
   and T=512 (20). The dynamic split has not been ported to the full model; its DDR cost
@@ -2738,4 +2804,7 @@ capacity-input graph with only the tiered specialization);
 `build_full_tiered.py --capacity-inputs`, `truncate_layers.py ... --keep-counts`; the 1024-token reference
 `e2e_cpu_ref_local.py --ids full_model/heldout_T1024_ids.npy --T 1024 --out full_model/ref1024`. E41:
 `e41_make_chunks.py <mdts_flag dir>`, `run_e41.sh <T> <static program>`, `e41_analysis.py <mdts_flag dir>`. E42: the two-layer
-cuts `trunc2_512_e42R{0..3}` of the ladder graphs and `run_e38p.sh 512 e42R0:def ...`.
+cuts `trunc2_512_e42R{0..3}` of the ladder graphs and `run_e38p.sh 512 e42R0:def ...`. E43: `run_e38p.sh 512 e38C:512` (the
+one new profile) and `tile_predication.py <analysis dir> <result.json> <tiers> [layer]` on the kept layer-1 work tables
+(`full_model/e39/e43_tile_predication.txt`); the routing counts come from each program's own full-model run of the same
+prompt.

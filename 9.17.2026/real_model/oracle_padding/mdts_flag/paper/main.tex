@@ -209,9 +209,9 @@ holds on any AOT target; the other two describe this export and compiler.
 \subsection{Capacities Attached to Experts Cover the Worst Chunk}
 \label{sec:mot-pad}
 
-Without data-dependent control flow a lane cannot skip rows: every lane of a compiled stage computes its full capacity of
-$C$ rows, however few tokens it receives. Capacity is work, and the question is which capacities a program may use
-without dropping tokens.
+Without data-dependent control flow a lane cannot size its work to its tokens: the compiler skips only whole row tiles
+that hold no token (\S\ref{sec:eval-abl}), so a lane computes its tokens rounded up to the tile and, unless it is one tile,
+reads all its weights. Capacity is work, and the question is which capacities a program may use without dropping tokens.
 
 We captured the routing of all 48 layers for 50 prompts of 128 tokens from each of eight workloads, GSM8K, MMLU,
 SWE-bench Lite issues, HumanEval and its JavaScript version, Alpaca instructions, CNN/DailyMail articles and Chinese XNLI
@@ -590,13 +590,15 @@ Rows, A--C / E    & \multicolumn{2}{c}{4096 / 1664} & \multicolumn{2}{c}{8192 / 
 1.13, 1.13 and 1.27$\times$ faster at $T=128$, 256 and 512 with tuned tiles (1.15--1.34$\times$ at the default), and
 1.06--1.17$\times$ faster than the best static program, which cannot follow the ranking.
 
-\textbf{Why the tile size matters.} At 512\,KiB tiles the static program issues as many tensor-unit operations as at the
-default, but half of its gate and up operations take under 0.5\,$\mu$s (the rest up to 32) instead of 24--138\,$\mu$s: the static GEMMs skip most padded rows
-and become weight-bound (Appendix~\ref{app:attrprof}). Gathered GEMMs do not: C's second stage holds at most 30 tokens per 512-row lane yet
-spends 4--9\,ms of tensor-unit time per SoC. That is the 6\% of A$\to$B at $T=512$, a property of this compiler rather than
-of indirection (none at $T\le256$). A ranked program needs the gather, so its capacities must recover the skipping: eight
-lanes at capacity $T$ spend 0.39\,ms of tensor-unit time per lane where sixteen spend 1.3--1.7\,ms. The sort costs 0--2\%
-at $T\ge256$ and 9\% at 128.
+\textbf{Why the tile size matters.} The compiler cuts each lane's rows into tiles and runs a tile only if a run-time
+predicate, derived from the export's mask of empty slots, finds a token in it; an empty expert's weights are skipped only
+when its lane is one tile (Appendix~\ref{app:attrprof}). The tile size sets the tiles: a 512-row lane is one tile at the
+default, two at 1024\,KiB and four at 512\,KiB, where the static program computes 3.5--3.8k of 16.4k rows per SoC instead of
+13.8--15.4k and becomes weight-bound. Gathered GEMMs skip the same way, but at 512\,KiB the compiler spills their activations
+(95--97\,MiB per SoC and layer), so they run at 1024\,KiB with twice the rows: the 6\% of A$\to$B at $T=512$, a property of
+this compiler rather than of indirection (none at $T\le256$). Capacities make the tile follow the rank: eight lanes at
+capacity $T$ spend 0.4\,ms of tensor-unit time per lane where sixteen spend 1.3--1.7\,ms, and \sys's 64-row lanes are
+single tiles. The sort costs 0--2\% at $T\ge256$ and 9\% at 128.
 
 \textbf{The order of the series.} Under the export's combine the same tiers make the program slower (0.69--0.85$\times$
 of naive \naive), since each tier width needs its own dense accumulator; the reduction series, 2.06--2.38$\times$ alone, is
@@ -647,8 +649,8 @@ Part & Transferable reasoning & Pays when & Shaped here by the compiler \\
 \midrule
 Rank-bound capacities & a lane serves a load rank within a device's experts; the $r$-th largest of $n$ assignments is at
 most $n/r$, and per-rank maxima were stable across workloads while identities were not; blocks stream weights per block & expert
-work is fixed before routing is known; padded rows cost time and the compiler cannot skip them (static weights at tuned
-tiles partly can); many experts per device & no control flow, so a sort and gathers; one gathered constant, replicated (22.5\,GiB per SoC); tile size tuned
+work is fixed before routing is known; padded rows cost time and the compiler skips them only in whole
+tiles; many experts per device & no control flow, so a sort and gathers; one gathered constant, replicated (22.5\,GiB per SoC); tile size tuned
 per chunk length \\
 Tier sizes & first tier at $T$; lower tiers at $h$ times the calibrated maximum of their first rank; the tier count trades
 rows against per-stage cost; overflows show in the counts & a stage's fixed cost is small against the rows it removes &
@@ -759,8 +761,8 @@ property of the model, measured here for one.
 \textbf{When it pays.} The techniques target programs that fix an expert's work before routing is known; kernels that
 size expert work at run time have no padding to remove \citep{gale2023megablocks}. Padded rows must cost time, which
 depends on the hardware and on the compiler: a 16-lane stage of ours streams its MXFP6 weights in about 0.6\,ms, stays at
-that floor with 92 rows per lane and is bound by its tensor-unit time with 296, and static-weight GEMMs at a tuned tile
-size skip most padded rows while gathered ones do not, so the capacities gain 1.13--1.27$\times$ over the ranked program
+that floor with 92 rows per lane and is bound by its tensor-unit time with 296, and the compiler skips padded rows only in
+whole tiles, coarser ones for gathered weights, so the capacities gain 1.13--1.27$\times$ over the ranked program
 and 1.06--1.17$\times$ over the best static one. Blocks need what whole-expert lanes do not, a weight load shared by an
 expert's consecutive blocks or skipped for unused ones; where a stack provides both \citep{awsneuronmoe} they may close
 the 1.12--1.71$\times$ gap we measured. Both techniques need many experts per device relative to $k$ (32 per SoC against
@@ -902,7 +904,8 @@ With default tiles the rank sort is 4.7\% slower than the token-owned program at
 tiles it is 1.4\% faster. The
 best size moves with the chunk, 512\,KiB up to 256 tokens and 1024\,KiB at 512; static weights prefer the default only
 at $T=128$ (small tiles slow them by 1--2\%), while at 256 and 512 tokens 512\,KiB tiles make the static program 8\% and 16\%
-faster (Table~\ref{tab:attr}). Each program therefore uses its own best size.
+faster (Table~\ref{tab:attr}). Each program therefore uses its own best size. The tile size is the granularity of the
+compiler's row skipping (Appendix~\ref{app:attrprof}); at $T=128$ a lane is one tile at every size.
 
 \section{Ladder Chart}
 \label{app:ladder}
@@ -938,6 +941,7 @@ A, default tiles & 6.87 & 26.0 / 21.1 & 53 / 56 \\
 A, 512\,KiB      & 4.12 & 5.1 / 3.1 & 56 / 56 \\
 B, 1024\,KiB     & 5.23 & 18.5 / 10.7 & 56 / 56 \\
 C, 1024\,KiB     & 5.74 & 24.3 / 8.9 & 56 / 56 \\
+C, 512\,KiB      & 6.45 & 4.2 / 1.8 & 56 / 56 \\
 D, 1024\,KiB     & 5.07 & 27.3 / 0.6 & 56 / 49 \\
 E (\sys)         & 3.65 & 0.8 / 3.3 / 0.35 & 49 / 28 / 28 \\
 Blocks, 64, dropless & 12.6 & 31.4 & 337.5 \\
@@ -947,6 +951,19 @@ Blocks, 64, trace-specialized & 8.5 & 9.9 & 168.8 \\
 \end{small}
 \end{center}
 \end{table}
+
+\textbf{Tile predication.} The export ends each expert lane with $\mathrm{Where}(r<n_e,\,y,\,0)$, where $n_e$ is the
+expert's run-time token count. The compiler lowers it as a range select that writes the zero rows directly and gates the
+work producing the others: it cuts the lane's rows into tiles, evaluates for each tile at run time whether it holds a row
+below $n_e$ (a compare and a reduction to a scalar), and runs the tile's activation gather, GEMMs and SiLU only if so. A lane
+with $n$ tokens and row tile $R$ therefore computes $R\lceil n/R\rceil$ rows, which holds exactly for every lane of every
+stage and SoC of the programs above: a 512-row lane is one tile at the default ($R=512$), two at 1024\,KiB and four at
+512\,KiB, and a lane spread over two cores is cut per core (\sys's 128-row lanes: $R=64$). Per SoC, A computes 13.8--15.4k
+of its 16.4k rows at the default and 3.5--3.8k at 512\,KiB, B and C 6.9--7.7k at 1024\,KiB, and \sys 3.3--3.5k of 6.1k.
+An expert's weight load and dequantization feed all of its lane's tiles: for an empty expert they are skipped only when the
+lane is one tile (A at the default, the 64-row tiers of D and \sys) and run otherwise. At 512\,KiB the gathered program C
+computes 128-row tiles like A but spills the activations of its GEMMs to DRAM (95--97\,MiB written and read back per SoC,
+against none for A), which lengthens its stages. Both rules are read off the traces; the compiler does not document them.
 
 \section{Block Scheduling by Block Size}
 \label{app:blocks}
