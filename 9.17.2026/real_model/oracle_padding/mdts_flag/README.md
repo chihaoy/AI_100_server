@@ -97,6 +97,22 @@ needs capacity T (E41), and with the dense path already repaired the token-owned
 work at run time without control flow: every row tile of an expert lane is gated by a predicate derived from the export's
 mask, and an empty expert's weights are skipped only when its lane is a single tile (E43).
 
+A full-model profile of RankTier (E44) then showed attention's sum over its four head groups, an einsum on few cores, taking
+31% of each layer at T = 512. Written elementwise (E45, E46), it saves 17 / 67 / 130 ms per chunk in every head-parallel
+program, so the earlier ladder had charged attention cost to the MoE combine. All programs were re-timed with that fix in one
+program + session fit over E46–E55, every session holding ladder step 5 as an anchor (E47). RankTier prefills in 105.3 /
+141.5 / 225.3 ms at T = 128 / 256 / 512: 2.37 / 3.55 / 4.56× faster than naive T/T, and 4.74 / 3.65 / 4.68× faster than
+production re-timed against the same anchor (E55). MoE output aggregation gives 1.88–2.51×, the capacities 1.07–1.55×, of
+which 1.10–1.37× with ranking and weight indirection matched. The aggregation's graph form decides where it runs (E48,
+E52). A top-k gather across SoCs is 4.0–4.9× slower than step 5, and two local top-k forms with bit-identical outputs are
+3.4–5.3× slower, because the compiler moves 1539 instead of 14 MiB of expert outputs between SoCs. A lane-indexed form that
+stays local is still 11–15% slower: its sum crosses cores. Under a repaired dense combine, tiers change latency by +37 /
++4 / −4%, against −9 / −13 / −27% under token-owned aggregation (E50). An HVX custom operator in the token-owned layout
+(E49, E51, E54) runs at 0.94× of step 5 at T = 512, after a 650–656-minute compile. On one H100 under TensorRT 11.4 (E56)
+the 2×2 transfers weakly: capacities give 1.27–1.42× with token-owned against 1.21–1.22× with dense aggregation, a gap that
+comes from the extra stages rather than the row cut. TensorRT copies the gathered weight bank on every call, and vLLM's fused
+MoE is 5–6× faster.
+
 ## 1. What the flag does
 
 `-mos` is the degree of weight splitting across cores; `-mdts-mos` is the same knob
@@ -2622,6 +2638,176 @@ exactly where a lane is a single tile.
   tile (busiest card: 1.6–2.1 µs per row with 128-row tiles, 3.1–4.3 µs with 256- or 512-row tiles), part of which is stall
   time inside the operations.
 
+## 3.40 Full-model profile of RankTier, before the attention fix (E44)
+
+An instrumented 48-layer build of RankTier at T = 512 (`scripts/run_e44.sh`; layer timeline by `scripts/e44_layers.py`,
+`full_model/e44_layers.txt`) runs 371.2 ms on the device. Medians over layers 1–46:
+
+| Phase | ms per layer | Share |
+|---|---:|---:|
+| Attention, input norm to output projection | 1.73 | 22% |
+| Output projection: sum over the 4 head groups (cross-SoC) | 2.39 | 31% |
+| Residual, post-attention norm, router | 0.23 | 3% |
+| Router to per-SoC sort | 0.27 | 4% |
+| Expert tiers, sort to last tier | 2.98 | 38.5% |
+| Combine tail, last tier to final sum | 0.40 | 5% |
+| Layer period (the next layer starts 0.26 ms before the final sum ends, so the shares overlap) | 7.73 | |
+
+- **Tier spans.** Tier 0 (8×512) spans 1.01 ms after a 0.48 ms gap. The 8×128 and 16×64 tiers span 0.59 and 0.52 ms, but their GEMMs keep the busiest core busy for only 0.08–0.09 ms: they wait on weights.
+- **Core-time.** Busy core-time is 40% of the 64 cores' time. The largest items are the token-owned combine (20%), the tiers' activation gather and mask (12%), the routing chain with the sort (12%) and dequantization (10%).
+- **The head-group sum.** It is the largest phase after the expert tiers. It belongs to attention, not to the MoE layer.
+
+## 3.41 The elementwise head-group sum, and the ladder re-timed with it (E45–E47)
+
+**The fix (E45).** The head-parallel attention block of 3.15 sums its four group outputs with an einsum. `headpar_graph.py
+--osum addtree` writes the sum as the elementwise tree (G0+G1)+(G2+G3) per token tile, like the MoE layer's final sum (3.27).
+On two-layer cuts at T = 128 (`run_e45.sh`, `full_model/e45/e45_run.txt`):
+
+| Two layers | Einsum | Elementwise | Change |
+|---|---:|---:|---:|
+| Step 2, naive T/T | 12.31 ms | 11.57 ms | −6.0% |
+| RankTier | 5.94 ms | 5.19 ms | −12.5% |
+
+The outputs differ only in FP16 summation order (relative L2 8e-4 and 1.5e-3, same argmax).
+
+**Full model (E46).** On the full model the fix makes naive T/T 1.068 / 1.133 / 1.127× faster (`run_e46.sh`,
+`e46_summary.py`, `full_model/e46/e46_summary.txt`). The earlier reading that expert parallelism was slower than production
+because of the dense combine was wrong: it was the head-group sum.
+
+**Re-timing (E47).** Every ladder step and attribution program was re-timed with the elementwise sum (`run_e47.sh`). Step 3
+is split into the tree prefix scans (3a, `build_full_stack.py --rewrite-set scan`) and the two dense-combine repairs (3b).
+Latencies come from one program + session fit of log latency over every timed pass of E46–E55, every session holding step 5
+as an anchor (`scripts/paper_numbers.py full_model paper/paper_numbers.json`; largest residual 0.50 / 0.88 / 1.69%):
+
+| Step, ms | T=128 | T=256 | T=512 |
+|---|---:|---:|---:|
+| 1 Production (E55) | 499.6 | 516.5 | 1053.5 |
+| 2 Naive T/T, einsum head-group sum | 266.9 | 569.3 | 1157.6 |
+| 2′ + elementwise head-group sum | 250.0 | 502.4 | 1027.4 |
+| 3a + tree prefix scans | 212.4 | 431.0 | 877.8 |
+| 3b + dense-combine repairs | 141.9 | 289.9 | 570.9 |
+| 4 + token-owned aggregation | 115.8 | 189.9 | 350.9 |
+| 5 + elementwise final sum | 113.2 | 184.8 | 349.2 |
+| 6 Run-time rank, two tiers (D) | 106.3 | 138.0 | 269.6 |
+| 7 RankTier, three tiers (E) | 105.3 | 141.5 | 225.3 |
+| Attribution A / B / C (3.34) | 113.8 / 109.1 / 115.5 | 168.7 / 160.0 / 163.1 | 288.0 / 302.3 / 308.1 |
+
+- **Aggregation.** Steps 3b–5 give 1.88 / 2.33 / 2.51×.
+- **Capacities.** Steps 5–7 give 1.07 / 1.31 / 1.55×. With ranking and indirection matched (C/E) that is 1.10 / 1.15 / 1.37×, and RankTier is 1.08 / 1.19 / 1.28× faster than the static program A.
+- **Two tiers vs three.** At T = 256 two tiers are 2.5% faster than three.
+- **Exactness.** Scans and repairs are bit-identical to naive T/T, and A–E to each other.
+
+Interim fits (E46–E51, `full_model/e51/e46_e51_summary.txt`) differ by at most 0.5%.
+
+## 3.42 Aggregation formulations: where the expert outputs go (E48, E52)
+
+Seven formulations at capacity T, with static weights and the same routing (`run_e48.sh`, `run_e52.sh`):
+- Step 5 (token-owned, SoC batch axis).
+- Two local top-k forms (`build_full_dyncard.py --combine local_slices|local_global`).
+- The top-k gather of each token's k rows from all SoCs (`--combine topk|topk_gather`).
+- The lane-indexed combine on the lane axis, and with explicit SoC slices (`build_full_stack.py --combine tokencentric_slices`).
+- The repaired dense combine.
+
+Latency is relative to step 5 (joint fit). Cross-SoC MiB per MoE layer come from instrumented two-layer profiles, layer 1
+(`full_model/e48/e48_T512_profiles.txt`, `e52/e52_T512_profiles.txt`):
+
+| Formulation | T=128 | T=256 | T=512 | MiB (T=512) | Logits vs step 5 |
+|---|---:|---:|---:|---:|---|
+| Step 5: SoC batch axis | 1.00 | 1.00 | 1.00 | 14 | — |
+| Local top-k, explicit SoC slices | 3.44 | 4.04 | 4.14 | 1539 | bit-identical |
+| Local top-k, global row indices | 4.37 | 5.14 | 5.30 | 1539 | bit-identical |
+| Top-k rows from all SoCs | 4.05 | 4.70 | 4.92 | 1538 | summation order |
+| Lane-indexed, lane axis | 1.12 | 1.11 | 1.15 | 12 | summation order |
+| Lane-indexed, SoC slices | 7.02 | 8.22 | 4.31 | 577 | summation order |
+| Repaired dense combine | 1.25 | 1.57 | 1.64 | 48 | summation order |
+
+**Local top-k is step 5's own sum.** The two local top-k forms compute step 5's sum in step 5's order. Expressing device
+ownership by index values or slices still makes the compiler move expert outputs between SoCs, about 110× step 5's bytes.
+
+**Why the lane-indexed form is slower** (`scripts/combine_breakdown.py` on the layer-1 work tables):
+- It sums each token tile over a SoC's 16 lanes, which sit on 16 cores. That moves 242 MiB between cores and costs 47 core-ms, against 1.9 MiB and 2.4 core-ms for step 5's per-token sum.
+- Its 16 tiles run largely one after another, so the window from the last expert GEMM to the end of the final sum grows from 1.2–1.7 to 3.1–3.7 ms per SoC.
+- The uninstrumented full models differ by 1.1 ms per layer. The windows locate the difference; they are not a dependency-chain decomposition.
+
+## 3.43 Capacities under a repaired dense combine: the 2×2 (E50)
+
+All four programs rank experts at run time, gather weights from the bank, and share the final sum and tiles (`run_e50.sh`).
+The dense combine with tiers (`build_full_tiered.py --combine densefix`):
+- keeps one zero-filled accumulator per tier width and never reads its zeros back;
+- lets a width group's later tiers read, add and scatter back;
+- sums its lanes in 16 token tiles.
+
+Joint fit:
+
+| T | Repaired dense: uniform T → tiers | Token-owned: uniform T → tiers |
+|---:|---|---|
+| 128 | 146.4 → 200.4 ms (+36.9%) | 115.5 → 105.3 ms (−8.8%) |
+| 256 | 222.2 → 230.8 ms (+3.9%) | 163.1 → 141.5 ms (−13.3%) |
+| 512 | 409.5 → 394.6 ms (−3.6%) | 308.1 → 225.3 ms (−26.9%) |
+
+Token-owned aggregation is 1.27–1.36× faster than the repaired dense combine at capacity T and 1.63–1.90× with tiers. The
+repaired dense combine still gains from tiers at T = 512: the claim is the size and consistency of the benefit, not its
+existence.
+
+## 3.44 A fused TokenCombine operator in the token-owned layout (E49, E51, E54)
+
+**The operator.** `scripts/customop/tokencombine` is an SDK custom operator. It takes a stage's expert outputs `[4, 16C, d]`
+and per-SoC row indices `[4, T·k]` (−1 for rows on other SoCs) and returns the per-SoC partials. Its output is tileable by
+SoC, token and column, and a tile on SoC c reads only c's outputs. The HVX kernel accumulates each token's rows in FP32.
+
+**Two-layer tests (E49).**
+- The four-SoC test of one stage is bit-identical to the graph aggregation.
+- The scalar kernel was 6.5–7.8× slower than step 5; the HVX kernel runs two layers in 14.8 against 15.7 ms.
+- On the full model at T = 512, tiles land on all 64 cores and cross-SoC traffic stays at 14.1 MiB.
+
+**Full model, T = 512 (E51, E54).** E51's first pass failed after 19 s on a board collision with another job. E54 timed six
+alternating passes in one session: 323.3–324.7 ms against 341.9–343.8 ms for step 5 (0.945×; 0.940× in the joint fit).
+- **Numerics:** the logits differ from step 5's deterministically by 1.68e-2 relative L2 (largest absolute 0.273 of logits up to 24.7, same top five). The cause is FP32 accumulation per stage against the compiler's ReduceSum order.
+- **Compile:** one full-model compile takes 650–656 minutes. qaic-compile inlines the kernel at every output tile and compiles each SoC's code with one single-threaded `hexagon-clang++ -O3`.
+- **Kept:** `full_model/qpc_e54_512_tcc` (25 GB). T = 128, 256 and the tiered layout were not measured.
+
+## 3.45 Production re-timed against the anchor (E55)
+
+The speedups over production had come from E36, outside the joint fit and before the attention fix. E55 (`run_e55.sh`) times
+production (the exported graph, default partitioning, no `-mdts-mos=1`) against step 5 in one session per chunk length:
+
+| T | Production | Naive T/T 2′ | Step 5 | RankTier | Production → RankTier | Production → 2′ |
+|---:|---:|---:|---:|---:|---:|---:|
+| 128 | 499.6 ms | 250.0 ms | 113.2 ms | 105.3 ms | 4.74× | 2.00× |
+| 256 | 516.5 ms | 502.4 ms | 184.8 ms | 141.5 ms | 3.65× | 1.03× |
+| 512 | 1053.5 ms | 1027.4 ms | 349.2 ms | 225.3 ms | 4.68× | 1.03× |
+
+- **Without the attention fix,** naive T/T is 10% slower than production at T = 256 and 512.
+- **At T = 128,** production takes about as long as at T = 256.
+- **Accuracy:** production's relative L2 against FP32 is 0.188 / 0.089 / 0.095. At T = 256 production, step 5 and RankTier all pick ' a' over ' the', whose FP32 logits are 0.58 apart.
+- **Fit drift:** adding sessions to the joint fit moves every absolute latency by at most 0.3 ms, because the level is the mean of the session effects. Ratios are unchanged.
+
+## 3.46 TensorRT on one H100: the 2×2 on a GPU compiler (E56)
+
+`trt_h100/` (README there) ports one complete MoE block (layer 20, FP16) to TensorRT 11.4 on wolverine's H100 PCIe,
+following `RANKTIER_TENSORRT_H100_EXPERIMENT_PLAN.md`; full results are in its section 14.
+- **Tiers.** One GPU owns all 128 experts, so tiers rank all of them: 32/32/64 lanes, calibrated on the E41 calibration split.
+- **Arms.** All arms are built from one ONNX operator set with identical builder settings. They time routing metadata, expert GEMMs and aggregation; the router is excluded.
+- **Control.** U00/U01 hold capacity T in the tiers' stage structure.
+- **Native reference.** vLLM 0.31's `fused_experts`, on the same inputs.
+
+| µs, CUDA graph | S01 static, token-owned | G01 ranked uniform, token-owned | G00 ranked uniform, dense | G11 tiers, token-owned | G10 tiers, dense | vLLM |
+|---:|---:|---:|---:|---:|---:|---:|
+| T=128 | 1009 | 3398 | 3661 | 2677 | 3015 | 433 |
+| T=256 | 1297 | 3701 | 4245 | 2781 | 3488 | 509 |
+| T=512 | 1943 | 4248 | 5413 | 3001 | 4437 | 597 |
+
+- **Capacities.** The capacity speedup is 1.27–1.42× with token-owned aggregation against 1.21–1.22× with dense, so the interaction is 1.05–1.16, growing with T.
+- **Where the interaction comes from.** The control splits it.
+  - The row cut alone gives 1.06–1.24× under both combines alike.
+  - Three stages give 1.14–1.20× with token-owned aggregation but 1.00–1.13× with dense, whose per-stage accumulators cost more.
+- **Weight gather.** TensorRT materializes the run-time weight gather: 1.1 GiB is copied per call, taking 1.9–2.5 ms.
+- **Dense intermediate.** TensorRT keeps the dense `[lanes, T+1, d]` accumulator (1.1–1.8 ms at T = 512). The token-owned combine becomes one 88 µs fused kernel.
+- **Native comparison.** vLLM is 5.0–6.2× faster than G11, and 2.3–3.3× faster than the static TensorRT graph.
+- **Numerics.** TensorRT picks FP16-accumulating GEMM kernels by fused context, giving 1.07e-3 to 2.67e-3 relative L2 against FP32, which emulation reproduces. vLLM is at 4.8e-4.
+- **Overflow.** A forced overflow is flagged and recovered exactly. The host check costs 8–12 µs per chunk.
+- **TensorRT's native MoE layer.** TensorRT 11.4 has one (`add_moe`), but it refuses to build on the H100: it requires SM 10.x or 11.x (`trt_h100/moe_native_trt.py`).
+
 ## 4. Limits
 
 - One layer, one real prompt plus five synthetic workloads (E6) and fourteen
@@ -2697,6 +2883,10 @@ exactly where a lane is a single tile.
   of the 1872 evaluation chunks contain documents the deployed capacities were calibrated on. E40's 13% is not profiled, and
   RankTier and the static program were not loaded together. E42's combine numbers are
   instrumented two-layer profiles; uninstrumented latencies are E36's.
+
+- E44–E55 are full-model latencies of one held-out chunk per chunk length, from one program + session fit (3.41); the
+  block, multi-chunk and tile-size measurements (E39, E40, E27/E29) predate the elementwise head-group sum. E56 is one MoE
+  block (layer 20) on one H100 PCIe under TensorRT 11.4 with a vLLM reference at its default kernel configuration.
 
 ## 5. Reproduction
 
@@ -2808,3 +2998,15 @@ cuts `trunc2_512_e42R{0..3}` of the ladder graphs and `run_e38p.sh 512 e42R0:def
 one new profile) and `tile_predication.py <analysis dir> <result.json> <tiers> [layer]` on the kept layer-1 work tables
 (`full_model/e39/e43_tile_predication.txt`); the routing counts come from each program's own full-model run of the same
 prompt.
+
+E44: `scripts/run_e44.sh` (instrumented 48-layer RankTier at T=512), `e44_layers.py` (per-layer phase timeline),
+`e44_cores.py`, `e44_page.py`. E45: `headpar_graph.py ... --osum addtree` (the elementwise head-group sum; graphs `*_hpos`),
+`run_e45.sh` (two-layer timing and the instrumented profile). E46: `run_e46.sh`, `e46_summary.py <e46 dir>`. E47–E55:
+`run_e47.sh` (the re-timed ladder and attribution), `run_e48.sh` (combine variants and their two-layer profiles),
+`run_e50.sh` (the 2×2 with `build_full_tiered.py --combine densefix`), `run_e51.sh` and `run_e54.sh` (TokenCombine,
+`scripts/customop/tokencombine/`, compiled with `-register-custom-op`), `run_e52.sh` (local top-k, `build_full_dyncard.py
+--combine local_global|local_slices`), `run_e53.sh` (tier sweep, not run), `run_e55.sh` (production against the anchor);
+`e47_summary.py <full_model dir>...` and `paper_numbers.py <full_model dir> <json>` (the joint fit), `combine_breakdown.py
+<work.csv> ...` (aggregation phases). E56: `trt_h100/` on an H100 host: `export_layer.py`, `calibrate_tiers.py`,
+`setup_trt_venv.sh`, `setup_vllm_venv.sh`, `run_queue.sh` (export, engines, checks, timing, vLLM, kernel profile per T),
+`summarize.py`.
