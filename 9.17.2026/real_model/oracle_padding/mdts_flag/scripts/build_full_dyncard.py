@@ -12,6 +12,11 @@ ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); 
 ap.add_argument('--C_cold', type=int, default=16); ap.add_argument('--T', type=int, default=128)
 ap.add_argument('--final', choices=['einsum', 'addtree', 'tileadd'], default='einsum', help='form of the final cross-card sum: 16 Einsum tiles (collective template), '
                 'elementwise (p0+p1)+(p2+p3) on the whole [T, 2048], or the same per token tile (github_pack/FINAL_COMBINE_16CORE.md)')
+ap.add_argument('--combine', choices=['tokenowned', 'topk', 'topk_gather', 'local_global', 'local_slices'], default='tokenowned', help='tokenowned: per-card [4, T*8] gathers and partials, then the '
+                'final cross-card sum; topk: the direct analog of a GPU combine, one gather of each token\'s k rows from all lanes of all cards (CtxGather3D on '
+                '[1, 64*C, 2048]) and a sum over k, no per-card partials; topk_gather: the same with ONNX Gather on [64*C, 2048]; local_global: the token-owned '
+                'per-card partials, but each card\'s k rows gathered by global row (lane*C + slot) from the unsplit [1, 64*C, 2048] outputs, so locality is '
+                'only in the index values; local_slices: each card\'s 16 lanes cut out by an explicit Slice, gathered and summed over k per card')
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
 T, DOM, C_HOT, C_COLD = a.T, 'com.qualcomm.cloud', a.T, (a.C_cold if a.mode in ('dyncard', 'sortfirst') else a.T)
 m = onnx.load(f'{a.src}/model.onnx', load_external_data=False); g = m.graph
@@ -154,7 +159,8 @@ def tokenowned(L, routes):
             ps.append(c_(f'{tag}_p{c}'))
         new.extend([h.make_node('Add', [ps[0], ps[1]], [c_(f'{tag}_a01')], name=STEM + f'{tag}_add01'), h.make_node('Add', [ps[2], ps[3]], [c_(f'{tag}_a23')], name=STEM + f'{tag}_add23')])
         return h.make_node('Add', [c_(f'{tag}_a01'), c_(f'{tag}_a23')], [out], name=STEM + f'{tag}_add')
-    if a.final == 'addtree':
+    if a.combine in ('topk', 'topk_gather'): final_concat = None   # the top-k combine writes the layer output itself
+    elif a.final == 'addtree':
         final_concat = addtree(c_('to_partials'), 'fa', e4.output[0])
     else:
         outs = []
@@ -177,6 +183,26 @@ def tokenowned(L, routes):
             h.make_node('Div', [c_('to_lane'), i32('to_c16', 16)], [c_('to_card')], name=STEM + 'to_card'), h.make_node('Mul', [c_('to_card'), 'to_c16'], [c_('to_card16')], name=STEM + 'to_card16'),
             h.make_node('Sub', [c_('to_lane'), c_('to_card16')], [c_('to_local')], name=STEM + 'to_local')]
     slot_src = {0: STEM + 'Where_1_output_0', 1: STEM + 'Where_5_output_0'}; gathered = []
+    if a.combine in ('topk', 'topk_gather'):   # row of (token, j) in the stage's [64*C, 2048] outputs: lane * C + slot, masked when the expert is in the other stage
+        for s_ in (0, 1):
+            g3 = a.combine == 'topk'
+            new += [h.make_node('Transpose', [slot_src[s_]], [c_(f'to_slotT_s{s_}')], perm=[1, 0], name=STEM + f'to_slotT_s{s_}'),
+                    h.make_node('GatherElements', [c_(f'to_slotT_s{s_}'), c_('to_lane')], [c_(f'to_slot_s{s_}')], axis=1, name=STEM + f'to_slot_s{s_}'),
+                    h.make_node('Mul', [c_('to_lane'), i32(f'to_C_{C[s_]}', C[s_])], [c_(f'tk_lanerow_s{s_}')], name=STEM + f'tk_lanerow_s{s_}'),
+                    h.make_node('Add', [c_(f'tk_lanerow_s{s_}'), c_(f'to_slot_s{s_}')], [c_(f'tk_row_s{s_}')], name=STEM + f'tk_row_s{s_}'),
+                    h.make_node('Equal', [c_('to_stage'), i32(f'to_s{s_}', s_)], [c_(f'to_instage_s{s_}')], name=STEM + f'to_instage_s{s_}'),
+                    h.make_node('Where', [c_(f'to_instage_s{s_}'), c_(f'tk_row_s{s_}'), i32('to_zero', 0)], [c_(f'tk_idx_s{s_}')], name=STEM + f'tk_idx_s{s_}'),
+                    h.make_node('Cast', [c_(f'to_instage_s{s_}')], [c_(f'tk_mf_s{s_}')], to=TP.FLOAT16, name=STEM + f'tk_mf_s{s_}'),
+                    h.make_node('Reshape', [data[s_], i64(f'tk_shape_d{int(g3)}_{C[s_]}', ([1] if g3 else []) + [64 * C[s_], 2048])], [c_(f'tk_data_s{s_}')], name=STEM + f'tk_data_s{s_}'),
+                    h.make_node('Reshape', [c_(f'tk_idx_s{s_}'), i64(f'tk_shape_i{int(g3)}_{T}', ([1] if g3 else []) + [T * 8])], [c_(f'tk_idxr_s{s_}')], name=STEM + f'tk_idxr_s{s_}'),
+                    h.make_node('Reshape', [c_(f'tk_mf_s{s_}'), i64(f'tk_shape_m{int(g3)}_{T}', ([1] if g3 else []) + [T * 8, 1])], [c_(f'tk_mask_s{s_}')], name=STEM + f'tk_mask_s{s_}'),
+                    h.make_node('CtxGather3D', [c_(f'tk_data_s{s_}'), c_(f'tk_idxr_s{s_}')], [c_(f'tk_g_s{s_}')], name=STEM + f'tk_g_s{s_}', domain=DOM) if g3 else
+                    h.make_node('Gather', [c_(f'tk_data_s{s_}'), c_(f'tk_idxr_s{s_}')], [c_(f'tk_g_s{s_}')], axis=0, name=STEM + f'tk_g_s{s_}'),
+                    h.make_node('Mul', [c_(f'tk_g_s{s_}'), c_(f'tk_mask_s{s_}')], [c_(f'tk_gm_s{s_}')], name=STEM + f'tk_gm_s{s_}')]
+            gathered.append(c_(f'tk_gm_s{s_}'))
+        new += [h.make_node('Add', gathered, [c_('tk_sum')], name=STEM + 'tk_sum'), h.make_node('Reshape', [c_('tk_sum'), i64(f'tk_shape3_{T}', [T, 8, 2048])], [c_('tk_sum3')], name=STEM + 'tk_sum3'),
+                h.make_node('ReduceSum', [c_('tk_sum3'), i64('tk_reduce_axes', [1])], [e4.output[0]], keepdims=0, name=STEM + 'tk_reduce')]
+        return new, {e4.name}
     for s_ in (0, 1):
         new += [h.make_node('Transpose', [slot_src[s_]], [c_(f'to_slotT_s{s_}')], perm=[1, 0], name=STEM + f'to_slotT_s{s_}'),
                 h.make_node('GatherElements', [c_(f'to_slotT_s{s_}'), c_('to_lane')], [c_(f'to_slot_s{s_}')], axis=1, name=STEM + f'to_slot_s{s_}'),
@@ -184,21 +210,52 @@ def tokenowned(L, routes):
                 h.make_node('Add', [c_(f'to_localrow_s{s_}'), c_(f'to_slot_s{s_}')], [c_(f'to_row_s{s_}')], name=STEM + f'to_row_s{s_}'),
                 h.make_node('Equal', [c_('to_stage'), i32(f'to_s{s_}', s_)], [c_(f'to_instage_s{s_}')], name=STEM + f'to_instage_s{s_}'),
                 h.make_node('Reshape', [data[s_], i64(f'to_shape_d_{C[s_]}', [4, 16 * C[s_], 2048])], [c_(f'to_data_s{s_}')], name=STEM + f'to_data_s{s_}')]
+        rowsrc = c_(f'to_row_s{s_}')
+        if a.combine == 'local_global':   # global row in the stage's flat [64*C, 2048] outputs
+            new += [h.make_node('Mul', [c_('to_lane'), f'to_C_{C[s_]}'], [c_(f'to_rowg_lane_s{s_}')], name=STEM + f'to_rowg_lane_s{s_}'),
+                    h.make_node('Add', [c_(f'to_rowg_lane_s{s_}'), c_(f'to_slot_s{s_}')], [c_(f'to_rowg_s{s_}')], name=STEM + f'to_rowg_s{s_}')]
+            rowsrc = c_(f'to_rowg_s{s_}')
         idx_parts, mask_parts = [], []
         for k in range(4):
             new += [h.make_node('Equal', [c_('to_card'), i32(f'to_card{k}', k)], [c_(f'to_oncard{k}_s{s_}')], name=STEM + f'to_oncard{k}_s{s_}'),
                     h.make_node('And', [c_(f'to_instage_s{s_}'), c_(f'to_oncard{k}_s{s_}')], [c_(f'to_m{k}_s{s_}')], name=STEM + f'to_m{k}_s{s_}'),
-                    h.make_node('Where', [c_(f'to_m{k}_s{s_}'), c_(f'to_row_s{s_}'), i32('to_zero', 0)], [c_(f'to_idx{k}_s{s_}')], name=STEM + f'to_idx{k}_s{s_}'),
+                    h.make_node('Where', [c_(f'to_m{k}_s{s_}'), rowsrc, i32('to_zero', 0)], [c_(f'to_idx{k}_s{s_}')], name=STEM + f'to_idx{k}_s{s_}'),
                     h.make_node('Cast', [c_(f'to_m{k}_s{s_}')], [c_(f'to_mf{k}_s{s_}')], to=TP.FLOAT16, name=STEM + f'to_mf{k}_s{s_}'),
                     h.make_node('Unsqueeze', [c_(f'to_idx{k}_s{s_}'), i64('to_axis0', [0])], [c_(f'to_idx{k}_s{s_}_u')], name=STEM + f'to_idx{k}_s{s_}_u'),
                     h.make_node('Unsqueeze', [c_(f'to_mf{k}_s{s_}'), 'to_axis0'], [c_(f'to_mf{k}_s{s_}_u')], name=STEM + f'to_mf{k}_s{s_}_u')]
             idx_parts.append(c_(f'to_idx{k}_s{s_}_u')); mask_parts.append(c_(f'to_mf{k}_s{s_}_u'))
         new += [h.make_node('Concat', idx_parts, [c_(f'to_idx4_s{s_}')], axis=0, name=STEM + f'to_idx4_s{s_}'), h.make_node('Concat', mask_parts, [c_(f'to_mf4_s{s_}')], axis=0, name=STEM + f'to_mf4_s{s_}'),
                 h.make_node('Reshape', [c_(f'to_idx4_s{s_}'), i64(f'to_shape_g_{T}', [4, T * 8])], [c_(f'to_idx_s{s_}')], name=STEM + f'to_idx_s{s_}'),
-                h.make_node('Reshape', [c_(f'to_mf4_s{s_}'), i64(f'to_shape_m_{T}', [4, T * 8, 1])], [c_(f'to_mask_s{s_}')], name=STEM + f'to_mask_s{s_}'),
-                h.make_node('CtxGather3D', [c_(f'to_data_s{s_}'), c_(f'to_idx_s{s_}')], [c_(f'to_g_s{s_}')], name=STEM + f'to_g_s{s_}', domain=DOM),
-                h.make_node('Mul', [c_(f'to_g_s{s_}'), c_(f'to_mask_s{s_}')], [c_(f'to_gm_s{s_}')], name=STEM + f'to_gm_s{s_}')]
+                h.make_node('Reshape', [c_(f'to_mf4_s{s_}'), i64(f'to_shape_m_{T}', [4, T * 8, 1])], [c_(f'to_mask_s{s_}')], name=STEM + f'to_mask_s{s_}')]
+        if a.combine == 'local_slices':   # per card: its 16 lanes sliced out, its k rows gathered by local row and masked
+            per_card = []
+            for k in range(4):
+                new += [h.make_node('Slice', [data[s_], i64(f'to_lane_lo{k}', [16 * k]), i64(f'to_lane_hi{k}', [16 * k + 16]), 'to_axis0'], [c_(f'to_datac{k}_s{s_}')], name=STEM + f'to_datac{k}_s{s_}'),
+                        h.make_node('Reshape', [c_(f'to_datac{k}_s{s_}'), i64(f'to_shape_dc_{C[s_]}', [1, 16 * C[s_], 2048])], [c_(f'to_datacr{k}_s{s_}')], name=STEM + f'to_datacr{k}_s{s_}'),
+                        h.make_node('Reshape', [c_(f'to_idx{k}_s{s_}_u'), i64(f'to_shape_gc_{T}', [1, T * 8])], [c_(f'to_idxc{k}_s{s_}')], name=STEM + f'to_idxc{k}_s{s_}'),
+                        h.make_node('Reshape', [c_(f'to_mf{k}_s{s_}_u'), i64(f'to_shape_mc_{T}', [1, T * 8, 1])], [c_(f'to_maskc{k}_s{s_}')], name=STEM + f'to_maskc{k}_s{s_}'),
+                        h.make_node('CtxGather3D', [c_(f'to_datacr{k}_s{s_}'), c_(f'to_idxc{k}_s{s_}')], [c_(f'to_g_s{s_}_c{k}')], name=STEM + f'to_g_s{s_}_c{k}', domain=DOM),
+                        h.make_node('Mul', [c_(f'to_g_s{s_}_c{k}'), c_(f'to_maskc{k}_s{s_}')], [c_(f'to_gm_s{s_}_c{k}')], name=STEM + f'to_gm_s{s_}_c{k}')]
+                per_card.append(c_(f'to_gm_s{s_}_c{k}'))
+            gathered.append(per_card); continue
+        if a.combine == 'local_global':   # one gather from the unsplit outputs by global row, then per-card rows as in D
+            new += [h.make_node('Reshape', [data[s_], i64(f'to_shape_dg_{C[s_]}', [1, 64 * C[s_], 2048])], [c_(f'to_datag_s{s_}')], name=STEM + f'to_datag_s{s_}'),
+                    h.make_node('Reshape', [c_(f'to_idx_s{s_}'), i64(f'to_shape_gg_{T}', [1, 4 * T * 8])], [c_(f'to_idxg_s{s_}')], name=STEM + f'to_idxg_s{s_}'),
+                    h.make_node('CtxGather3D', [c_(f'to_datag_s{s_}'), c_(f'to_idxg_s{s_}')], [c_(f'to_g1_s{s_}')], name=STEM + f'to_g_s{s_}', domain=DOM),
+                    h.make_node('Reshape', [c_(f'to_g1_s{s_}'), i64(f'to_shape_g4_{T}', [4, T * 8, 2048])], [c_(f'to_g_s{s_}')], name=STEM + f'to_g_s{s_}_r')]
+        else:
+            new.append(h.make_node('CtxGather3D', [c_(f'to_data_s{s_}'), c_(f'to_idx_s{s_}')], [c_(f'to_g_s{s_}')], name=STEM + f'to_g_s{s_}', domain=DOM))
+        new.append(h.make_node('Mul', [c_(f'to_g_s{s_}'), c_(f'to_mask_s{s_}')], [c_(f'to_gm_s{s_}')], name=STEM + f'to_gm_s{s_}'))
         gathered.append(c_(f'to_gm_s{s_}'))
+    if a.combine == 'local_slices':   # per card: stages added, summed over k; the four [T, 2048] partials stacked for the same final sum
+        parts = []
+        for k in range(4):
+            new += [h.make_node('Add', [gathered[0][k], gathered[1][k]], [c_(f'to_sum_c{k}')], name=STEM + f'to_sum_c{k}'),
+                    h.make_node('Reshape', [c_(f'to_sum_c{k}'), i64(f'to_shape3c_{T}', [1, T, 8, 2048])], [c_(f'to_sum4_c{k}')], name=STEM + f'to_sum4_c{k}'),
+                    h.make_node('ReduceSum', [c_(f'to_sum4_c{k}'), i64('to_reduce_axes', [2])], [c_(f'to_partials_c{k}')], keepdims=0, name=STEM + f'to_partials_c{k}')]
+            parts.append(c_(f'to_partials_c{k}'))
+        new.append(h.make_node('Concat', parts, [c_('to_partials')], axis=0, name=STEM + 'to_partials'))
+        return new + [final_concat], {e4.name}
     new += [h.make_node('Add', gathered, [c_('to_sum')], name=STEM + 'to_sum'), h.make_node('Reshape', [c_('to_sum'), i64(f'to_shape4_{T}', [4, T, 8, 2048])], [c_('to_sum4')], name=STEM + 'to_sum4'),
             h.make_node('ReduceSum', [c_('to_sum4'), i64('to_reduce_axes', [2])], [c_('to_partials')], keepdims=0, name=STEM + 'to_partials')]
     return new + [final_concat], {e4.name}
@@ -250,5 +307,5 @@ for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'wei
     p = f'{a.src}/{link}'
     if os.path.islink(p) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(p), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-json.dump(dict(src=a.src, mode=a.mode, T=T, C_hot=C_HOT, C_cold=C_COLD, final=a.final), open(f'{a.out}/info.json', 'w'))
-print(f'{a.out}: mode {a.mode}, final {a.final}, capacities {C_HOT}/{C_COLD}; nodes {len(order)}; initializers {len(keep)}; banks replaced {len(removed_banks)}')
+json.dump(dict(src=a.src, mode=a.mode, T=T, C_hot=C_HOT, C_cold=C_COLD, final=a.final, combine=a.combine), open(f'{a.out}/info.json', 'w'))
+print(f'{a.out}: mode {a.mode}, combine {a.combine}, final {a.final}, capacities {C_HOT}/{C_COLD}; nodes {len(order)}; initializers {len(keep)}; banks replaced {len(removed_banks)}')

@@ -1,0 +1,36 @@
+---
+# TokenCombine: the token-owned combine as one custom op (follow-up plan §5, E49).
+#   data [B, N, D] fp16   expert outputs of each device (B = devices, N = lanes x capacity rows)
+#   idx  [B, T*k] int32   row of token t's j-th expert in data[b], or -1 when that expert is not on device b
+#   out  [B, T, D] fp16   out[b, t] = sum_j data[b, idx[b, t*k + j]] over the entries with idx >= 0
+# The output is tileable along all three axes; each output tile reads all N rows of its devices' data columns.
+version: 6.0.0
+CustomOps:
+  - type: TokenCombine
+    package: QAic
+    inputs:
+      - name: data
+        maxDims: 3
+      - name: idx
+        maxDims: 2
+    parameters:
+      - name: k
+        dataType: int
+        scalar: true
+    outputs:
+      - name: out
+        maxDims: 3
+    functionsLibrary: /home/wentao/workspace/AI_100_server/9.17.2026/real_model/oracle_padding/mdts_flag/scripts/customop/tokencombine/src/tokencombine_lib.so
+    implementations:
+      - backend: Interpreter
+        type: TokenCombineInterpreter
+        impl: /home/wentao/workspace/AI_100_server/9.17.2026/real_model/oracle_padding/mdts_flag/scripts/customop/tokencombine/src/tokencombine_lib.so
+      - backend: AIC
+        type: TokenCombineAIC
+        impl: /home/wentao/workspace/AI_100_server/9.17.2026/real_model/oracle_padding/mdts_flag/scripts/customop/tokencombine/src/tokencombine_aic_hvx_b.cpp
+        memoryConfig:
+            DDR:
+            CacheableDDR:
+            VTCM: [data, idx, out]
+            requiredFor:
+...

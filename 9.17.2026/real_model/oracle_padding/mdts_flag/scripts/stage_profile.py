@@ -5,7 +5,7 @@ weight bytes are the DDR reads of its bank gathers (tr<t>_gather_*, runtime-inde
 gathers reads no weights through its MatMul nodes) or of its own MatMul nodes (static weights: DDR-to-VTCM reads less the
 VTCM-to-DDR spills of the same nodes, which are read back once). Per stage and card: GEMM window (first to last HMX op), HMX
 busy summed over cores, MXFP6 dequantize busy, weight MiB read from DDR, activation spills MiB written to DDR. Families: sort (per-card TopK and orders), block metadata (bk_*), native routing chain (nat*),
-token-owned combine (to_*), final sum (final_/ft/fa_). Usage: stage_profile.py <analysis sample dir> <label> [layer, default 1]"""
+combine (token-owned to_*, top-k tk_*, custom op tcc_*, repaired dense over tiers df_*, token-centric tc_*, the dense path's lane-sum tiles reduce_*), final sum (final_/ft/fa_). Usage: stage_profile.py <analysis sample dir> <label> [layer, default 1]"""
 import sys, csv, re, json, collections
 d, label = sys.argv[1], sys.argv[2]; L = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 P = f'/model/layers.{L}/mlp/'
@@ -20,7 +20,7 @@ def stage(n):
 def family(n):
     t = n[len(P):]
     for k, pat in (('sort', r'(dc_topk|dc_cnt|dc_loc|dc_gloc|tr_order|dc_sorted)'), ('block metadata', r'bk_'), ('routing chain', r'(nat|dc_counts|dc_routed|ScatterElements|TopK|Softmax|gate)'),
-                   ('combine', r'(to_|dn_|CtxScatter3D(_\d+)?(/|$)|CtxGather3D_2|Einsum_[234]|ConstantOfShape_1|tc_|ta_)'), ('final sum', r'(final_|ft\d|fa_)')):
+                   ('combine', r'(to_|tk_|tcc_|df_|dn_|CtxScatter3D(_\d+)?(/|$)|CtxGather3D_2|Einsum_[234]|ConstantOfShape_1|tc_|ta_|reduce_(slice|tile)_)'), ('final sum', r'(final_|ft\d|fa_)')):
         if re.match(pat, t): return k
     return 'other'
 S = collections.defaultdict(lambda: collections.defaultdict(lambda: dict(g0=1e9, g1=-1e9, hmx=0.0, deq=0.0, gmib=0.0, inmib=0.0, spill=0.0, wmib=0.0)))

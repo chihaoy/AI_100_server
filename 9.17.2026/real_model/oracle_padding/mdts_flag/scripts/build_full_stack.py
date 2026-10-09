@@ -12,9 +12,14 @@ Usage: build_full_stack.py <src dir> <out dir> <counts_i32.bin> --regroup native
 import sys, os, json, copy, argparse, numpy as np, onnx
 from onnx import helper as h, numpy_helper as nh, TensorProto as TP
 from onnx.reference import ReferenceEvaluator
-ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('counts'); ap.add_argument('--regroup', default='native'); ap.add_argument('--caps', default='128'); ap.add_argument('--rewrites', type=int, default=1); ap.add_argument('--banks', default=None); ap.add_argument('--poscounts', default=None, help='counts in position order from a run of the same layout; capacities are taken from these'); ap.add_argument('--combine', default='dense', help='dense | tokencentric (drop the accumulator: per token tile gather+mask+lane-reduce+card-reduce, needs --rewrites 1)')
+ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); ap.add_argument('counts'); ap.add_argument('--regroup', default='native'); ap.add_argument('--caps', default='128'); ap.add_argument('--rewrites', type=int, default=1); ap.add_argument('--banks', default=None); ap.add_argument('--poscounts', default=None, help='counts in position order from a run of the same layout; capacities are taken from these'); ap.add_argument('--combine', default='dense', help='dense | tokencentric (drop the accumulator: per token tile gather+mask+lane-reduce+card-reduce, needs --rewrites 1) | '
+                'tokencentric_slices (the same with each card\'s lanes cut out by explicit slices, the E11 dead end)')
 ap.add_argument('--T', type=int, default=128)
+ap.add_argument('--rewrite-set', default='zeroread,tile,scan', help='rewrites applied by --rewrites 1: zeroread (drop the read of the zeroed accumulator), '
+                'tile (16 token tiles for the lane sum), scan (tree prefix scans)')
+ap.add_argument('--tc-final', choices=['einsum', 'addtree'], default='einsum', help='token-centric combines: card sum per token tile as Einsum dth->th or elementwise (p0+p1)+(p2+p3)')
 a = ap.parse_args(); os.makedirs(a.out, exist_ok=True)
+RS = set(a.rewrite_set.split(',')); assert RS <= {'zeroread', 'tile', 'scan'}, RS
 O = '/home/wentao/workspace/AI_100_server/9.17.2026/real_model/oracle_padding'; F = f'{O}/mdts_flag/full_model'
 m = onnx.load(f'{a.src}/model.onnx', load_external_data=False); g = m.graph
 counts = np.fromfile(a.counts, np.int32).reshape(48, 128); assert (counts.sum(1) == 8 * a.T).all()
@@ -101,30 +106,32 @@ if a.rewrites:
     for L in range(48):
         p = f'/model/layers.{L}/mlp/'; bn = by_name()
         # zero-read removal
-        gather, add, zero = bn[p + 'CtxGather3D_2'], bn[p + 'Add'], bn[p + 'ConstantOfShape_1']
-        assert gather.op_type == 'CtxGather3D' and gather.input[0] == zero.output[0] and list(add.input) == [gather.output[0], bn[p + 'Mul_5'].output[0]]
-        assert sum(gather.output[0] in n.input for n in g.node) == 1
-        old, new = add.output[0], add.input[1]; nodes = []
-        for n in g.node:
-            if n.name in (gather.name, add.name): continue
-            for i, v in enumerate(n.input):
-                if v == old: n.input[i] = new
-            nodes.append(n)
-        del g.node[:]; g.node.extend(nodes); bn = by_name()
+        if 'zeroread' in RS:
+            gather, add, zero = bn[p + 'CtxGather3D_2'], bn[p + 'Add'], bn[p + 'ConstantOfShape_1']
+            assert gather.op_type == 'CtxGather3D' and gather.input[0] == zero.output[0] and list(add.input) == [gather.output[0], bn[p + 'Mul_5'].output[0]]
+            assert sum(gather.output[0] in n.input for n in g.node) == 1
+            old, new = add.output[0], add.input[1]; nodes = []
+            for n in g.node:
+                if n.name in (gather.name, add.name): continue
+                for i, v in enumerate(n.input):
+                    if v == old: n.input[i] = new
+                nodes.append(n)
+            del g.node[:]; g.node.extend(nodes); bn = by_name()
         # tiled local reduction
-        e3 = bn[p + 'Einsum_3']; assert e3.op_type == 'Einsum' and h.get_attribute_value(e3.attribute[0]) == b'dpth->dth'
-        inits = [nh.from_array(np.array([2], np.int64), f'stack_L{L}_tile_axis')]; rep, outs = [], []
-        for i in range(16):
-            s, e = f'stack_L{L}_tile_start_{i}', f'stack_L{L}_tile_end_{i}'; inits += [nh.from_array(np.array([i * (a.T // 16)], np.int64), s), nh.from_array(np.array([(i + 1) * (a.T // 16)], np.int64), e)]
-            sl, rd = f'stack_L{L}_tile_slice_{i}', f'stack_L{L}_tile_reduced_{i}'
-            rep += [h.make_node('Slice', [e3.input[0], s, e, f'stack_L{L}_tile_axis'], [sl], name=p + f'reduce_slice_{i}'), h.make_node('Einsum', [sl], [rd], equation='dpth->dth', name=p + f'reduce_tile_{i}')]
-            outs.append(rd)
-        rep.append(h.make_node('Concat', outs, list(e3.output), axis=1, name=e3.name))
-        nodes = []
-        for n in g.node: nodes.extend(rep if n.name == e3.name else [n])
-        del g.node[:]; g.node.extend(nodes); g.initializer.extend(inits); bn = by_name()
+        if 'tile' in RS:
+            e3 = bn[p + 'Einsum_3']; assert e3.op_type == 'Einsum' and h.get_attribute_value(e3.attribute[0]) == b'dpth->dth'
+            inits = [nh.from_array(np.array([2], np.int64), f'stack_L{L}_tile_axis')]; rep, outs = [], []
+            for i in range(16):
+                s, e = f'stack_L{L}_tile_start_{i}', f'stack_L{L}_tile_end_{i}'; inits += [nh.from_array(np.array([i * (a.T // 16)], np.int64), s), nh.from_array(np.array([(i + 1) * (a.T // 16)], np.int64), e)]
+                sl, rd = f'stack_L{L}_tile_slice_{i}', f'stack_L{L}_tile_reduced_{i}'
+                rep += [h.make_node('Slice', [e3.input[0], s, e, f'stack_L{L}_tile_axis'], [sl], name=p + f'reduce_slice_{i}'), h.make_node('Einsum', [sl], [rd], equation='dpth->dth', name=p + f'reduce_tile_{i}')]
+                outs.append(rd)
+            rep.append(h.make_node('Concat', outs, list(e3.output), axis=1, name=e3.name))
+            nodes = []
+            for n in g.node: nodes.extend(rep if n.name == e3.name else [n])
+            del g.node[:]; g.node.extend(nodes); g.initializer.extend(inits); bn = by_name()
         # tree scans
-        for cs in ('CumSum', 'CumSum_1'):
+        for cs in (('CumSum', 'CumSum_1') if 'scan' in RS else ()):
             original = bn[p + cs]; assert original.op_type == 'CumSum' and not original.attribute
             axis_node = next(n for n in g.node if original.input[1] in n.output); assert int(nh.to_array(h.get_attribute_value(axis_node.attribute[0]))) == 1
             rep, inits = scan_nodes(original, original.name + '_retune_')
@@ -137,13 +144,22 @@ if a.rewrites:
             del g.node[:]; g.node.extend(nodes); g.initializer.extend(inits); bn = by_name()
         if L % 8 == 0: print('rewrites layer', L, flush=True)
 
-# ---------------- token-centric combine (E11 design), per layer
-if a.combine == 'tokencentric':
-    assert a.rewrites, 'token-centric combine builds on the rewritten graph'
-    T = a.T; W = T // 16; DOM = 'com.qualcomm.cloud'
+# ---------------- token-centric combines (E11 design), per layer
+if a.combine in ('tokencentric', 'tokencentric_slices'):
+    assert a.rewrites and RS == {'zeroread', 'tile', 'scan'}, 'token-centric combines build on the fully rewritten graph'
+    T = a.T; W = T // 16; DOM = 'com.qualcomm.cloud'; slices = a.combine == 'tokencentric_slices'
     def init(name, arr): t = nh.from_array(np.asarray(arr), name); g.initializer.append(t); return name
     ax1 = init('tc_axis1', np.array([1], np.int64)); ax2 = init('tc_axis2', np.array([2], np.int64)); zero_i32 = init('tc_zero_i32', np.array(0, np.int32)); shape4 = init('tc_shape4', np.array([4, 16, W, 2048], np.int64))
     tok = [(init(f'tc_tok_start_{i}', np.array([i * W], np.int64)), init(f'tc_tok_end_{i}', np.array([(i + 1) * W], np.int64))) for i in range(16)]
+    ax0 = init('tc_axis0', np.array([0], np.int64)); cidx = [init(f'tc_c_{c}', np.array([c], np.int64)) for c in range(5)]
+    lane_lo = [init(f'tc_lane_lo_{c}', np.array([16 * c], np.int64)) for c in range(4)]; lane_hi = [init(f'tc_lane_hi_{c}', np.array([16 * c + 16], np.int64)) for c in range(4)]
+    def card_sum(parts, out, stem):   # [W, 2048] per card -> elementwise (p0 + p1) + (p2 + p3), or Einsum dth->th over their stack
+        if a.tc_final == 'addtree':
+            return [h.make_node('Add', [parts[0], parts[1]], [out + '_a01'], name=stem + '_add01'), h.make_node('Add', [parts[2], parts[3]], [out + '_a23'], name=stem + '_add23'),
+                    h.make_node('Add', [out + '_a01', out + '_a23'], [out], name=stem + '_add')]
+        us = [h.make_node('Unsqueeze', [x, ax0], [f'{out}_u{c}'], name=f'{stem}_unsq{c}') for c, x in enumerate(parts)]
+        return us + [h.make_node('Concat', [f'{out}_u{c}' for c in range(4)], [out + '_stack'], axis=0, name=stem + '_stack'),
+                     h.make_node('Einsum', [out + '_stack'], [out], equation='dth->th', name=stem)]
     for L in range(48):
         p = f'/model/layers.{L}/mlp/'; bn = by_name(); pre = f'tc_L{L}_'
         for nm, op in (('Where_1', 'Where'), ('Where_5', 'Where'), ('Where_3', 'Where'), ('Where_7', 'Where'), ('Mul_10', 'Mul'), ('Greater', 'Greater'), ('Greater_1', 'Greater'), ('Einsum_4', 'Einsum')):
@@ -159,9 +175,33 @@ if a.combine == 'tokencentric':
                    h.make_node('Cast', [mask[s_]], [pre + f'mask_s{s_}'], to=TP.FLOAT16, name=p + f'tc_mask_s{s_}'),
                    h.make_node('Unsqueeze', [pre + f'mask_s{s_}', ax2], [pre + f'maskf_s{s_}'], name=p + f'tc_maskf_s{s_}')]
             slot[s_] = pre + f'slotsafe_s{s_}'
+        if slices:   # each card's 16 lanes cut out of the 64-lane axis by explicit slices
+            for s_ in (0, 1):
+                for c in range(4):
+                    nn += [h.make_node('Slice', [data[s_], lane_lo[c], lane_hi[c], ax0], [pre + f'data_s{s_}_c{c}'], name=p + f'tc_data_s{s_}_c{c}'),
+                           h.make_node('Slice', [slot[s_], lane_lo[c], lane_hi[c], ax0], [pre + f'slot_s{s_}_c{c}'], name=p + f'tc_slot_s{s_}_c{c}'),
+                           h.make_node('Slice', [pre + f'maskf_s{s_}', lane_lo[c], lane_hi[c], ax0], [pre + f'maskf_s{s_}_c{c}'], name=p + f'tc_maskf_s{s_}_c{c}')]
         finals = []
         for i in range(16):
-            ts, te = tok[i]; gathered = []
+            ts, te = tok[i]; cards = pre + f'final_t{i}'
+            if slices:
+                per_card = []
+                for c in range(4):
+                    gathered = []
+                    for s_ in (0, 1):
+                        idx, gth, mk, gm = [pre + f'{k}_s{s_}_c{c}_t{i}' for k in ('idx', 'g', 'mk', 'gm')]
+                        nn += [h.make_node('Slice', [pre + f'slot_s{s_}_c{c}', ts, te, ax1], [idx], name=p + f'tc_idx_s{s_}_c{c}_t{i}'),
+                               h.make_node('CtxGather3D', [pre + f'data_s{s_}_c{c}', idx], [gth], name=p + f'tc_g_s{s_}_c{c}_t{i}', domain=DOM),
+                               h.make_node('Slice', [pre + f'maskf_s{s_}_c{c}', ts, te, ax1], [mk], name=p + f'tc_mk_s{s_}_c{c}_t{i}'),
+                               h.make_node('Mul', [gth, mk], [gm], name=p + f'tc_gm_s{s_}_c{c}_t{i}')]
+                        gathered.append(gm)
+                    add, red = pre + f'add_c{c}_t{i}', pre + f'lanes_c{c}_t{i}'
+                    nn += [h.make_node('Add', gathered, [add], name=p + f'tc_add_c{c}_t{i}'),
+                           h.make_node('Einsum', [add], [red], equation='pth->th', name=p + f'tc_reduce_c{c}_t{i}')]
+                    per_card.append(red)
+                nn += card_sum(per_card, cards, p + f'final_tile_{i}')
+                finals.append(cards); continue
+            gathered = []
             for s_ in (0, 1):
                 idx, gth, mk, gm = [pre + f'{k}_s{s_}_t{i}' for k in ('idx', 'g', 'mk', 'gm')]
                 nn += [h.make_node('Slice', [slot[s_], ts, te, ax1], [idx], name=p + f'tc_idx_s{s_}_t{i}'),
@@ -169,9 +209,17 @@ if a.combine == 'tokencentric':
                        h.make_node('Slice', [pre + f'maskf_s{s_}', ts, te, ax1], [mk], name=p + f'tc_mk_s{s_}_t{i}'),
                        h.make_node('Mul', [gth, mk], [gm], name=p + f'tc_gm_s{s_}_t{i}')]
                 gathered.append(gm)
-            add, rs, lanes, cards = [pre + f'{k}_t{i}' for k in ('add', 'rs', 'lanes', 'final')]
+            add, rs, lanes = [pre + f'{k}_t{i}' for k in ('add', 'rs', 'lanes')]
             nn += [h.make_node('Add', gathered, [add], name=p + f'tc_add_t{i}'), h.make_node('Reshape', [add, shape4], [rs], name=p + f'tc_rs_t{i}'),
-                   h.make_node('Einsum', [rs], [lanes], equation='dpth->dth', name=p + f'tc_reduce_tile_{i}'), h.make_node('Einsum', [lanes], [cards], equation='dth->th', name=p + f'final_tile_{i}')]
+                   h.make_node('Einsum', [rs], [lanes], equation='dpth->dth', name=p + f'tc_reduce_tile_{i}')]
+            if a.tc_final == 'einsum': nn.append(h.make_node('Einsum', [lanes], [cards], equation='dth->th', name=p + f'final_tile_{i}'))
+            else:
+                parts = []
+                for c in range(4):
+                    nn += [h.make_node('Slice', [lanes, cidx[c], cidx[c + 1], ax0], [f'{cards}_s{c}'], name=p + f'final_tile_{i}_slice{c}'),
+                           h.make_node('Squeeze', [f'{cards}_s{c}', ax0], [f'{cards}_p{c}'], name=p + f'final_tile_{i}_squeeze{c}')]
+                    parts.append(f'{cards}_p{c}')
+                nn += card_sum(parts, cards, p + f'final_tile_{i}')
             finals.append(cards)
         e4 = bn[p + 'Einsum_4']; outname = e4.output[0]
         nodes = []
@@ -190,6 +238,6 @@ for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'wei
     ps = f'{a.src}/{link}'
     if os.path.islink(ps) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(ps), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-json.dump(dict(src=a.src, T=a.T, regroup=a.regroup, caps=a.caps, rewrites=a.rewrites, combine=a.combine, layers=plan), open(f'{a.out}/plan.json', 'w'))
+json.dump(dict(src=a.src, T=a.T, regroup=a.regroup, caps=a.caps, rewrites=a.rewrites, rewrite_set=sorted(RS), combine=a.combine, tc_final=a.tc_final, layers=plan), open(f'{a.out}/plan.json', 'w'))
 busiest = [max(v['active_per_card']) for v in plan.values()]; padded = sum(sum(v['capacities'][s] * sum(1 for e in v['order'][s*64:(s+1)*64] if counts[int(k)][e] > 0) for s in range(2)) for k, v in plan.items())
 print(f'{a.out}: regroup={a.regroup} caps={a.caps} rewrites={a.rewrites} combine={a.combine}; nodes {len(g.node)}; busiest-card active experts mean {np.mean(busiest):.1f}; padded rows total {padded} (real {int(counts.sum())})')

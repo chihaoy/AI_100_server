@@ -38,7 +38,9 @@ ap = argparse.ArgumentParser(); ap.add_argument('src'); ap.add_argument('out'); 
 ap.add_argument('--tiers', required=True, help='comma list of <lanes per card>x<capacity>, e.g. 8x512,8x128,16x64')
 ap.add_argument('--final', choices=['einsum', 'addtree', 'tileadd'], default='einsum')
 ap.add_argument('--placement', default=None, help='[48,128] expert -> card assignment (32 per card); default native e // 32')
-ap.add_argument('--combine', choices=['tokenowned', 'dense'], default='tokenowned', help='token-owned combine, or the export combine per tier group (see above)')
+ap.add_argument('--combine', choices=['tokenowned', 'dense', 'densefix'], default='tokenowned', help='token-owned combine, the export combine per tier group (see above), or '
+                'densefix: the repaired dense combine per tier group on the rewritten input (no read of the zeroed accumulator, read-modify-write for the '
+                'group\'s later tiers, the lane sum in 16 token tiles, then the --final cross-card sum as in the token-owned programs)')
 ap.add_argument('--order', choices=['rank', 'identity'], default='rank', help='rank: per-card sort by load (TopK); identity: each card keeps its experts in '
                 'fixed order through the same gathers, the index made runtime data (min(position_ids, 0)) so the gathers are not folded')
 ap.add_argument('--direct-gather', action='store_true', help='stage activations by Gather from [T, 2048] instead of CtxGather3D on the expanded hidden states')
@@ -411,6 +413,64 @@ def densecombine(L, datas):
         tail.append(h.make_node('Add', [total, parts[k]], [c_(f'dn_sum{k}')], name=STEM + f'dn_sum{k}')); total = c_(f'dn_sum{k}')
     e4.input[0] = total
     return head, tail
+def final_sum(STEM, P, e4):
+    """The --final cross-card sum of the token-owned programs over P + 'to_partials' [4, T, 2048], written to Einsum_4's output (as in tokenowned)."""
+    c_ = lambda nm: P + nm; W = T // 16; new = []
+    def addtree(src, tag, out):
+        ps = []
+        for c in range(4):
+            new.extend([h.make_node('Slice', [src, i64(f'fa_c{c}', [c]), i64(f'fa_c{c + 1}', [c + 1]), i64('fa_axis0', [0])], [c_(f'{tag}_s{c}')], name=STEM + f'{tag}_slice_{c}'),
+                        h.make_node('Squeeze', [c_(f'{tag}_s{c}'), 'fa_axis0'], [c_(f'{tag}_p{c}')], name=STEM + f'{tag}_squeeze_{c}')])
+            ps.append(c_(f'{tag}_p{c}'))
+        new.extend([h.make_node('Add', [ps[0], ps[1]], [c_(f'{tag}_a01')], name=STEM + f'{tag}_add01'), h.make_node('Add', [ps[2], ps[3]], [c_(f'{tag}_a23')], name=STEM + f'{tag}_add23')])
+        return h.make_node('Add', [c_(f'{tag}_a01'), c_(f'{tag}_a23')], [out], name=STEM + f'{tag}_add')
+    if a.final == 'addtree': return new + [addtree(c_('to_partials'), 'fa', e4.output[0])]
+    outs = []
+    for i in range(16):
+        new.append(h.make_node('Slice', [c_('to_partials'), i64(f'tc_final_start_{i}_{T}', [i * W]), i64(f'tc_final_end_{i}_{T}', [(i + 1) * W]), i64('tc_final_axis', [1])], [c_(f'final_slice_{i}')], name=STEM + f'final_slice_{i}'))
+        if a.final == 'einsum': new.append(h.make_node('Einsum', [c_(f'final_slice_{i}')], [c_(f'final_red_{i}')], equation='dth->th', name=STEM + f'final_tile_{i}'))
+        else: new.append(addtree(c_(f'final_slice_{i}'), f'ft{i}', c_(f'final_red_{i}')))
+        outs.append(c_(f'final_red_{i}'))
+    return new + [h.make_node('Concat', outs, list(e4.output), axis=0, name=STEM + 'final_concat')]
+def densefix(L, datas):
+    """The repaired dense combine over the tiers (--combine densefix, follow-up plan §6); returns (nodes placed with the stages, nodes at Einsum_4,
+    dropped node names). Per group of consecutive tiers with equal lanes per card: a zeroed [4E, T, 2048] accumulator, the first tier's rows
+    scattered into it without reading the zeros back, every later tier's rows added to a read of the accumulator at its token table and
+    scattered back; the group's lane sum in 16 token tiles of Einsum 'dpth->dth'; the groups' [4, T, 2048] partials added; the cross-card
+    sum in the --final form of the token-owned programs."""
+    STEM, P = f'/model/layers.{L}/mlp/', f'L{L}_'; c_ = lambda nm: P + nm
+    ln, bn, prod, cons = layer_view(STEM); tts, zreads = dense_info[L]
+    assert all(z is None for z in zreads), 'densefix needs the rewritten input (build_full_stack.py --rewrites 1)'
+    e4 = bn[STEM + 'Einsum_4']; assert e4.op_type == 'Einsum' and h.get_attribute_value(e4.attribute[0]) == b'dth->th'
+    zval = next(x for x in bn[STEM + 'ConstantOfShape_1'].attribute if x.name == 'value').t
+    head, tail, parts, t, grp, W = [], [], [], 0, 0, T // 16
+    while t < NT:
+        E = TIERS[t][0]; members = [t]
+        while t + len(members) < NT and TIERS[t + len(members)][0] == E: members.append(t + len(members))
+        acc = c_(f'df_zeros{grp}')
+        head.append(h.make_node('ConstantOfShape', [i64(f'df_shape_{4 * E}_{T}', [4 * E, T, 2048])], [acc], name=STEM + f'df_zeros{grp}', value=zval))
+        for j, u in enumerate(members):
+            rows = datas[u]
+            if j:   # read-modify-write: the accumulator rows of this tier's token table plus its weighted rows
+                tail += [h.make_node('CtxGather3D', [acc, tts[u]], [c_(f'df_read{u}')], name=STEM + f'df_read{u}', domain=DOM),
+                         h.make_node('Add', [c_(f'df_read{u}'), datas[u]], [c_(f'df_rmw{u}')], name=STEM + f'df_rmw{u}')]
+                rows = c_(f'df_rmw{u}')
+            tail.append(h.make_node('CtxScatter3D', [acc, tts[u], rows], [c_(f'df_acc{u}')], name=STEM + f'df_scatter{u}', domain=DOM)); acc = c_(f'df_acc{u}')
+        tail.append(h.make_node('Reshape', [acc, i64(f'df_shape4_{E}_{T}', [4, E, T, 2048])], [c_(f'df_acc4_{grp}')], name=STEM + f'df_acc4_{grp}'))
+        tiles = []
+        for i in range(16):
+            tail += [h.make_node('Slice', [c_(f'df_acc4_{grp}'), i64(f'df_tile_start_{i}_{T}', [i * W]), i64(f'df_tile_end_{i}_{T}', [(i + 1) * W]), i64('df_tile_axis', [2])],
+                                 [c_(f'df_slice{grp}_{i}')], name=STEM + f'reduce_slice_{grp}_{i}'),
+                     h.make_node('Einsum', [c_(f'df_slice{grp}_{i}')], [c_(f'df_red{grp}_{i}')], equation='dpth->dth', name=STEM + f'reduce_tile_{grp}_{i}')]
+            tiles.append(c_(f'df_red{grp}_{i}'))
+        tail.append(h.make_node('Concat', tiles, [c_(f'df_part{grp}')], axis=1, name=STEM + f'df_part{grp}'))
+        parts.append(c_(f'df_part{grp}')); t += len(members); grp += 1
+    total = parts[0]
+    for k in range(1, len(parts)):
+        tail.append(h.make_node('Add', [total, parts[k]], [c_(f'df_sum{k}')], name=STEM + f'df_sum{k}')); total = c_(f'df_sum{k}')
+    tail.append(h.make_node('Identity', [total], [c_('to_partials')], name=STEM + 'df_partials'))   # the token-owned final sum reads to_partials
+    tail += final_sum(STEM, P, e4)
+    return head, tail, {e4.name}
 # ---------------- apply to every layer
 added = []
 if a.order == 'identity':   # a zero the compiler cannot fold: position ids are non-negative, but only at run time
@@ -442,6 +502,10 @@ for L in range(48):
     added += new
     if a.combine == 'dense':
         head, new2 = densecombine(L, datas)
+        for j, n in enumerate(head): key[id(n)] = base - 0.5 + j / (len(head) + 1) * 0.1
+        added += head
+    elif a.combine == 'densefix':
+        head, new2, d2 = densefix(L, datas); drop |= d2
         for j, n in enumerate(head): key[id(n)] = base - 0.5 + j / (len(head) + 1) * 0.1
         added += head
     else: new2, d2 = tokenowned(L, routes_native, orders, datas, slots); drop |= d2
@@ -483,6 +547,6 @@ for link in ('weights', 'weights_fp16', 'weights_native_fp16', 'regrouped', 'wei
     p = f'{a.src}/{link}'
     if os.path.islink(p) and not os.path.exists(f'{a.out}/{link}'): os.symlink(os.path.realpath(p), f'{a.out}/{link}')
 onnx.save(m, f'{a.out}/model.onnx'); _c = os.getcwd(); os.chdir(a.out); onnx.checker.check_model('model.onnx'); os.chdir(_c)
-json.dump(dict(src=a.src, mode='tiered', T=T, tiers=TIERS3, final=a.final, placement=a.placement, **({'combine': 'dense'} if a.combine == 'dense' else {}),
+json.dump(dict(src=a.src, mode='tiered', T=T, tiers=TIERS3, final=a.final, placement=a.placement, **({'combine': a.combine} if a.combine != 'tokenowned' else {}),
                **({'order': 'identity'} if a.order == 'identity' else {}), **({'blocks': BLOCK, 'block_budget': BUDGET, 'block_pad': a.block_pad} if BLOCK else {}), **({'capacity_inputs': True} if CAPIN else {}), **({'direct_gather': True} if a.direct_gather else {})), open(f'{a.out}/info.json', 'w'))
-print(f'{a.out}: ' + (f'blocks of {BLOCK} rows, budget per card {sorted(set(BUDGET))}; ' if BLOCK else '') + f'tiered {TIERS3}, {"dense combine" if a.combine == "dense" else "final " + a.final}, placement {"native" if not a.placement else a.placement}; nodes {len(order)}; initializers {len(keep)}')
+print(f'{a.out}: ' + (f'blocks of {BLOCK} rows, budget per card {sorted(set(BUDGET))}; ' if BLOCK else '') + f'tiered {TIERS3}, {"dense combine" if a.combine == "dense" else ("repaired dense combine, " if a.combine == "densefix" else "") + "final " + a.final}, placement {"native" if not a.placement else a.placement}; nodes {len(order)}; initializers {len(keep)}')
