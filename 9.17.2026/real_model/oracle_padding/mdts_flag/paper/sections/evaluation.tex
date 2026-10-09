@@ -1,0 +1,270 @@
+% !TEX root = ../main.tex
+\section{Evaluation}
+\label{sec:eval}
+
+We attribute \sys's speedup (\S\ref{sec:eval-e2e}), examine how capacities and aggregation interact
+(\S\ref{sec:eval-abl}--\S\ref{sec:eval-pad}), and test blocks, multiple chunks, generalization, accuracy and a fused kernel
+(\S\ref{sec:eval-blocks}--\S\ref{sec:eval-kernel}).
+
+\subsection{Experimental Setup}
+\label{sec:setup}
+
+\textbf{Hardware and model.} One Cloud AI 100 Ultra card, four SoCs with 16 cores and 32\,GB each, platform SDK 1.21.6;
+Qwen3-30B-A3B, all 48 layers, batch 1, MXFP6 matrix weights and FP16 activations as in the production deployment, and the
+KV cache on device.
+
+\textbf{Programs.} The ladder of Table~\ref{tab:ladder} adds one step at a time: (1) the production compilation of the
+exported graph; (2) expert-parallel compilation with head-parallel attention, the export's combine and capacity $T$, our
+\emph{naive \naive} baseline; (2$'$) attention's sum over its head groups written elementwise, kept by every later
+program; (3a) tree prefix scans for the routing; (3b) two repairs of the dense combine; (4) token-owned aggregation and
+(5) its elementwise cross-SoC sum (\S\ref{sec:red}); (6) the run-time rank sort with two tiers at $T$ and $T/8$; (7) \sys's
+three tiers. Controlled variants change one choice of these programs.
+
+\textbf{Inputs and protocol.} At $T=128$ the first chunk of a GSM8K chat prompt, at 256 and 512 held-out GSM8K chunks
+outside the calibration range; latency depends on a chunk only through its routing, and on one layer it varied by about
+1\% across 200 prompts of four workloads. A pass is the median of three rounds of 20 inferences after warm-up. Sessions
+time two to six programs in two or three passes of mirrored order, always with program 5 as an anchor, and one
+program$\,+\,$session fit of log latency over all passes (66 to 75 per chunk length) gives each program's latency; the
+largest residual is 0.50\%, 0.88\% and 1.7\% at $T=128$, 256 and 512. We compare the last-position logits with an FP32 CPU run and read back every lane's count.
+
+\subsection{End-to-End Results}
+\label{sec:eval-e2e}
+
+\begin{table}[t]
+\caption{Prefill latency of one chunk (ms) along the ladder, the change against the step above, and the contribution of
+each group of steps.}
+\label{tab:ladder}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{1.2pt}
+\begin{tabular}{@{}lr@{\,}lr@{\,}lr@{\,}l@{}}
+\toprule
+Program & \multicolumn{2}{c}{$T=128$} & \multicolumn{2}{c}{$T=256$} & \multicolumn{2}{c}{$T=512$} \\
+\midrule
+1 Production              & 499.6 &  & 516.5 &  & 1053.5 &  \\
+2 + expert parallel       & 266.9 & {\scriptsize $-$46.6\%} & 569.3 & {\scriptsize $+$10.2\%} & 1157.6 & {\scriptsize $+$9.9\%} \\
+2$'$ + head-group sum     & 250.0 & {\scriptsize $-$6.3\%} & 502.4 & {\scriptsize $-$11.8\%} & 1027.4 & {\scriptsize $-$11.2\%} \\
+3a + tree scans           & 212.4 & {\scriptsize $-$15.1\%} & 431.0 & {\scriptsize $-$14.2\%} & 877.8 & {\scriptsize $-$14.6\%} \\
+3b + dense repairs        & 141.9 & {\scriptsize $-$33.2\%} & 289.9 & {\scriptsize $-$32.7\%} & 570.9 & {\scriptsize $-$35.0\%} \\
+4 + token-owned           & 115.8 & {\scriptsize $-$18.5\%} & 189.9 & {\scriptsize $-$34.5\%} & 350.9 & {\scriptsize $-$38.5\%} \\
+5 + elementwise sum       & 113.2 & {\scriptsize $-$2.2\%} & 184.8 & {\scriptsize $-$2.7\%} & 349.2 & {\scriptsize $-$0.5\%} \\
+6 + rank sort, 2 tiers    & 106.3 & {\scriptsize $-$6.1\%} & 138.0 & {\scriptsize $-$25.3\%} & 269.6 & {\scriptsize $-$22.8\%} \\
+7 + 3 tiers (\sys)        & \textbf{105.3} & {\scriptsize $-$0.9\%} & \textbf{141.5} & {\scriptsize $+$2.5\%} & \textbf{225.3} & {\scriptsize $-$16.4\%} \\
+\midrule
+Aggregation, 3a$\to$5      & \multicolumn{2}{c}{1.88$\times$} & \multicolumn{2}{c}{2.33$\times$} & \multicolumn{2}{c}{2.51$\times$} \\
+Capacities, 5$\to$7        & \multicolumn{2}{c}{1.07$\times$} & \multicolumn{2}{c}{1.31$\times$} & \multicolumn{2}{c}{1.55$\times$} \\
+vs.\ \naive, 2$'\to$7      & \multicolumn{2}{c}{2.37$\times$} & \multicolumn{2}{c}{3.55$\times$} & \multicolumn{2}{c}{4.56$\times$} \\
+vs.\ production, 1$\to$7   & \multicolumn{2}{c}{\textbf{4.74$\times$}} & \multicolumn{2}{c}{\textbf{3.65$\times$}} & \multicolumn{2}{c}{\textbf{4.68$\times$}} \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+Table~\ref{tab:ladder} gives the results (Figure~\ref{fig:ladder} in Appendix~\ref{app:ladder} plots them). \sys prefills
+128-, 256- and 512-token chunks in 105.3, 141.5 and 225.3\,ms, 4.74$\times$, 3.65$\times$ and 4.68$\times$ faster than the production
+compilation and 2.37$\times$, 3.55$\times$ and 4.56$\times$ faster than naive \naive. The attention rewrite (2$\to$2$'$)
+saves 17, 67 and 130\,ms in every head-parallel program alike; it is not an MoE gain. Without it, naive expert parallelism
+is 10\% slower than production at $T=256$ and 512; with it, 2.5--2.7\% faster, and 2.00$\times$ faster at $T=128$, where
+production takes about as long as for 256 tokens. The routing scans (3a)
+give 1.17--1.18$\times$. MoE output aggregation, steps 3b--5, is the largest factor at 1.88$\times$, 2.33$\times$ and
+2.51$\times$, and the ranked capacities add 1.07--1.55$\times$. Only with both does a longer chunk pay: per token, \sys costs
+0.82, 0.55 and 0.44\,ms at $T=128$, 256 and 512, while naive \naive stays at 1.95--2.01\,ms.
+
+\subsection{Capacities and Aggregation Together}
+\label{sec:eval-abl}
+
+\textbf{The interaction.} Figure~\ref{fig:interaction} isolates it: all four programs rank experts at run time, gather
+weights from the same bank and share the final sum and the tile size. The repaired dense combine keeps one zero-filled
+accumulator per tier width, never reads its zeros back, lets a width group's later tiers read, add and scatter back, and
+sums lanes in 16 token tiles. With it, tiers change latency by $+36.9\%$, $+3.9\%$ and $-3.6\%$; with token-owned
+aggregation, by $-8.8\%$, $-13.3\%$ and $-26.9\%$. Token-owned aggregation is 1.27--1.36$\times$ faster than the dense
+combine at capacity $T$, and 1.63--1.90$\times$ with tiers.
+
+\begin{table}[t]
+\caption{Capacity attribution (ms per chunk, each program at its best tile size), and expert rows provisioned per SoC.}
+\label{tab:attr}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ & $T=128$ & $T=256$ & $T=512$ \\
+\midrule
+A static, fixed order, $T$       & 113.8 & 168.7 & 288.0 \\
+B gathered, fixed order, $T$     & 109.1 & 160.0 & 302.3 \\
+C gathered, ranked, $T$          & 115.5 & 163.1 & 308.1 \\
+D ranked, two tiers              & 106.3 & \textbf{138.0} & 269.6 \\
+E \sys, three tiers              & \textbf{105.3} & 141.5 & \textbf{225.3} \\
+\midrule
+C/E, capacities                    & 1.10$\times$ & 1.15$\times$ & 1.37$\times$ \\
+A/E, vs.\ best static            & 1.08$\times$ & 1.19$\times$ & 1.28$\times$ \\
+Rows, A--C/E                     & 4096/1664 & 8192/3072 & 16384/6144 \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+\textbf{Attributing the capacities.} Steps 5--7 change weight access, the assignment of experts to lanes and the
+capacities at once. Table~\ref{tab:attr} separates them with five programs that share the aggregation: (A) a fixed expert
+order at capacity $T$ with static weights; (B) the same order through the bank gathers; (C) the run-time rank at capacity
+$T$; (D) two tiers; (E) \sys. All give bit-identical logits. With ranking and indirection matched, \sys's capacities are
+1.10, 1.15 and 1.37$\times$ faster (C$\to$E), and \sys is 1.08--1.28$\times$ faster than the best static program. Each
+program runs at its best tile size, the granularity at which the compiler skips padded rows (\S\ref{sec:skip},
+Appendix~\ref{app:attrprof}): with 512\,KiB tiles the static program computes a quarter of its rows, while the gathered
+programs spill activations at that size and use 1024\,KiB tiles at $T=512$.
+
+\subsection{What Makes the Aggregation Efficient}
+\label{sec:eval-own}
+
+\begin{table}[t]
+\caption{Aggregation formulations at capacity $T$ with static weights and the same routing: full-model latency relative to
+\sys's aggregation (ladder step 5), cross-SoC MiB per MoE layer at $T=512$ (layer 1 of instrumented two-layer cuts), and
+whether the logits equal step 5's or differ in FP16 summation order.}
+\label{tab:own}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{2.5pt}
+\begin{tabular}{@{}lrrrrl@{}}
+\toprule
+Formulation & 128 & 256 & 512 & MiB & Logits \\
+\midrule
+Step 5: SoC batch axis        & 1.00 & 1.00 & 1.00 & 14 & -- \\
+Local top-$k$, SoC slices     & 3.44 & 4.04 & 4.14 & 1539 & equal \\
+Local top-$k$, global rows    & 4.37 & 5.14 & 5.30 & 1539 & equal \\
+Top-$k$ rows from all SoCs    & 4.05 & 4.70 & 4.92 & 1538 & order \\
+Lane-indexed, lane axis       & 1.12 & 1.11 & 1.15 & 12 & order \\
+Lane-indexed, SoC slices      & 7.02 & 8.22 & 4.31 & 577 & order \\
+Repaired dense combine        & 1.25 & 1.57 & 1.64 & 48 & order \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+Table~\ref{tab:own} compares \sys's aggregation, ladder step 5, with six formulations at the same capacity and routing.
+The two local top-$k$ variants compute exactly its sum in its order and differ only in how the graph expresses device
+ownership; both make the compiler ship expert outputs between SoCs, as does the GPU-style gather of each token's $k$ rows
+from all SoCs (\S\ref{sec:mot-own}). The repaired dense combine keeps locality, but its accumulator grows with $T$:
+replacing the representation (step 4) gives 1.23--1.63$\times$ on top of the 1.49--1.54$\times$ of the repairs (3b).
+
+\textbf{Local reduction.} The lane-indexed formulation keeps device locality, with slightly less cross-SoC traffic than
+step 5 (12 against 14\,MiB), and is still 11--15\% slower. It sums each token tile over a SoC's 16 lanes, which sit on 16
+cores: in the profile this sum moves 242\,MiB between cores per layer and keeps them busy for 47\,core-ms, against 1.9\,MiB
+and 2.4\,core-ms for step 5's sum over each token's $k$ rows on one core, and its 16 tiles run largely one after another.
+The window from the last expert GEMM to the end of the final sum grows from 1.2--1.7 to 3.1--3.7\,ms per SoC
+(Appendix~\ref{app:phases}); the uninstrumented full models differ by 1.1\,ms per layer, so these windows locate the
+difference rather than decompose it along a dependency chain.
+
+\subsection{Tier Structure}
+\label{sec:eval-pad}
+
+Each tier is a stage with a cost of its own. In a full-model profile of \sys at $T=512$ (before the attention fix), the
+8$\times$128 and 16$\times$64 tiers span 0.59 and 0.52\,ms per layer while their GEMMs keep the busiest core busy for
+0.08--0.09\,ms: they wait on their experts' weights, and each tier starts after a gap of 0.28--0.48\,ms. The first tier
+splits because it is bound by the SoC's memory traffic: 16 lanes at capacity 512 take 2.2\,ms, eight at 512 and eight at 128
+take 0.8--1.0 and 0.65--0.72\,ms (Appendix~\ref{app:stages}). Three tiers save 28--33\% of the rows of two, and their worth
+depends on the chunk: 1.20$\times$ at $T=512$, 1.01$\times$ at 128 and 0.975$\times$ at 256 (Table~\ref{tab:attr}), where a
+session before the attention fix had found them 3.6\% faster; four tiers lost to three on two-layer cuts
+(Appendix~\ref{app:neg}). Rows do not predict the best structure, and the deployed one is not the best at every chunk length;
+selecting it from measured stage costs remains open.
+
+% tab:transfer belongs to sections/transfer.tex, but a table* is set no earlier than the next page, so it is defined
+% here to land on the page where that section starts.
+\begin{table*}[t]
+\caption{What transfers: for each part of \sys, the reasoning we expect to hold on other statically partitioned targets,
+the conditions under which it pays, and the Cloud AI 100 compiler behavior that shaped our realization of it.}
+\label{tab:transfer}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.12\textwidth}>{\raggedright\arraybackslash}p{0.34\textwidth}>{\raggedright\arraybackslash}p{0.22\textwidth}>{\raggedright\arraybackslash}p{0.26\textwidth}@{}}
+\toprule
+Part & Transferable reasoning & Pays when & Shaped here by the compiler \\
+\midrule
+Rank-bound capacities & a lane serves a load rank within a device's experts; the $r$-th largest of $n$ assignments is at
+most $n/r$; per-rank maxima were stable across workloads, identities were not & expert work is fixed before routing;
+padded rows cost time; many experts per device & no control flow, so a sort and gathers; one gathered constant, replicated;
+tile size per chunk length \\
+Tier structure & first tier at $T$, lower tiers at $h$ times the calibrated maximum of their first rank; rows traded against
+measured per-stage cost; overflows show in the counts and a rerun recovers them exactly & a stage's fixed cost is small
+against the rows it removes & widths must divide 16 and stages run in sequence \\
+Ownership-preserving aggregation & designed with the capacities; device ownership stated in a form the compiler keeps;
+each token's rows summed on the core that owns it; one elementwise cross-device sum; cost grows with $kT$ per tier & the
+baseline combine is dense in lanes; capacities change the outputs' shapes & index values and slices lost locality, the
+SoC batch axis kept it; gather without zero fill \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table*}
+
+\subsection{Fixed-Size Blocks Instead of Ranked Lanes}
+\label{sec:eval-blocks}
+
+Block scheduling packs assignments into blocks of $B$ rows, one expert per block, with $\lceil kT/B\rceil+E-1$ blocks to
+drop nothing \citep{awsneuronmoe}. Built from \sys's own components and measured on two-layer cuts before the attention fix
+(Appendix~\ref{app:blocks}), the best calibrated block program is 1.26, 1.39 and
+1.69$\times$ slower than \sys at $T=512$, 256 and 128, the best dropless one 1.51--1.71$\times$, and even a
+trace-specialized diagnostic 1.12--1.31$\times$. Blocks lose on weight traffic: every block slot streams its expert's MXFP6
+weights, used or not, 337.5\,MiB per SoC and layer for 64-row dropless blocks against 95--106\,MiB for \sys, and one weight
+load cannot serve consecutive blocks of an expert in this compiler.
+
+\subsection{Beyond the First Chunk, and Overflow}
+\label{sec:eval-chunks}
+
+The programs keep the cache for $2T$ positions. A second chunk attends to the cache the first wrote: \sys and the static
+capacity-$T$ program give bit-identical logits for both chunks at all three lengths, and the second chunk costs what the
+first does. To test the recovery of \S\ref{sec:overflow}, we forced an undersized capacity profile on the second of four
+128-token chunks: the counts flagged 45 (layer, lane) pairs, the rejected logits were 0.04 relative $L_2$ off, and after
+the rerun all four chunks were bit-identical to runs without overflow, as after an overflow in the first chunk. Capacity
+inputs and extra profiles make the tiered program 18\% slower, so a resident capacity-$T$ program may be the cheaper
+fallback, at the cost of re-prefilling earlier chunks, which we did not time. These tests predate the attention fix.
+
+\subsection{Do Calibrated Capacities Generalize?}
+\label{sec:eval-gen}
+
+We split each of eight workloads into calibration and evaluation documents before cutting chunks, and measured the routing
+of every chunk on the device. \sys's capacities overflowed in none of the 805, 618 and 449 evaluation chunks at $T=128$, 256
+and 512 and in no workload (30 chunks hold documents the deployed capacities were calibrated on), nor did
+leave-one-workload-out calibration; without headroom, the rule gives a 112-row middle tier at $T=512$, which overflows in 2
+of 449 chunks. The same tiers bound to a fixed expert order need capacity $T$ everywhere; calibrated per workload, they need
+1.4--2.7$\times$ the rows and still overflow in up to 30\% of chunks, while ranks 1, 9 and 17 never exceeded 509, 119 and 52
+tokens. The bound $n_{(r)}\le N/r$ holds with room (at most 0.97 of it).
+
+\subsection{Accuracy}
+\label{sec:eval-acc}
+
+Every program stays at the error level of the MXFP6 weights: the relative $L_2$ error of the last-position logits against
+FP32 is 0.188, 0.091 and 0.096 for \sys at $T=128$, 256 and 512, against 0.188, 0.089 and 0.095 for production
+(Appendix~\ref{app:acc}). The programs differ from production only in FP16 summation order, in attention's group sum and in
+the order of a token's expert rows; A--E are bit-identical to each other. The next token of \sys and of production
+matches FP32 except in the 256-token chunk, whose two leading FP32 logits are 0.58 apart. No lane exceeded its capacity.
+
+\subsection{A Fused Kernel in the Same Layout}
+\label{sec:eval-kernel}
+
+TokenCombine, a C++ custom operator with HVX vector intrinsics, replaces step 5's gather, mask and sum over the same
+$[4,16C,d]$ layout (Appendix~\ref{app:custom}); its tiles follow the SoC axis over all 64 cores, and cross-SoC traffic stays
+at step 5's 14\,MiB. At $T=512$ it runs at 0.940$\times$ of step 5
+in the fit (323.3--324.7 against 341.9--343.8\,ms in one alternating session). Its logits differ deterministically from step
+5's by 1.7\% relative $L_2$, because it sums in FP32 in another order, and it takes 650--656 minutes to compile. The layout
+thus also supports a fused implementation, with a modest gain at the one chunk length we tested.
+
+\subsection{Limitations}
+\label{sec:limits}
+
+The lower tiers are calibrated, not dropless: no evaluation chunk overflowed, but the deployed rate depends on model and
+workload. We evaluate one model, at batch 1 and in prefill only (our rewrites fix $T$), and blocks under this compiler
+only. The tier structure was chosen by comparison, not by a validated method,
+and the ownership results concern this compiler's partitioner. The SoCs share a 150\,W limit under which most padded
+programs throttle at times (\sys never does), so we compare programs through the anchored fit rather than across sessions.

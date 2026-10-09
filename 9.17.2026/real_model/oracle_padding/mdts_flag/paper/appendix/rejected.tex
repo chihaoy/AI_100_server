@@ -1,0 +1,37 @@
+% !TEX root = ../main.tex
+\section{Rejected Alternatives}
+\label{app:neg}
+\label{sec:eval-neg}
+
+Table~\ref{tab:neg} lists the alternatives we rejected. Splitting a loaded expert over two
+lanes halves the first tier's GEMM time in isolation, but the compiler keeps the 16 lanes on eight cores per SoC and
+dequantizes each expert twice, so the program gets 6\% slower. Co-locating experts that fire together cuts the SoCs a
+token touches from 3.63 to 2.42, but it doubles the order statistics the lower tiers must cover (at $T=512$ from 50 to 85
+rows at rank 17) and targets an exchange that is only 3\% of the model.
+
+
+\begin{table}[H]
+\caption{Alternatives we built or analyzed and rejected ($T=512$ unless noted).}
+\label{tab:neg}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}>{\raggedright\arraybackslash}p{0.33\columnwidth}>{\raggedright\arraybackslash}p{0.25\columnwidth}>{\raggedright\arraybackslash}p{0.36\columnwidth}@{}}
+\toprule
+Alternative & Result & Reason \\
+\midrule
+Sort first, then route on permuted columns & $+$2.5 vs.\ $+$1.6\,ms (12 layers, $T{=}128$) & all routing waits for the sort \\
+Row-chunked expert GEMMs & $+$25\%, $+$66\% (one layer) & each chunk re-streams and re-dequantizes the weights \\
+One partition per SoC & 1.7$\times$ slower & the runtime runs partitions in sequence \\
+Per-layer first-tier capacity & $-$10--15\% of its rows & held-out chunks overflow in 1--5 layers \\
+Co-locate experts that fire together & 3.63$\to$2.42 SoCs per token & doubles lower-tier loads; the exchange is 3\% \\
+Split first-tier experts over two lanes & $+$6\% (two layers) & 16 lanes stay on 8 cores; 1.8$\times$ dequantization \\
+Four tiers & $-$8.6\% vs.\ $-$14.1\% & one more sequential window \\
+No depth-first scheduling & $+$1--2\% & stages still run in sequence \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}

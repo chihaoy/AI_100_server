@@ -1,0 +1,10 @@
+% !TEX root = ../main.tex
+\section{Conclusion}
+\label{sec:conclusion}
+
+Ahead-of-time compilation fixes, before routing is known, how many rows each expert computes and how its outputs return
+to their tokens. \sys adapts the first through data, binding compiled capacity tiers to per-device load ranks, and keeps the
+second efficient with an aggregation graph that preserves device ownership and token-local reduction. The two must be
+designed together: ranked tiers cut the latency of 512-token chunks by 27\% with this aggregation but by 4\% with a
+repaired dense combine. On four Cloud AI 100 SoCs, \sys prefills Qwen3-30B-A3B 3.65--4.74$\times$ faster than the production
+compilation. Selecting the tier structure from measured stage costs, and other models and compilers, come next.

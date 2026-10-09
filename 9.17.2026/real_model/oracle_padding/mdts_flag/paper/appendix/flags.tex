@@ -1,0 +1,43 @@
+% !TEX root = ../main.tex
+\section{Compilation Flags and Program Sizes}
+\label{app:flags}
+
+All programs are compiled with the command below, with a four-SoC partition configuration and one shape specialization
+per chunk length (sequence length $T$, context $2T$). Every program but production (step 1) adds \texttt{-mdts-mos=1}.
+Steps 6--7 set the maximum tile size (\texttt{-size-split-granularity}), 512\,KiB for $T\le256$ and 1024\,KiB for $T=512$;
+the attribution programs use their own best size (Table~\ref{tab:attr}). The TokenCombine program registers the operator's
+configuration with \texttt{-register-custom-op}.
+{\footnotesize
+\begin{verbatim}
+qaic-compile -aic-hw -aic-hw-version=ai100
+  -retained-state -convert-to-fp16
+  -mxfp6-matmul -aic-num-cores=16 -mos=1
+  -aic-enable-depth-first
+  -mdp-load-partition-config=<4 SoCs>
+  -network-specialization-config=<T, 2T>
+  [-mdts-mos=1]               # steps 2-7
+  [-size-split-granularity=512|1024]
+  [-register-custom-op=<yaml>]
+\end{verbatim}}
+\noindent Table~\ref{tab:sizes} lists the program sizes.
+
+\begin{table}[H]
+\caption{Program file, device memory per SoC and full-model compile time.}
+\label{tab:sizes}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Programs & File & Memory/SoC & Compile \\
+ & (GiB) & (GiB) & (min) \\
+\midrule
+Static weights (1--5, A)  & 25 & 6.6--7.1 & 7--26 \\
+Gathered weights (6--7)   & 88 & 22.4--22.5 & 9--20 \\
+TokenCombine ($T=512$)    & 25 & -- & 650--656 \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\end{table}

@@ -1,0 +1,29 @@
+% !TEX root = ../main.tex
+\section{Accuracy per Program}
+\label{app:acc}
+
+\begin{table}[H]
+\caption{Relative $L_2$ error of the last-position logits against FP32, and the next token (\checkmark: matches FP32).
+Programs in one row give identical logits.}
+\label{tab:acc}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}lccc@{}}
+\toprule
+Program & $T=128$ & $T=256$ & $T=512$ \\
+\midrule
+1 Production                         & 0.188 \checkmark & 0.089 $\times$ & 0.095 \checkmark \\
+2 Naive \naive                       & 0.172 \checkmark & 0.077 \checkmark & 0.094 \checkmark \\
+2$'$--3b Head sum, rewrites         & 0.199 \checkmark & 0.072 \checkmark & 0.087 \checkmark \\
+4 Token-owned                        & 0.156 \checkmark & 0.082 $\times$ & 0.089 \checkmark \\
+5 Elementwise sum                    & 0.163 \checkmark & 0.087 $\times$ & 0.092 \checkmark \\
+6--7, A--E Rank sort, \sys           & 0.188 \checkmark & 0.091 $\times$ & 0.096 \checkmark \\
+TokenCombine                         & -- & -- & 0.095 \checkmark \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\vskip -0.15in
+\end{table}

@@ -1,0 +1,43 @@
+% !TEX root = ../main.tex
+\section{Aggregation Phases: Lane-Indexed against Step 5}
+\label{app:phases}
+
+\begin{table}[H]
+\caption{Aggregation of layer 1 of instrumented two-layer cuts at $T=512$ (one sample), by phase: operations, busy
+core-ms summed over the 64 cores, and MiB multicast between cores. Last row: from the last expert GEMM to the end of the
+final sum, per SoC.}
+\label{tab:phases}
+\vskip 0.1in
+\begin{center}
+\begin{footnotesize}
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+ & \multicolumn{3}{c}{Step 5} & \multicolumn{3}{c}{Lane-indexed} \\
+Phase & ops & core-ms & MiB & ops & core-ms & MiB \\
+\midrule
+Index build            & 6913 & 27.5 & 0.5 & 1040 & 3.3 & 0.4 \\
+Gather                 & 762  & 66.7 & 0   & 4430 & 15.0 & 0 \\
+Mask multiply          & 128  & 1.4  & 0   & 3072 & 4.6 & 0 \\
+Stage add              & 64   & 0.7  & 0   & 1024 & 1.6 & 0 \\
+Sum to partials        & 304 & 2.4  & 1.9 & 2288 & 47.1 & 241.9 \\
+Final sum              & 1248 & 0.7  & 1.9 & 1250 & 0.9 & 1.9 \\
+\midrule
+After last GEMM        & \multicolumn{3}{c}{1.22--1.69\,ms} & \multicolumn{3}{c}{3.10--3.68\,ms} \\
+\bottomrule
+\end{tabular}
+\end{footnotesize}
+\end{center}
+\vskip -0.15in
+\end{table}
+
+Table~\ref{tab:phases} classifies the aggregation's operations by phase. Both formulations gather about the same bytes
+(898 and 924\,MiB) and keep them on their SoC: cross-SoC traffic in the MoE layer is 14.0 and 12.1\,MiB. They differ in
+the sum to the per-SoC partials. The lane-indexed formulation sums each token tile over a SoC's 16 lanes, which sit on 16
+different cores, so every tile's sum pulls its operands from all cores; its 16 tiles span 3.0--3.6\,ms per SoC, and their
+windows add up to 4.6--5.6\,ms with only 1.7--2.0\,ms of overlap. Step 5 sums each token's $k$ rows on the core that owns
+the token. Its index build is heavier, but it runs while the expert stages do. In the profile, the window from the last
+expert GEMM to the end of the final sum is about 1.9\,ms longer per layer for the lane-indexed formulation; the
+uninstrumented full models differ by 1.1\,ms per layer (401.7 against 349.2\,ms over 48 layers), so the instrumentation
+overstates the gap. The profiles' critical-path tables hold no usable rows, so these windows locate the difference
+without decomposing it along a dependency chain.

@@ -1,0 +1,164 @@
+% !TEX root = ../main.tex
+\section{\sys}
+\label{sec:design}
+
+Section~\ref{sec:mot} leads to three requirements. First, capacity must follow each chunk's load without control flow:
+the program must choose at run time which expert a lane serves, and bind capacities to a quantity that is stable across
+chunks. Second, aggregation must stay efficient whatever shapes the capacities take: keep each device's expert rows on that
+device, sum each token's rows on one core, and cost in proportion to the routed rows, not to lanes$\,\times\,T$. Third, both
+must be static graphs of operations that ahead-of-time targets provide: reductions, a sort, gathers with run-time indices
+and one cross-device sum. This section states the method independent of the accelerator; \S\ref{sec:impl} summarizes how
+the Cloud AI 100 compiler shaped its realization.
+
+\begin{figure*}[t]
+\centering
+\input{figures/overview.tex}
+\vskip -0.05in
+\caption{One MoE layer under \sys. (1) Each SoC counts the tokens routed to its 32 experts and sorts them (bars: SoC~2 in
+layer 20 of the held-out 512-token chunk; colors mark the tiers). (2) Three tiers of lanes with compile-time capacities
+($C_2=128$, $C_3=64$ at $T=512$) serve the experts by rank; their weights are gathered from a bank of all 128 experts
+through the rank permutation $\pi_c$. The filled area is the padded work, against the dashed capacity-$T$ layout.
+(3) Each core gathers and sums the rows of its own tokens. (4) One elementwise sum over SoCs completes the layer.}
+\label{fig:overview}
+\vskip -0.1in
+\end{figure*}
+
+\subsection{A Static Model of an MoE Layer}
+\label{sec:model}
+
+A device $c$ owns a fixed set $\mathcal{E}_c$ of experts, 32 of the 128 on each SoC here. A static program computes them in
+\emph{lanes}: a lane is one expert's three GEMMs over $C$ token rows gathered through a token table, and lanes of equal
+capacity that run together form a stage. The boundary between compile time and run time is
+sharp. Fixed at compile time: the number of tiers, their lanes and capacities, the shapes of every tensor, the weight bank
+and the expert-to-device placement. Decided by data at run time: which expert each lane serves, which tokens fill its
+rows, which weights it gathers, and which rows each token's aggregation reads. A chunk routes $n_e$
+of its $kT$ assignments to expert $e$ and $N_c=\sum_{e\in\mathcal{E}_c}n_e$ to device $c$, and a lane that serves $e$ drops
+tokens unless $n_e\le C$. A lane's cost has a weight part, its expert's matrices streamed from memory, and a row part
+that grows with the rows it computes: all $C$ of them without control flow, or $R\lceil n_e/R\rceil$ on a target that
+predicates row tiles of $R$ rows (\S\ref{sec:skip}). Either way the capacity, fixed before the routing is known, bounds a
+lane's work.
+
+\subsection{Rank-Bound Capacities}
+\label{sec:sort}\label{sec:tiers}
+
+After the router, each device counts its experts' tokens and sorts the counts, which gives a permutation $\pi_c$ from rank
+to expert with $n_{\pi_c(1)}\ge n_{\pi_c(2)}\ge\dots$. The device's lanes form tiers: tier $i$ is a stage of $L_i$ lanes
+at capacity $C_i$ that covers ranks $a_i,\dots,a_i+L_i-1$, with $\sum_iL_i=|\mathcal{E}_c|$, and lane $j$ of tier $i$
+serves expert $\pi_c(a_i+j)$. The lane gathers that expert's weights through $\pi_c$ and its token table from tables
+that the routing computes for all experts in their fixed order (Figure~\ref{fig:overview}). Every expert keeps exactly one
+lane, so a tiering changes only the padding: the same experts compute the same tokens, and as long as every expert fits
+its lane, the output equals that of any other tiering, capacity $T$ everywhere included (bit-identical in our
+implementation). A device provisions $\sum_iL_iC_i$ rows per layer against $|\mathcal{E}_c|\,T$.
+
+\textbf{Why ranks.} The order statistics of per-device load are bounded for a structural reason. The $r$ most loaded
+experts of device $c$ each hold at least $n_{\pi_c(r)}$ assignments, and together at most $N_c$, so
+\begin{equation}
+n_{\pi_c(r)}\;\le\;N_c/r,\qquad N_c\;\le\;\min(k,|\mathcal{E}_c|)\,T .
+\label{eq:bound}
+\end{equation}
+$N_c$ sums over all of the device's experts, $kT|\mathcal{E}_c|/E=2T$ on average here and at most 1.9$\times$ that in our
+256- and 512-token captures, so every rank beyond the first few is bounded well below $T$ whatever the workload. A capacity
+attached to an expert must instead cover the worst case of that one expert, which approaches $T$ because routing is
+skewed and which experts are hot changes with the workload (\S\ref{sec:mot-pad}). Eq.~(\ref{eq:bound}) holds for any
+routing; that the per-rank maxima are also stable across workloads, while expert identities are not, is a property of the
+model, which we measured on held-out documents of eight workloads (Figure~\ref{fig:rank}, \S\ref{sec:eval-gen}).
+
+\subsection{Calibrating the Tiers}
+\label{sec:calib}
+
+\textbf{Capacities.} The first tier has capacity $T$, since rank 1 can receive every token. For $i>1$, $C_i$ is the largest
+load observed at rank $a_i$, the tier's first rank, over calibration chunks, times a headroom $h$, rounded up to the
+target's row granularity $g$ and capped at $T$; since ranks are sorted, rank $a_i$ bounds the whole tier. We calibrate
+with $h=1.28$ and $g=16$ on routing captures of the eight workloads: the 128-token prompts of \S\ref{sec:mot-pad}, 56
+chunks of 256 tokens and 20 of 512.
+
+\textbf{Structure.} The number and widths of the tiers trade padded rows against per-stage cost. Rows alone favor many
+tiers: under our calibration at $T=256$ and 512, three tiers need 65--67\% of the rows of a two-tier split at $T$ and $T/8$, four 52--58\% and
+five 48--56\%. But each tier is a stage with a cost of its own, a weight pipeline and one aggregation gather, and a target
+may restrict the widths a stage can take. We fix the structure by measurement, not by a model: on Cloud AI 100, where
+widths must divide 16 and stages run one after another (\S\ref{sec:impl}), we compared two, three and four tiers and
+deploy three tiers of 8, 8 and 16 lanes per SoC at every chunk length, with capacities $T$, $C_2$ and $C_3$ of 128/48/16,
+256/64/32 and 512/128/64 for $T=128$, 256 and 512: 12--13$T$ rows per SoC against $18T$ for two
+tiers and $32T$ for capacity-$T$ padding. This structure is not optimal everywhere: at $T=256$ two tiers are 2.5\% faster
+in the full model, although three save a third of the rows (\S\ref{sec:eval-pad}). Choosing the structure per chunk
+length from measured stage costs remains open.
+
+\subsection{Overflow Detection and Recovery}
+\label{sec:overflow}
+
+The lower tiers are calibrated, not dropless, so a deployment must detect overflow and recover from it exactly. Detection
+is free: the program already computes every lane's token count, and the host compares it with the lane's capacity after
+each chunk. Recovery reruns the chunk on a capacity-$T$ variant at the same positions. Prefill writes the KV cache only at
+the chunk's own positions, so the rerun overwrites every entry the failed attempt wrote, later chunks see only the rerun's
+cache, and the result is that of an overflow-free run. The variant can be a second profile of the same program, since
+tier capacities read from the lengths of small row inputs let the compiler specialize one program per profile over the
+same weights and cache, or a second program kept resident, which must first rebuild the cache from the earlier chunks.
+With overflow probability $p$ a chunk costs $t_{\mathrm{tier}}+p\,t_T$ on
+average, so the tiered program's own latency matters most (\S\ref{sec:eval-chunks}).
+
+\subsection{Ownership-Preserving Token Aggregation}
+\label{sec:red}
+
+After the expert GEMMs, each token's $k$ weighted expert rows must be summed. Device $c$ computes the experts
+$\mathcal{E}_c$, and the result is
+\begin{equation}
+P_c[t]=\sum_{j:\,e_{t,j}\in\mathcal{E}_c} O_c[\mathrm{row}(t,j)],\qquad y[t]=\sum_c P_c[t],
+\label{eq:agg}
+\end{equation}
+where $O_c$ holds device $c$'s weighted expert outputs and $\mathrm{row}(t,j)$ addresses the output of token $t$'s $j$-th
+expert. The arithmetic is the standard local top-$k$ reduction; what \sys contributes is a graph form that a compiler executes
+locally and in parallel, independent of the tiers' shapes (Algorithm~\ref{alg:combine}). It makes three choices.
+
+\textbf{Ownership as layout.} A stage or tier computes its $L$ lanes as one output of shape $[L,C,d]$, whose lane axis the
+compiler already partitions across the $D$ devices, $L/D$ lanes each. \sys reshapes it, without moving data, to
+$[D,(L/D)\,C,d]$, which makes the device the leading batch axis of one batched gather with per-device row indices of shape
+$[D,Tk]$: for token $t$'s $j$-th expert $e$, the index on its own device is $l\,C+\mathrm{slot}(e,t)$, with $l$ the expert's
+lane on that device, and every other device gets a safe index and a zero mask. Global row indices into the flattened
+outputs, or explicit per-device slices, address the same rows, but with them the compiler we use moved expert outputs
+between devices (\S\ref{sec:mot-own}).
+
+\textbf{Token-local reduction.} The gathered rows, $[D,Tk,d]$, are summed over $k$ into the partials $[D,T,d]$. The
+compiler splits this sum by token tiles, so each core gathers and adds the at most $k$ rows of its own tokens, with no
+cross-core reduction. A lane-indexed formulation, which gathers every lane's row for each token and sums over lanes, keeps
+device locality but pulls each reduction's operands from all cores (\S\ref{sec:eval-own}).
+
+\textbf{Elementwise cross-device sum.} The partials are summed as $(P_0+P_1)+(P_2+P_3)$ per token tile, which the compiler
+lowers as a reduce-scatter with no root device; the next layer's input normalization completes it.
+
+The indices need nothing beyond the routing. The router's top-$k$ output lists each token's experts; integer arithmetic on
+the placement and small per-tier tables map an expert to its (tier, device, lane), and the per-expert slot tables that
+the routing computes anyway give its row.
+
+\begin{algorithm}[t]
+\caption{Ownership-preserving token aggregation for one tier $s$ ($D$ devices)}
+\label{alg:combine}
+\begin{algorithmic}[1]
+\REQUIRE top-$k$ experts $\mathcal{K}[t,1..k]$ of each token $t$; map $\ell(e)\mapsto(s,c,l)$ (tier, device, lane); slot table
+  $\mathrm{slot}[e,t]$; tier outputs $O_s$ of shape $[L_s,C_s,d]$, lanes partitioned over devices
+\STATE $\hat O_s\leftarrow\mathrm{reshape}(O_s,[D,(L_s/D)\,C_s,d])$ \COMMENT{no data movement}
+\FOR{all $t\le T$, $j\le k$, devices $c$ \textbf{in parallel}}
+  \STATE $e\leftarrow\mathcal{K}[t,j]$;\; $(s',c',l)\leftarrow\ell(e)$
+  \STATE $m[c,t,j]\leftarrow[s'=s\wedge c'=c]$;\; $\mathit{idx}[c,t,j]\leftarrow m\,?\,l\,C_s+\mathrm{slot}[e,t]:0$
+\ENDFOR
+\STATE $G\leftarrow\mathrm{gather}(\hat O_s,\mathit{idx})\odot m$ \COMMENT{batched over devices: $[D,Tk,d]$}
+\STATE $P_s\leftarrow\sum_j G[\cdot,\cdot,j]$ \COMMENT{per token, on its core: $[D,T,d]$}
+\STATE \textbf{after all tiers:} $P\leftarrow\sum_s P_s$;\; $y\leftarrow(P_0+P_1)+(P_2+P_3)$ \COMMENT{elementwise}
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Cost.} Per device and tier the gather produces $Tk$ rows of $d$ elements, masked slots included, against $L\,T$
+rows of a lane-dense accumulator, and a tier adds one such gather whatever its width and capacity; the cross-device traffic
+is one $[T,d]$ partial per device. A lane-dense combine instead needs one accumulator per tier width, which grows with $T$
+and absorbs the rows the tiers save (Figure~\ref{fig:interaction}).
+
+\subsection{Capacities and Tile-Granular Skipping}
+\label{sec:skip}
+
+A compiler may already skip padded work at run time without control flow. Cloud AI 100 lowers the export's mask of empty
+slots, $\mathrm{Where}(r<n_e,\,y,\,0)$, into a predicate per row tile of a lane: the tile's gather, GEMMs and SiLU run only
+if it holds a routed token, so a lane computes $R\lceil n_e/R\rceil$ rows for tiles of $R$ rows, and an empty expert's
+weights are skipped only when its lane is a single tile (Appendix~\ref{app:attrprof}). The tile follows the compiler's
+maximum tile size. Such skipping is coarse and does not shrink what a capacity provisions: token tables, buffers and the
+weight reads of multi-tile lanes stay at capacity. Rank-bound capacities compose with it: they set the lane size, and with
+it the tile, per rank, so the low ranks get single-tile lanes that skip empty experts entirely. Every program therefore
+runs at its own best tile size (\S\ref{sec:eval-abl}).

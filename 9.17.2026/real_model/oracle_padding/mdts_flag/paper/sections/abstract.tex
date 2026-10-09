@@ -1,0 +1,17 @@
+% !TEX root = ../main.tex
+\begin{abstract}
+Mixture-of-experts (MoE) models route each token to a few experts chosen at run time, so the work each expert receives
+changes from input to input and from layer to layer. Server inference accelerators such as Qualcomm Cloud AI 100 run
+programs compiled ahead of time, with shapes, partitions and schedules fixed before the first request. Uniform expert
+capacities accept any routing but execute padded work, and capacities fitted to observed loads fail when the busy experts
+change. We present \sys, which adapts expert work inside a static multi-device program while keeping the aggregation of
+expert outputs efficient. Each device ranks its experts by load at run time and binds compiled capacity tiers to load
+ranks, whose order statistics are bounded and stable across workloads. Expert outputs return to their tokens through a
+layout that keeps each device's rows on that device and each token's sum on one core. The two parts must be designed
+together. On Qwen3-30B-A3B across the four SoCs of a Cloud AI 100 Ultra card, ranked tiers cut full-model prefill latency
+at 512-token chunks by 27\% with \sys's aggregation but by only 4\% with a repaired dense combine, and aggregation graphs
+that compute bit-identical results but express device ownership through index values or slices run 3.4--5.3$\times$
+slower. \sys prefills 128-, 256- and 512-token chunks 4.74$\times$, 3.65$\times$ and 4.68$\times$ faster than the production compilation
+and 2.37$\times$, 3.55$\times$ and 4.56$\times$ faster than an expert-parallel program with the exported combine. Its
+calibrated capacities overflowed in none of 1872 evaluation chunks, and a forced overflow is recovered bit-exactly.
+\end{abstract}

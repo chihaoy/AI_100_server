@@ -3,10 +3,13 @@
 
 fig_rank_identity.pdf  rows a card must reserve at each position of its 32 experts: fixed expert order vs run-time rank
                        (routing captures under realcase/routing*, T=128 and T=512)
-fig_ladder.pdf         the E36 ladder, latency of each program relative to the production compile (full_model/e36/e36_ladder.json)
+fig_ladder.pdf         the ladder from the joint fit of E46-E55 (paper/paper_numbers.json from scripts/paper_numbers.py), relative to production
+fig_interaction.pdf    capacity x aggregation: E50's 2x2 at T = 128, 256, 512 (paper_numbers.json)
+fig_ownership.pdf      equivalent arithmetic, different placement: E52's ownership representations against step 5 (latency from paper_numbers.json,
+                       cross-SoC bytes per MoE layer from the instrumented two-layer profiles full_model/e48|e52/e4*_T512_profiles.txt)
 fig_stages.pdf         GEMM window of each expert stage in execution order, two-layer T=512 profiles (README 3.30, E34)
 """
-import sys, os, glob, json
+import sys, os, re, glob, json
 import numpy as np
 import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -72,28 +75,80 @@ fig.legend(h, l, loc='upper center', ncol=2, frameon=False, bbox_to_anchor=(0.53
 fig.subplots_adjust(wspace=0.32)
 fig.savefig(f'{OUT}/fig_rank_identity.pdf'); plt.close(fig)
 
-# ---- the E36 ladder
-lad = json.load(open(f'{R}/full_model/e36/e36_ladder.json'))
-steps = list(lad['128'])
-labels = ['Production compile', '+ expert/head-parallel\n   (naive $T/T$)', '+ dense-path rewrites', '+ token-owned combine',
-          '+ elementwise final sum', '+ run-time rank sort', '+ tiered capacities\n   (RankTier)']
-fig, ax = plt.subplots(figsize=(3.3, 2.75))
+# ---- the ladder, from the joint fit
+NUM = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'paper_numbers.json')))
+steps = ['prod', 's2', 's2os', 's3sos', 's3os', 's4os', 's5os', 'Dos', 'Eos']
+labels = ['Production compile', '+ expert/head-parallel (naive $T/T$)', '+ elementwise head-group sum', '+ tree prefix scans',
+          '+ dense-combine repairs', '+ token-owned aggregation', '+ elementwise final sum', '+ rank sort, two tiers', '+ three tiers (RankTier)']
 Ts, cols, hgt = ('128', '256', '512'), ('#a9c8ea', '#4f8fd1', '#1f3f7a'), 0.26
+HAVE_PROD = all('prod' in NUM[T]['fit'] for T in Ts)
+if not HAVE_PROD: print('fig_ladder.pdf skipped: production (E55) is not in paper_numbers.json yet')
+fig, ax = plt.subplots(figsize=(3.3, 2.9))
 y = np.arange(len(steps))[::-1]
-for j, T in enumerate(Ts):
-    v = np.array([lad[T][s] for s in steps]) / lad[T][steps[0]]
+for j, T in enumerate(Ts if HAVE_PROD else ()):
+    fit = NUM[T]['fit']; base = fit[steps[0]]
+    v = np.array([fit[s] for s in steps]) / base
     ax.barh(y + (1 - j) * hgt, v, height=hgt, color=cols[j], label=f'$T={T}$', zorder=3)
     for yi, vi, s in zip(y, v, steps):
-        ms = lad[T][s]; lab = f'{ms:.0f} ms' + (f', {lad[T][steps[0]] / ms:.2f}$\\times$' if s == steps[-1] else '')
-        ax.text(vi + 0.012, yi + (1 - j) * hgt, lab, va='center', ha='left', fontsize=5.4, color='#333333')
+        lab = f'{fit[s]:.0f} ms' + (f', {base / fit[s]:.2f}$\\times$' if s == steps[-1] else '')
+        ax.text(vi + 0.012, yi + (1 - j) * hgt, lab, va='center', ha='left', fontsize=5.0, color='#333333')
 ax.axvline(1.0, color=GREY, lw=0.6, ls=':', zorder=2)
-ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=6.6)
-ax.set_xlim(0, 1.32); ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0, 1.25])
+ax.set_yticks(y); ax.set_yticklabels(labels, fontsize=6.2)
+ax.set_xlim(0, 1.36); ax.set_xticks([0, 0.25, 0.5, 0.75, 1.0, 1.25])
 ax.set_xlabel('prefill latency relative to the production compile', labelpad=1)
-for s in ('top', 'right'): ax.spines[s].set_visible(False)
+for s_ in ('top', 'right'): ax.spines[s_].set_visible(False)
 ax.tick_params(axis='y', length=0, pad=2); ax.tick_params(axis='x', length=2, pad=1.5)
 ax.legend(loc='lower right', frameon=False, ncol=1, handlelength=1.2, borderaxespad=0.2)
-fig.savefig(f'{OUT}/fig_ladder.pdf'); plt.close(fig)
+if HAVE_PROD: fig.savefig(f'{OUT}/fig_ladder.pdf')
+plt.close(fig)
+
+# ---- capacity x aggregation (E50)
+DENSE, OWNED = '#9e9e9e', '#1f5aa6'
+fig, axes = plt.subplots(1, 3, figsize=(3.4, 1.45), sharey=False)
+for ax, T in zip(axes, Ts):
+    t = NUM[T]['twobytwo']; vals = [t['dense_uniform'], t['dense_tiers'], t['owned_uniform'], t['owned_tiers']]
+    xs = [0, 0.9, 2.2, 3.1]; colors = [DENSE, DENSE, OWNED, OWNED]
+    bars = ax.bar(xs, vals, width=0.8, color=colors, zorder=3)
+    for b in (bars[1], bars[3]): b.set_hatch('////'); b.set_edgecolor('white'); b.set_linewidth(0)
+    for x0, (a, b) in ((0.45, (vals[0], vals[1])), (2.65, (vals[2], vals[3]))):
+        ch = 100 * (b / a - 1); ax.text(x0, max(a, b) * 1.03, f'{ch:+.0f}%'.replace('-', '\u2212'), ha='center', va='bottom', fontsize=6.0,
+                                       color=RED if ch > 0 else BLUE)
+    ax.set_xticks([0.45, 2.65]); ax.set_xticklabels(['dense\n(repaired)', 'token-\nowned'], fontsize=6.0)
+    ax.set_ylim(0, max(vals) * 1.22); ax.set_title(f'$T={T}$', pad=2)
+    for s_ in ('top', 'right'): ax.spines[s_].set_visible(False)
+    ax.tick_params(length=2, pad=1.5)
+axes[0].set_ylabel('full-model prefill, ms', labelpad=1)
+from matplotlib.patches import Patch
+fig.legend(handles=[Patch(facecolor=GREY, label='uniform capacity $T$'), Patch(facecolor=GREY, hatch='////', edgecolor='white', label='ranked tiers')],
+           loc='upper center', ncol=2, frameon=False, bbox_to_anchor=(0.53, 1.13), handlelength=1.4, columnspacing=1.2)
+fig.subplots_adjust(wspace=0.45)
+fig.savefig(f'{OUT}/fig_interaction.pdf'); plt.close(fig)
+
+# ---- equivalent arithmetic, different placement (E52; traffic from the instrumented two-layer profiles)
+mib = {}
+for f in (f'{R}/full_model/e48/e48_T512_profiles.txt', f'{R}/full_model/e52/e52_T512_profiles.txt'):
+    for line in open(f):
+        m = re.search(r'T=512 (p2\w+) def, layer 1: MoE ops .*\(([\d.]+) ms\).*P2P within the MoE ([\d.]+) MiB', line)
+        if m: mib[m.group(1)] = float(m.group(3))
+rows = [('SoC as a leading batch\naxis (RankTier)', 's5os', 'p2D'), ('local top-k:\nexplicit per-SoC slices', 'ls', 'p2ls'),
+        ('local top-k:\nglobal row indices', 'lg', 'p2lg')]
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(3.4, 1.3), gridspec_kw=dict(width_ratios=[1.3, 1]))
+yy = np.arange(len(rows))[::-1]
+for j, T in enumerate(Ts):
+    v = [NUM[T]['vs_D'].get(k, 1.0) if k != 's5os' else 1.0 for _, k, _ in rows]
+    a1.barh(yy + (1 - j) * 0.26, v, height=0.26, color=cols[j], label=f'$T={T}$', zorder=3)
+a1.set_yticks(yy); a1.set_yticklabels([r[0] for r in rows], fontsize=6.0); a1.set_xlabel('latency relative to the SoC axis', labelpad=1)
+a1.set_xlim(0, 5.8); a1.axvline(1.0, color=GREY, lw=0.6, ls=':')
+h_, l_ = a1.get_legend_handles_labels()
+fig.legend(h_, l_, loc='upper center', ncol=3, frameon=False, bbox_to_anchor=(0.55, 1.12), handlelength=1.2, columnspacing=1.0)
+a2.barh(yy, [mib[r[2]] for r in rows], height=0.5, color=[OWNED, RED, RED], zorder=3)
+for yi, r in zip(yy, rows): a2.text(mib[r[2]] * 1.15, yi, f'{mib[r[2]]:.0f}', va='center', fontsize=6.0)
+a2.set_xscale('log'); a2.set_xlim(5, 12000); a2.set_yticks([]); a2.set_xlabel('cross-SoC MiB per layer', labelpad=1)
+for ax in (a1, a2):
+    for s_ in ('top', 'right'): ax.spines[s_].set_visible(False)
+    ax.tick_params(axis='y', length=0, pad=2); ax.tick_params(axis='x', length=2, pad=1.5)
+fig.subplots_adjust(wspace=0.08)
+fig.savefig(f'{OUT}/fig_ownership.pdf'); plt.close(fig)
 
 # ---- stage windows at T=512 (README 3.30: GEMM window of each stage, in execution order, ranges over SoCs)
 progs = [('two stages\n(run-time sort)', [('16$\\times$512', 2.18, 2.20), ('16$\\times$64', 1.03, 1.31)]),

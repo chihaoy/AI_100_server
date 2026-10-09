@@ -1,0 +1,51 @@
+% !TEX root = ../main.tex
+\section{Background and Related Work}
+\label{sec:bg}
+
+\subsection{MoE Inference}
+
+An MoE layer replaces the feed-forward block with $E$ experts and a router. For a token with hidden state
+$x_t\in\mathbb{R}^d$, the router selects the set $\mathcal{K}_t$ of $k$ experts with the largest gate values and returns
+\begin{equation}
+y_t=\sum_{e\in\mathcal{K}_t} w_{t,e}\,W^{\mathrm{down}}_e\big(\mathrm{SiLU}(W^{\mathrm{gate}}_e x_t)\odot W^{\mathrm{up}}_e x_t\big),
+\label{eq:moe}
+\end{equation}
+with normalized gate weights $w_{t,e}$. Qwen3-30B-A3B uses $E=128$, $k=8$, $d=2048$ and an expert width of 768, so an
+expert's three matrices hold 9\,MiB in FP16. Implementations group assignments by expert, run each expert's GEMMs over
+its gathered token rows, and return the weighted rows to their tokens; under expert parallelism the experts are spread
+over devices and dispatch and combine become cross-device exchanges \citep{lepikhin2021gshard,rajbhandari2022deepspeedmoe}.
+Training systems bound each expert's work by a capacity factor and drop the tokens beyond it
+\citep{lepikhin2021gshard,fedus2022switch}; at inference, a dropped assignment changes the model's output. Prefill
+processes the prompt in chunks of $T$ tokens and writes their keys and values to the KV cache; decode then generates one
+token per step \citep{kwon2023vllm,agrawal2024sarathi}. A chunk gives each layer $8T$ assignments, $2T$ per SoC on average
+when four SoCs hold 32 experts each.
+
+\subsection{MoE Systems}
+
+GPU systems handle the data-dependent shape of expert work directly: MegaBlocks computes experts as block-sparse GEMMs
+and never drops tokens \citep{gale2023megablocks}, and DeepSpeed-MoE, FasterMoE and Lina optimize or schedule the
+all-to-all exchange \citep{rajbhandari2022deepspeedmoe,he2022fastermoe,li2023lina}. The combine has been made sparse on
+GPUs too: Tutel replaces GShard's dense dispatch and combine einsums with sparse encode and decode kernels that assign
+tokens to thread groups \citep{hwang2023tutel}, and vLLM sums each token's top-$k$
+expert rows in a single kernel, with fixed-size buffers and device-side indices that suit CUDA graphs
+\citep{vllmmoe,megatronfusedmoe}. A kernel author decides there which thread reads which rows and where partial sums live;
+a graph compiler decides that for the program, which is the gap \S\ref{sec:mot-own} examines. Placement studies exploit routing structure
+\citep{yao2024exflow,yu2025patterns}, \citet{huang2024toward} replace static capacity with dynamic gating, and
+expert-choice routing fixes each expert's tokens by construction but changes the model \citep{zhou2022expertchoice}. On
+Trainium, expert work is packed into fixed-size blocks whose weight loads are shared across an expert's blocks and whose
+unused blocks are skipped \citep{awsneuronmoe}; we compare against blocks in \S\ref{sec:eval-blocks}. DynaMoE recompiles a
+static-shape program when capacities change during training \citep{kossmann2022dynamoe}; our full-model programs take
+7--26 minutes to compile, so capacities cannot follow each chunk by recompilation.
+
+\subsection{AOT-Compiled Inference Accelerators}
+
+A Cloud AI 100 SoC has 16 AI cores and 136\,GB/s of LPDDR4x bandwidth to up to 32\,GB
+\citep{chatha2021qualcomm,qualcomm2025arch}; each core has a scalar VLIW processor, a vector unit, a tensor unit with 4K
+FP16 MACs and 8\,MB of software-managed vector memory. The Ultra card carries four SoCs under a shared 150\,W limit.
+
+The compiler takes an ONNX graph and one shape specialization per chunk length and produces a static program,
+partitioned over the cores of a SoC and, by multi-device tensor slicing, over the SoCs. Matrix weights can be MXFP6
+\citep{rouhani2023mx}, dequantized by the vector unit while the tensor unit computes. A KV cache stays on device when each
+cache input can be paired with its updated output (\emph{retained state}). An ONNX \texttt{If} with a non-constant
+condition is rejected; dynamic-shape compilers for CPUs and GPUs handle such workloads with run-time dispatch
+\citep{shen2021nimble,zhu2021disc}, which these programs lack.

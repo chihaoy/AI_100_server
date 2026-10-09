@@ -1,0 +1,26 @@
+% !TEX root = ../main.tex
+\section{What Transfers}
+\label{sec:transfer}
+
+Table~\ref{tab:transfer} separates, for each part of \sys, the reasoning we expect to hold on other statically partitioned
+targets from the conditions under which it pays and the compiler behavior that shaped it. We measured one model under one
+compiler, so this section states expectations, not results.
+
+\textbf{The method.} Capacities fixed before routing is known should follow per-device load ranks, and the aggregation
+must be designed with them: its cost must not grow with the shapes the capacities create, and the graph must state device
+ownership and token-local reduction in a form the compiler preserves. The order-statistics bound holds for any routing;
+its stability across workloads is a property of the model.
+
+\textbf{When it pays.} Padded rows must cost time: a 16-lane stage of ours streams its MXFP6 weights in about 0.6\,ms, stays
+at that floor with 92 rows per lane and is bound by its tensor-unit time with 296, and the compiler skips padded rows only
+in whole tiles. Kernels that size expert work at run time have no padding to remove \citep{gale2023megablocks}, and blocks
+whose weight loads are shared across an expert's blocks \citep{awsneuronmoe} may close the gap we measured. Ranking needs
+many experts per device relative to $k$: 32 per SoC against $k=8$ here, while 8 experts with $k=2$ on four devices would
+leave little to rank.
+
+\textbf{What the compiler shaped.} Which graph forms keep ownership is a property of this partitioner; another compiler may
+keep index values or slices local, or need another form. We expect the requirement to transfer, that the graph let the
+compiler see which device owns which rows, not the reshape that met it here. The attention rewrite and the dense-combine
+repairs fix this export and compiler, and the production baseline reflects its default partitioning, which takes about as
+long for 128 tokens as for 256: our speedups over production do not transfer, while the reasoning does. A scheduler that
+overlaps independent stages would favor more tiers.

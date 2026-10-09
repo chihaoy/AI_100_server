@@ -1,0 +1,29 @@
+% !TEX root = ../main.tex
+\section{The TokenCombine Operator}
+\label{app:custom}
+
+\textbf{Interface.} TokenCombine is a custom operator written against the SDK's C++ interface. Its inputs are a stage's
+expert outputs in the layout of \S\ref{sec:red}, $[4,16C,d]$ in FP16, and per-SoC row indices $[4,Tk]$ that hold $-1$ for a
+token's experts on other SoCs; its output is the per-SoC partials $[4,T,d]$. It thus replaces step 5's gather, mask and sum
+over $k$, while the graph keeps the index construction, the add of the two stages' partials and the elementwise sum across
+SoCs. Its configuration declares the output tileable along all three axes; for an output tile $[b_0{:}b_1,t_0{:}t_1,d_0{:}d_1]$
+the operator requests the data tile $[b_0{:}b_1,0{:}16C,d_0{:}d_1]$ and the index tile $[b_0{:}b_1,t_0k{:}t_1k]$, so a tile
+on SoC $c$ reads only $c$'s expert outputs. The kernel converts each indexed row from FP16 to FP32 with HVX vector
+instructions, accumulates a token's rows in FP32 and converts the sum back to FP16 once; it asks for its operands in the
+core's vector memory.
+
+\textbf{Integration.} In a four-SoC test of one stage at $T=128$, the operator's output is bit-identical to step 5's
+aggregation. In the full model at $T=512$ its tiles land on all 64 cores, and the cross-SoC traffic of the MoE layer stays
+at 14.1\,MiB. A scalar version was 6.5--7.8$\times$ slower than step 5 on two layers, compute-bound at about 26\,ms of busy
+time per core and layer; the HVX version runs the two layers in 14.8 against 15.7\,ms. The compiler did not place the data
+input in vector memory and warns about it 26,112 times, without effect on the result. It instantiates the kernel at every
+output tile and hands each SoC's code to one single-threaded \texttt{hexagon-clang++ -O3} run of about 2.7\,h, so a
+full-model program takes 650--656 minutes to compile.
+
+\textbf{Numerics.} The last-position logits differ from step 5's by $1.68\times10^{-2}$ relative $L_2$, with a largest
+absolute difference of 0.273 for logits up to 24.7, the same top five and the same next token; both programs repeat
+bit-identically, so the difference is deterministic. The kernel rounds each stage's FP32 partial to FP16 once. Step 5 adds
+the two stages slot by slot, which is exact because each slot is non-zero in one stage only, and then reduces the eight
+slots with the compiler's \texttt{ReduceSum}, whose accumulation precision is undocumented. Formulations that reorder the
+same sums differ from step 5 by $0.7$--$3.3\times10^{-2}$; those that keep its order are bit-identical. One matching next
+token is not evidence of general equivalence.

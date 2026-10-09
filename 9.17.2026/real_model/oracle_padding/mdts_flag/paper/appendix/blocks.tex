@@ -1,0 +1,27 @@
+% !TEX root = ../main.tex
+\section{Block Scheduling by Block Size}
+\label{app:blocks}
+
+\begin{table}[H]
+\caption{Block scheduling against \sys on two-layer cuts at $T=512$, measured before the attention fix (ms; \sys 15.9).
+Blocks per SoC in parentheses.}
+\label{tab:blocks}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{3pt}
+\begin{tabular}{@{}rrrr@{}}
+\toprule
+$B$ & dropless & calibrated & trace-specialized \\
+\midrule
+16  & 38.3 (288) & 28.0 (176) & 19.7 (96) \\
+32  & 30.3 (160) & 21.2 (96)  & 18.1 (64) \\
+64  & 24.6 (96)  & 20.1 (64)  & \textbf{17.9} (48) \\
+128 & \textbf{24.0} (64) & = dropless & 18.1 (32) \\
+\midrule
+vs.\ \sys & 1.51$\times$ & 1.26$\times$ & 1.12$\times$ \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}

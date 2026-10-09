@@ -1,0 +1,23 @@
+% !TEX root = ../main.tex
+\section{Realization on Cloud AI 100}
+\label{sec:impl}
+
+We realize \sys as ONNX graph transformations of the Qwen3-30B-A3B graph that the vendor's QEfficient library exports for
+Cloud AI 100 \citep{qefficient}, about 1,200 lines of Python with one pass per step of the evaluation's ladder
+(\S\ref{sec:setup}). The compiler shaped six choices, detailed in Appendix~\ref{app:impl}. (i) \emph{Expert parallelism
+with an on-device cache:} forbidding the partitioner to cut weights across SoCs puts whole experts on each SoC, one lane
+per core, and cuts the layer's cross-SoC traffic from 121.6 to 1.5\,MiB, but it also stops the KV cache from staying on
+device; head-parallel attention, one KV-head group per SoC, restores it. (ii) \emph{The attention's group sum:} the four
+head groups' partial outputs must be summed elementwise; written as an einsum, the sum took 31\% of each layer at $T=512$.
+This repair belongs to attention, and the evaluation attributes it separately. (iii) \emph{One
+gathered bank:} weights gathered with a run-time index cost what static weights do (a one-layer replay runs in 2.796\,ms
+either way), because the gather becomes an indirect DMA of the MXFP6 bytes; but only a gather from one constant holding all
+128 experts stays this fast, so the bank is replicated, 22.5\,GiB per SoC instead of 6.7\,GiB. (iv) \emph{Tier widths:} a stage maps evenly onto a SoC's cores only when
+its lanes divide 16, and the compiler runs a layer's stages one after another, so widths come from $\{1,2,4,8,16\}$ and every
+tier adds a sequential window. (v) \emph{The sort off the critical path:} the routing tables are computed for all experts in
+their fixed order, and only a row permutation and the weight gathers wait for the sort; the maximum tile size is chosen per
+program and chunk length (Appendix~\ref{app:tiles}). (vi) \emph{The aggregation's graph form:} among equivalent
+expressions, only the layout-preserving SoC axis kept every expert row on its SoC (\S\ref{sec:mot-own}). Tree prefix scans for the
+routing and two repairs of the exported dense combine remove serialized work before the combine is replaced; the
+evaluation keeps them as steps of their own. Each chunk length is its own program, with sequence length $T$, context $2T$,
+MXFP6 matrix weights and FP16 activations (Appendix~\ref{app:flags}).

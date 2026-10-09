@@ -1,0 +1,35 @@
+% !TEX root = ../main.tex
+\section{Routing Captures and Tier Calibration}
+\label{app:calib}
+
+Routing captures run the model's FP32 layers on the CPU and record every layer's top-8 experts. At $T=128$ we use 50
+chat prompts per workload; at 512 tokens, 8 GSM8K chunks and 4 each from HumanEval, MMLU and SWE-bench Lite; the 256-token
+calibration set holds 16 GSM8K chunks and both halves of each 512-token chunk (56 in total). The held-out GSM8K chunks of
+the evaluation use test questions 1000--1003 (256 tokens) and 1004--1011 (512 tokens), outside the calibration range.
+Table~\ref{tab:ranks} gives the largest per-SoC load at selected ranks, the input to the tier rule of \S\ref{sec:tiers}.
+
+\begin{table}[H]
+\caption{Largest load of the rank-$r$ expert of a SoC over all calibration chunks, layers and SoCs.}
+\label{tab:ranks}
+\vskip 0.1in
+\begin{center}
+\begin{small}
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{@{}rrrrrrrrr@{}}
+\toprule
+$T$ & $r=1$ & 2 & 4 & 8 & 9 & 16 & 17 & 32 \\
+\midrule
+128 & 127 & 122 & 105 & 33 & 32 & 14 & 12 & 3 \\
+256 & 256 & 223 & 134 & 58 & 50 & 25 & 25 & 4 \\
+512 & 508 & 424 & 240 & 101 & 89 & 51 & 50 & 10 \\
+\bottomrule
+\end{tabular}
+\end{small}
+\end{center}
+\end{table}
+
+A fixed layout calibrated per workload fares worse the more its traffic varies. With 25 calibration prompts of the same
+workload, 64--92\% of that workload's held-out prompts overflow in some layer; calibrated on 175 prompts of the seven
+other workloads, 24--100\% do. With 200 prompts from all eight, the fraction falls to 12--36\%, and with random pooled
+subsets of 8, 32, 128 and 200 prompts to 100\%, 70\%, 27\% and 21\%. Under the per-SoC rank sort, ranks 17--32 need at
+most 12 rows at $T=128$ in every layer of every workload.

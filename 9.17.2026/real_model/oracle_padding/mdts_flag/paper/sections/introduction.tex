@@ -1,0 +1,64 @@
+% !TEX root = ../main.tex
+\section{Introduction}
+\label{sec:intro}
+
+Mixture-of-experts (MoE) layers let a language model grow its parameter count without a matching growth in per-token
+compute: a router sends each token to a few of many experts, and only those experts run
+\citep{shazeer2017outrageously,fedus2022switch}. Qwen3-30B-A3B routes each token to 8 of 128 experts in each of its 48
+layers \citep{yang2025qwen3}, and Mixtral and DeepSeek-V3 follow the same pattern \citep{jiang2024mixtral,deepseek2024v3}.
+During prefill a serving system processes the prompt in chunks of $T$ tokens \citep{agrawal2024sarathi}, and the router
+distributes each chunk's $8T$ assignments unevenly over the experts, differently in every layer and for every input.
+Efficient execution should therefore give different experts different amounts of work.
+
+Server inference accelerators make that hard. Qualcomm Cloud AI 100 \citep{chatha2021qualcomm}, like XLA-compiled TPU
+programs \citep{lepikhin2021gshard} and the statically scheduled Groq TSP \citep{abts2020tsp}, runs a model as a program
+compiled ahead of time: tensor shapes, the partition of every operator over cores and devices, and the schedule are fixed
+before the first request, and the compiler rejects control flow that depends on data. Expert work must be expressed
+through compiled shapes. A uniform capacity of $T$ rows per expert accepts any routing, but it executes padded rows,
+16$\times$ the routed assignments for this model, and the compiler skips them only in whole row tiles. Capacities fitted
+to observed loads do not escape this, because which experts are busy changes with the workload (\S\ref{sec:mot-pad}).
+
+Reducing expert work is only half of the problem. Expert outputs must return to their tokens and be summed over each
+token's experts, and the shapes and stages that capacity savings introduce change how that aggregation executes. In a
+controlled experiment that holds everything else fixed, ranked capacities cut the full-model latency of 512-token chunks
+by 27\% with \sys's aggregation but by only 4\% with a repaired dense combine, and at 128 tokens they make the dense
+version 37\% slower (\S\ref{sec:mot-red}). Choosing capacities to minimize padded rows is an incomplete objective:
+capacities and aggregation have to be designed together.
+
+Efficient aggregation in turn depends on how the graph expresses it. The mathematics is standard: each device sums the
+rows of the experts it computed into per-token partials, and the partials are summed across devices, as GPU systems do
+with sparse kernels \citep{hwang2023tutel,vllmmoe}. Through a graph compiler, however, equivalent expressions of that
+computation execute very differently. Three graphs that produce bit-identical logits differ only in how they tell the
+compiler which device owns which rows: global row indices and explicit per-device slices both make it ship expert outputs
+between devices, 110$\times$ the traffic, and run 3.4--5.3$\times$ slower than a layout that exposes the device as a batch
+axis of the gather (\S\ref{sec:mot-own}). Within a device, the reduction must also stay on the core that owns each token:
+summing a token's rows across cores costs 11--15\%.
+
+We present \sys, a design for MoE prefill that keeps the program static and moves the decisions it cannot compile into
+data. Each SoC ranks its 32 experts by load at run time and assigns them to fixed-capacity tiers by rank; the compiled
+program fixes the tiers, their lanes and capacities, and the run time decides which expert each lane serves. Capacities
+bound to ranks can be small because the order statistics of per-device load are bounded and stable across workloads,
+while the identities of the busy experts are not (Figure~\ref{fig:rank}). Expert outputs are aggregated in a layout that
+preserves device ownership and assigns each token's sum to one core, and that does not depend on the tiers' shapes. Both
+parts need only static shapes, a sort and gathers with run-time indices.
+
+We implement \sys as graph transformations of the exported Qwen3-30B-A3B and evaluate all 48 layers with MXFP6 expert
+weights on the four SoCs of one Cloud AI 100 Ultra card, with the KV cache on device. \sys prefills 128-, 256- and
+512-token chunks in 105.3, 141.5 and 225.3\,ms, 4.74$\times$, 3.65$\times$ and 4.68$\times$ faster than the production compilation and
+2.37$\times$, 3.55$\times$ and 4.56$\times$ faster than an expert-parallel program with the exported combine. With
+ranking and weight indirection matched, the ranked capacities give 1.10--1.37$\times$; fixed-size blocks under the same
+compiler are 1.26--1.71$\times$ slower. Capacities calibrated in advance overflowed in none of 1872 evaluation chunks of
+eight workloads, and a forced overflow is recovered bit-exactly. We separate what transfers to other statically
+partitioned targets from the behavior of this compiler (\S\ref{sec:transfer}).
+
+The paper makes three contributions:
+\begin{itemize}
+\item A characterization of MoE prefill under static partitioning: padded expert rows are executed work, capacity savings
+  pay only with efficient aggregation, and graphs with identical arithmetic place that aggregation very differently
+  (\S\ref{sec:mot}).
+\item A design that adapts expert work and preserves the aggregation structure: capacities bound to per-device load ranks,
+  with exact overflow recovery, and token aggregation that keeps device ownership and token-local reduction through
+  compilation (\S\ref{sec:design}, \S\ref{sec:impl}).
+\item A full-model evaluation that establishes the capacity--aggregation interaction with controlled ablations,
+  equivalent-arithmetic placement experiments and an attributed optimization ladder (\S\ref{sec:eval}).
+\end{itemize}
